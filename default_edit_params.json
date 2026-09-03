@@ -1,0 +1,115 @@
+{
+  "_comment": "Default parameters for the map's scenario/route editor (see transitLOS/costs.md for the cost research and reasoning behind every number below). Edit this file, or a per-study copy of it, to change the editor's behavior without touching code. All costs are in millions of USD (2024-2025). All speeds are km/h.",
+
+  "modes": {
+    "rail": { "label": "Rail", "icon": "fa-train", "default_color": "#DA291C" },
+    "tram": { "label": "Tram", "icon": "fa-train-tram", "default_color": "#00843D" },
+    "brt": { "label": "BRT", "icon": "fa-bus-simple", "default_color": "#0072CE", "scores_as": "tram" },
+    "bus": { "label": "Bus", "icon": "fa-bus-simple", "default_color": "#8b0000" }
+  },
+
+  "_modes_comment": "BRT visually uses the bus icon but scores (mode_score, in stop_score) exactly as tram -- see transitlos.scoring.mode.MODE_SCORES and this project's mode.py docstring for why tram/BRT are grouped together as the higher-quality-than-bus tier.",
+
+  "grade_separations": {
+    "rail": ["elevated", "normal", "underground"],
+    "tram": ["elevated", "separated", "mixed", "underground"],
+    "brt": ["elevated", "separated", "mixed", "underground"],
+    "bus": ["elevated", "separated", "mixed", "underground"]
+  },
+
+  "default_grade_separation": {
+    "_comment": "Applied automatically to a segment's grade_separation when it is first created (new route or new segment) and nothing has been explicitly chosen yet -- must be one of grade_separations[mode] above. rail has no 'separated' option (its at-grade tier is called 'normal'), so it maps there instead.",
+    "bus": "mixed",
+    "brt": "separated",
+    "tram": "separated",
+    "rail": "normal"
+  },
+
+  "grade_separation_colors": {
+    "_comment": "Used to color the route being actively edited when the grade-separation buttons are showing (draw/extend mode) -- otherwise the route displays in its own route_color.",
+    "elevated": "#f2a900",
+    "normal": "#2e8b57",
+    "separated": "#2e8b57",
+    "mixed": "#999999",
+    "underground": "#5b2c6f"
+  },
+
+  "speeds": {
+    "_comment": "Fixed by explicit user instruction, not derived from cost research. Dwell time is added per stop and is NOT user-configurable in the editor UI.",
+    "rail": {
+      "kmh": 40,
+      "dwell_seconds_per_stop": 45
+    },
+    "tram": {
+      "kmh_by_grade_separation": { "mixed": 10, "separated": 15, "elevated": 20, "underground": 20 },
+      "dwell_seconds_per_stop": 15
+    },
+    "brt": {
+      "kmh_by_grade_separation": { "mixed": 10, "separated": 15, "elevated": 20, "underground": 20 },
+      "dwell_seconds_per_stop": 15
+    },
+    "bus": {
+      "kmh_by_grade_separation": { "mixed": 10, "separated": 15, "elevated": 20, "underground": 20 },
+      "dwell_seconds_per_stop": 15
+    }
+  },
+
+  "costs": {
+    "_comment": "cost_per_km_musd = construction cost per route-km at that grade separation. station_musd = cost per station at that grade separation (a station's grade separation = the more expensive of its two adjacent segments', per the editor's rule -- see costs.md).",
+    "rail": {
+      "cost_per_km_musd": { "normal": 73, "elevated": 130, "underground": 354 },
+      "station_musd": { "normal": 15, "elevated": 15, "underground": 125 }
+    },
+    "tram": {
+      "cost_per_km_musd": { "mixed": 40, "separated": 60, "elevated": 110, "underground": 250 },
+      "station_musd": { "mixed": 2, "separated": 2, "elevated": 2, "underground": 40 }
+    },
+    "brt": {
+      "cost_per_km_musd": { "mixed": 3, "separated": 15, "elevated": 80, "underground": 200 },
+      "station_musd": { "mixed": 1.5, "separated": 1.5, "elevated": 1.5, "underground": 30 }
+    },
+    "bus": {
+      "cost_per_km_musd": { "mixed": 0.5, "separated": 3, "elevated": 60, "underground": 150 },
+      "station_musd": { "mixed": 0.1, "separated": 0.1, "elevated": 1, "underground": 20 }
+    }
+  },
+
+  "vehicle_cost_musd": {
+    "_comment": "Item 7: per-vehicle purchase cost (millions USD), used with the classic fleet-size formula vehicles_needed = ceil(round_trip_time_minutes / headway_minutes) to estimate a route's vehicle-fleet cost. Bus cheapest, rail/tram most expensive, consistent with real procurement costs. Grade separation does NOT change the vehicle price (only whether/how much dedicated infrastructure gets built, in `costs` above) -- notably bus-in-mixed-traffic still buys vehicles even though it has ~$0 infrastructure cost, since a bus route obviously needs buses.",
+    "bus": 1.0,
+    "brt": 1.0,
+    "tram": 4.5,
+    "rail": 8.0
+  },
+
+  "headway_aggregation": {
+    "_comment": "Very simple frequency-addition when combining an edited/new route's headway with a stop's existing (already-aggregated) headway, per explicit instruction: no directional computation, no special stop-level modeling. Same-mode routes at a shared stop combine; different-mode routes at a shared stop are scored independently (not aggregated together).",
+    "formula": "1 / combined_headway_minutes = 1 / headway_a_minutes + 1 / headway_b_minutes",
+    "combine_across_modes": false
+  },
+
+  "access_recompute": {
+    "_comment": "Client-side, frontend-only recompute of level_of_service for new/edited stops after the user clicks Compute.",
+    "h3_resolution": 11,
+    "method": "straight_line_buffer",
+    "max_walk_distance_m": 2000,
+    "max_walk_distance_m_comment": "Outer straight-line catchment radius around each new/edited stop, in metres. Mirrors the real pipeline's own outer walk-distance cutoff (the last entry of the study's `walk_distance_steps`, 2000 m for Boston, forwarded to `distance_matrix.build_intelligent_distance_matrix(max_walk_distance_m=...)`). A cutoff is REQUIRED here because `walk_decay` is an offset-power curve that never actually reaches zero -- without one, every stop would touch the entire metro's population grid.",
+    "headway_cv": 0.3,
+    "headway_cv_comment": "Fixed headway coefficient of variation fed to `reliability_score` for editor-created routes: a drawn route has no timetable, so its real service variability is unknowable. 0.3 is the same representative value the map's Discretization tab holds reliability at (`__DISC_STOP_SCORE_DEFAULT_CV`), so the editor and that tab's curves agree.",
+    "method_comment": "Straight-line (as-the-crow-flies) distance from each res-11 H3 cell centroid to the nearest new/edited stop, NOT a street-network walk distance -- an intentional simplification for a fast, purely-client-side what-if tool, per explicit instruction. Uses the same transitlos.scoring.walk_access decay curve shape as the real pipeline, mirrored in JS."
+  },
+
+  "impact_score": {
+    "_comment": "impact = sum(access_gain_i * population_i) over affected h3 cells. impact_per_million_dollar = impact / (total_cost_musd). Emoji thresholds are on impact_per_million_dollar.",
+    "happy_threshold": 300,
+    "sad_threshold": 100,
+    "medium_value": 200,
+    "interpolation": "linear_between_sad_and_happy",
+    "emoji": { "happy": "😀", "medium": "😐", "sad": "😞" }
+  },
+
+  "scenarios": {
+    "_comment": "'current' is the reserved, non-editable scenario name representing today's real transit network -- see the editor's scenario-selection UI.",
+    "reserved_current_name": "current"
+  }
+}

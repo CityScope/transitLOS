@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+.venv-scoring/
+venv/
+
+# Python egg files
+*.egg-info
+dist/
+build/
+.pytest_cache/
+
+# Secrets
+api_keys.json
+
+# Large downloaded/generated data -- not source, shouldn't be tracked
+*.osm.pbf
+_network_cache/
+_worldpop_cache/
+examples/outputs/
+examples/_network_cache/
+examples/_worldpop_cache/
+
+# Ad-hoc verification screenshots generated while testing map features
+/*.png
+
+# Internal method/research notes -- not shipped with the package
+documentation/
