@@ -763,14 +763,23 @@ def _numeric_field_candidates(gdf: gpd.GeoDataFrame, extra_exclude: Sequence[str
 def _preferred_density_field(fields: Sequence[str]) -> Optional[str]:
     """The best available population-density field in `fields`, for default circle-size/etc.
 
-    Priority: real census-source `population_density`, then
-    `worldpop_population_density`, then the legacy generic `pop_density`
-    (kept as the fallback for a grid where neither canonical column exists
-    -- see `_numeric_field_candidates`'s own dedup, which only drops
-    `pop_density` when a real replacement is present). `None` if none of
-    the three are offered at all.
+    Priority (verbatim user request: "jobs and population density instead
+    of population density or worldpop density... if not jobs then
+    population density instead of worldpop density"):
+      1. the combined population+jobs density (`pop_jobs_density`, aliased
+         `jobs_and_population_density` -- see `_numeric_field_candidates`'s
+         dedup, which keeps only one of the two names per city).
+      2. real census-source `population_density`, then the legacy generic
+         `pop_density`.
+      3. `worldpop_population_density` -- last resort only, never preferred
+         over a real census/jobs-based density.
+    `None` if none of these are offered at all.
     """
-    for cand in ("population_density", "worldpop_population_density", "pop_density"):
+    for cand in (
+        "pop_jobs_density", "jobs_and_population_density",
+        "population_density", "pop_density",
+        "worldpop_population_density",
+    ):
         if cand in fields:
             return cand
     return None
@@ -1805,7 +1814,7 @@ window.__stopsData = {data_json};
   // best thing reachable near here" rather than hiding it behind an
   // undifferentiated cluster blob.
   var cluster = L.markerClusterGroup({{
-    maxClusterRadius: 60, disableClusteringAtZoom: 17,
+    maxClusterRadius: 20, disableClusteringAtZoom: 17,
     iconCreateFunction: function(clusterObj) {{
       var members = clusterObj.getAllChildMarkers();
       var best = null;
@@ -1820,7 +1829,7 @@ window.__stopsData = {data_json};
       var tint = best ? best.tint : blueFor(0);
       var count = clusterObj.getChildCount();
       var html = '<div style="text-align:center;">' +
-        modeBadgeHtml(mode, tint, 24) +
+        modeBadgeHtml(mode, tint, 20) +
         scoreBadgeHtml(count, '#333') +
         '</div>';
       return L.divIcon({{html: html, className: 'stop-cluster-icon', iconSize: [32, 36]}});
@@ -1831,10 +1840,10 @@ window.__stopsData = {data_json};
     var t = (r.stop_score != null) ? (r.stop_score - sMin) / Math.max(sMax - sMin, 1e-9) : 0;
     var tint = blueFor(t);
     var html = '<div style="text-align:center;">' +
-      modeBadgeHtml(r.mode, tint, 22) +
+      modeBadgeHtml(r.mode, tint, 19) +
       (r.stop_score != null ? scoreBadgeHtml(fmt2(r.stop_score), tint) : '') +
       '</div>';
-    var icon = L.divIcon({{html: html, className: 'stop-marker-icon', iconSize: [26, 34]}});
+    var icon = L.divIcon({{html: html, className: 'stop-marker-icon', iconSize: [22, 29]}});
     var marker = L.marker([r.lat, r.lon], {{icon: icon}});
     // Read by iconCreateFunction above to pick each cluster's best member.
     marker.__stopMeta = {{mode: r.mode, stop_score: r.stop_score, tint: tint}};
@@ -2415,6 +2424,8 @@ def _control_panel_js(
     opacity_field_domains: Dict[str, tuple],
     base_layer_vars: Optional[Dict[str, str]] = None,
     default_shape: str = "hexagons",
+    radius_field_domains_by_res: Optional[Dict[int, Dict[str, tuple]]] = None,
+    circle_zoom_bands: Optional[Dict[int, tuple]] = None,
 ) -> str:
     """JS wiring the consolidated control panel + legend to the map.
 
@@ -2437,6 +2448,17 @@ def _control_panel_js(
     map_ref = f'window["{map_var}"]' if map_var else "null"
     radius_domains_json = json.dumps({k: list(v) for k, v in radius_field_domains.items()})
     opacity_domains_json = json.dumps({k: list(v) for k, v in opacity_field_domains.items()})
+    # Per-resolution radius domains + the zoom band each resolution is
+    # actually shown at (2026-09-04, "circle size legend should update with
+    # zoom") -- lets the legend text pick the domain matching whichever
+    # resolution the map is currently displaying, instead of always reading
+    # off the flat (finest-resolution) `radius_field_domains` above.
+    radius_domains_by_res_json = json.dumps(
+        {str(res): {k: list(v) for k, v in domains.items()} for res, domains in (radius_field_domains_by_res or {}).items()}
+    )
+    circle_zoom_bands_json = json.dumps(
+        {str(res): list(band) for res, band in (circle_zoom_bands or {}).items()}
+    )
     base_layer_vars = base_layer_vars or {}
     shape_layers_json = json.dumps(base_layer_vars)
     default_shape_json = json.dumps(default_shape if default_shape in base_layer_vars else "hexagons")
@@ -2546,6 +2568,7 @@ if (__leafletMap) {{
     // just because the map zoomed, so without this the already-rendered tile
     // is left showing whatever weight/opacity it was drawn with.
     __redrawMatching(function(k) {{ return k.indexOf('streets:') === 0 || k.indexOf('development:') === 0; }});
+    __updateCircleLegend(window.__circleField);
   }});
   __leafletMap.on('overlayadd', function(e) {{
     if (e.name === 'development') document.getElementById('devLegend').style.display = 'block';
@@ -2562,6 +2585,24 @@ if (__leafletMap) {{
 
 var __radiusFieldDomains = {radius_domains_json};
 var __opacityFieldDomains = {opacity_domains_json};
+var __radiusFieldDomainsByRes = {radius_domains_by_res_json};
+var __circleZoomBands = {circle_zoom_bands_json};
+// Picks the resolution whose zoom band contains `z`, for legend text that
+// tracks whichever resolution is actually being displayed at the current
+// zoom. Falls back to the finest (highest-numbered) resolution if `z` is
+// past every band's upper end (shouldn't happen -- bands partition the
+// whole [0,25] range -- but keeps this defensive rather than returning
+// undefined).
+function __resForZoom(z) {{
+  var best = null;
+  Object.keys(__circleZoomBands).forEach(function(resKey) {{
+    var band = __circleZoomBands[resKey];
+    if (z >= band[0] && z <= band[1]) best = resKey;
+  }});
+  if (best != null) return best;
+  var keys = Object.keys(__circleZoomBands).map(Number);
+  return keys.length ? String(Math.max.apply(null, keys)) : null;
+}}
 // Assigned onto `window`, not a plain top-level `function` declaration --
 // this whole block runs inside its own `window.addEventListener('load',
 // function() {{...}})` closure, and `_stats_panel_js`'s `renderRegression`
@@ -2612,7 +2653,12 @@ function __updateCircleLegend(field) {{
     }}
   }}
   document.getElementById('circleLegendField').textContent = circleLabel;
-  var d = __radiusFieldDomains[field];
+  var domains = __radiusFieldDomains;
+  if (window.__leafletMapRef && Object.keys(__radiusFieldDomainsByRes).length) {{
+    var res = __resForZoom(window.__leafletMapRef.getZoom());
+    if (res != null && __radiusFieldDomainsByRes[res]) domains = __radiusFieldDomainsByRes[res];
+  }}
+  var d = domains[field];
   document.getElementById('circleLegendMin').textContent = d ? __fmtLegendNum(d[0]) : '';
   document.getElementById('circleLegendMid').textContent = d ? __fmtLegendNum((d[0] + d[1]) / 2) : '';
   document.getElementById('circleLegendMax').textContent = d ? __fmtLegendNum(d[1]) : '';
@@ -3059,16 +3105,23 @@ def build_city_map(
     show_development = has_development_gdf or (has_census and "equity_flag" in finest.columns)
 
     if circle_fields is None:
-        # Relative-only: circle radius and fill opacity both encode "how much
-        # of X is here per unit of place", which a raw count cannot express
-        # (a bigger hexagon trivially holds more people). See
-        # `is_relative_field` for the naming-convention rule.
-        circle_fields = relative_fields(_numeric_field_candidates(finest, extra_exclude=[score_col]))
-        if not circle_fields:
-            _fallback_density = _preferred_density_field(list(finest.columns))
-            circle_fields = [_fallback_density] if _fallback_density else []
+        # 2026-09-05, explicit user request: "circle size by only allow
+        # count columns" -- a circle's AREA already encodes magnitude
+        # (bigger circle = more of X), so sizing it by a count (population,
+        # jobs, households, ...) is the natural fit; a relative/density
+        # field is better expressed by opacity/color instead (see
+        # `opacity_fields` below), which is what this swaps to. See
+        # `is_relative_field`/`absolute_fields` for the naming-convention
+        # rule this filters on.
+        circle_fields = absolute_fields(_numeric_field_candidates(finest, extra_exclude=[score_col]))
+        if not circle_fields and "population" in finest.columns:
+            circle_fields = ["population"]
     if opacity_fields is None:
-        opacity_fields = list(circle_fields)
+        # 2026-09-05, explicit user request: "opacity by only allow
+        # relative or density columns" -- the complement of `circle_fields`
+        # above, computed independently (not derived FROM circle_fields
+        # anymore, since that now holds counts instead of relative fields).
+        opacity_fields = relative_fields(_numeric_field_candidates(finest, extra_exclude=[score_col]))
         # Real bug (2026-08-25, reported: "opacity by affect all census
         # polygons by the same amount"): `__opacityFieldDomains`/the "Opacity
         # by" dropdown are ONE GLOBAL set shared by every shape (hexagons,
@@ -3110,6 +3163,25 @@ def build_city_map(
     # the domain so far that every "typical" value maps into a narrow sliver
     # of the 3-18px radius range, killing visible size contrast between them.
     radius_field_domains = {f: _percentile_domain(finest[f]) for f in circle_fields if f in finest.columns}
+    # Per-resolution domains (2026-09-04, user report: "the circle size
+    # legend should update with zoom"). `radius_field_domains` above is
+    # computed ONCE from `finest` and reused identically at every zoom level
+    # -- a coarse resolution's per-cell values (e.g. population summed over
+    # a huge res-5 hexagon) are on a completely different scale than the
+    # finest resolution's, so every coarse-zoom circle rendered near the
+    # domain's max (always maxed-out-looking) regardless of its real
+    # relative size at that zoom. Each resolution gets its own
+    # percentile-clipped domain from its OWN data here, used both for the
+    # actual per-resolution circle-radius paint (Folium's per-level
+    # `_circle_style_js` closure and MapLibre's per-level static
+    # `_score_maplibre_paint`, both already configured per resolution in the
+    # loop below) and for the live legend text (`_control_panel_js`'s
+    # `__updateCircleLegend`, which picks the domain matching the map's
+    # current zoom via `circle_zoom_bands`).
+    radius_field_domains_by_res: Dict[int, Dict[str, tuple]] = {
+        res: {f: _percentile_domain(h3_by_resolution[res][f]) for f in circle_fields if f in h3_by_resolution[res].columns}
+        for res in resolutions
+    }
     opacity_field_domains = {f: _percentile_domain(finest[f], 15, 85) for f in opacity_fields if f in finest.columns}
     # Same default-field choice `_inject_controls_into_saved_html` uses for
     # Folium's "Circle size by" dropdown -- computed here too so MapLibre's
@@ -3309,9 +3381,10 @@ def build_city_map(
         extract_xyz=(renderer == "folium"),
     )
     for res in resolutions:
+        _res_radius_domains = radius_field_domains_by_res.get(res) or radius_field_domains
         circ_map.configure_level(
             f"h3_{res}",
-            style_js=_circle_style_js(score_domain, radius_field_domains, opacity_field_domains, res=res),
+            style_js=_circle_style_js(score_domain, _res_radius_domains, opacity_field_domains, res=res),
             popup_fields=_popup_fields(h3_by_resolution[res]),
             popup_js=shape_popup_js,
             # Circles render at a fixed pixel radius (up to 18px) client-side, unlike a
@@ -3325,7 +3398,7 @@ def build_city_map(
             layer_type="circle",
             maplibre_paint=_score_maplibre_paint(
                 "circle", score_col, score_domain,
-                radius_field_domains=radius_field_domains,
+                radius_field_domains=_res_radius_domains,
                 default_circle_field=default_circle_field,
             ),
         )
@@ -3588,12 +3661,13 @@ def build_city_map(
             with contextlib.chdir(out_dir):
                 dev_map.build()
 
-    # Census geometries are the default shape wherever the study has them:
-    # they are the units the census variables are actually published for, so
-    # the map opens on the real data rather than on an H3 approximation of
-    # it. Studies without census data (no `census_by_level`) fall back to
-    # hexagons, which is the only always-available shape.
-    default_shape = "census" if has_census else "hexagons"
+    # 2026-09-05, explicit user request: "on all maps by default on startup
+    # activate the circles view" -- "circles" (centroid points sized/colored
+    # by a selectable field) is always built regardless of census
+    # availability, so it's always a safe default (unlike the old
+    # census-when-available/hexagons-otherwise choice below, kept only as
+    # dead documentation of the prior behavior).
+    default_shape = "circles"
     multi = MultiHierarchyMap(
         named_maps, default=default_shape, tiles_dir=None,
         overlay_hierarchy_maps=overlay_maps, overlay_show=overlay_show,
@@ -3641,6 +3715,17 @@ def build_city_map(
                 # module's cross-country humanizer) is computed here and
                 # handed over as a plain lookup table.
                 field_labels={f: field_label(f) for f in set(circle_fields) | set(opacity_fields)},
+                # 2026-09-05 real bug fix ("circle legend does not change
+                # with zoom"): `save_multi_maplibre`'s own live "Circle
+                # size by" JS used to apply ONE flat domain to every
+                # resolution's circle layer on page load, silently
+                # overwriting the per-resolution static paint computed
+                # above (`_score_maplibre_paint` calls inside the circles
+                # loop) -- see `save_multi_maplibre`'s docstring for the
+                # full story. These let it pick the right domain per
+                # layer/zoom instead.
+                radius_field_domains_by_res=radius_field_domains_by_res,
+                circle_zoom_bands={res: zoom_bands[f"h3_{res}"] for res in resolutions},
             )
             # Item 5 (user feedback, 2026-08-19): stops/routes/labels/popups
             # were entirely absent from the MapLibre page -- `stops_gdf`/
@@ -3749,6 +3834,8 @@ def build_city_map(
                 default_shape=default_shape,
                 enable_place_comparison=enable_place_comparison,
                 share_source_map=share_source_map,
+                radius_field_domains_by_res=radius_field_domains_by_res,
+                circle_zoom_bands={res: zoom_bands[f"h3_{res}"] for res in resolutions},
             )
 
     if stats_by_area:
@@ -3966,8 +4053,14 @@ def _stats_panel_html(
     # so behavior is unchanged unless the user picks something else) and the
     # regression/ANOVA "compare with" dropdowns (default "none" == today's
     # fixed level_of_service behavior).
+    # Item 3 (verbatim user request): "on distribution by default activate
+    # population and jobs and if not population and jobs activate
+    # population" -- prefer the combined population+jobs count column
+    # (`pop_jobs_total`, only present for cities with a jobs source joined),
+    # falling back to plain `population` (always present) when it isn't.
+    _dist_default_field = "pop_jobs_total" if "pop_jobs_total" in count_fields else "population"
     main_options = "".join(
-        f'<option value="{f}"{" selected" if f == "population" else ""}>{field_label(f)}</option>'
+        f'<option value="{f}"{" selected" if f == _dist_default_field else ""}>{field_label(f)}</option>'
         for f in count_fields
     )
     # Shared static markup for every "Compare with" popover's "Scenario"
@@ -4389,7 +4482,20 @@ def _stats_panel_js(
     place_manifest_json = json.dumps(
         place_manifest if place_manifest is not None else _DEFAULT_CS_PLACE_MANIFEST
     )
-    default_field = regression_fields[0] if regression_fields else "population"
+    # Item 3 (verbatim user request): "on regression population and jobs
+    # density and if not population density" -- prefer the combined
+    # population+jobs density column (`pop_jobs_density`, aliased
+    # `jobs_and_population_density` -- see `_numeric_field_candidates`'s
+    # dedup, which keeps only one of the two names per city), falling back
+    # to plain `pop_density`, then whatever regression offers first.
+    if "pop_jobs_density" in regression_fields:
+        default_field = "pop_jobs_density"
+    elif "jobs_and_population_density" in regression_fields:
+        default_field = "jobs_and_population_density"
+    elif "pop_density" in regression_fields:
+        default_field = "pop_density"
+    else:
+        default_field = regression_fields[0] if regression_fields else "population"
     default_tab = "placerank" if enable_place_comparison else "distribution"
     enable_place_comparison_json = json.dumps(enable_place_comparison)
     has_multi_area_json = json.dumps(has_multi_area)
@@ -4709,10 +4815,23 @@ function renderDistribution() {{
       secSums[__accessBin(ss)] += sv; totalSec += sv;
     }}
   }}
-  var weightedAccess = __weightedMean(score, pop);
-  var weightedAccessSec = secSums ? __weightedMean(secData.level_of_service, secData[secField]) : null;
-  var summary = mainLabel + '-weighted access: <b>' + weightedAccess.toFixed(2) + '</b>';
-  if (weightedAccessSec != null) summary += ' &nbsp;|&nbsp; ' + secLabel + '-weighted access: <b>' + weightedAccessSec.toFixed(2) + '</b>';
+  // Item 4 (verbatim user request): every "weighted transit score" shown
+  // anywhere in the stats panel is always a WEIGHTED MEDIAN by the
+  // corresponding column, never a mean -- `__weightedMean` used to be used
+  // here, which reads very differently for a skewed distribution (e.g. a
+  // large population share sitting at exactly 0 access pulls a mean down
+  // much further than the median most people actually experience).
+  var weightedAccess = __weightedMedian(score, pop);
+  var weightedAccessSec = secSums ? __weightedMedian(secData.level_of_service, secData[secField]) : null;
+  // Item 3 (verbatim user request): show "Total <column> <n> weighted
+  // transit level of service <value>" instead of the old bare "<column>
+  // -weighted access: <value>".
+  var summary = 'Total ' + mainLabel + ': <b>' + __fmt(totalPop) + '</b> &nbsp;|&nbsp; ' +
+    mainLabel + '-weighted transit level of service: <b>' + weightedAccess.toFixed(2) + '</b>';
+  if (weightedAccessSec != null) {{
+    summary += ' &nbsp;|&nbsp; Total ' + secLabel + ': <b>' + __fmt(totalSec) + '</b> &nbsp;|&nbsp; ' +
+      secLabel + '-weighted transit level of service: <b>' + weightedAccessSec.toFixed(2) + '</b>';
+  }}
 
   // Rescale check: compare the RAW value ranges of mainField (from the main
   // scenario) and secField (from the secondary series' scenario) -- e.g.
@@ -6354,7 +6473,13 @@ def _editor_html(params: dict) -> str:
     display:block; position:absolute; top:10px; left:50%; transform:translateX(-50%);
     z-index:1200; background:white; padding:5px 12px; border-radius:6px;
     box-shadow:0 1px 6px rgba(0,0,0,0.3); font:12px sans-serif; color:#333; white-space:nowrap;
-    max-width:calc(100vw - 460px); overflow:hidden; text-overflow:ellipsis;
+    /* Item 3 (verbatim user request): "make sure all this text and the
+       number fit in the panel and otherwise make the panel wider" --
+       widened from `100vw - 460px` (which could clip/ellipsis a custom
+       scenario's full line: name + score + cost + impact + impact/$M +
+       emoji) to `100vw - 40px`, just enough margin to clear the corner UI
+       (basemap switcher etc.) on a normal window. */
+    max-width:calc(100vw - 40px); overflow:hidden; text-overflow:ellipsis;
   }
   #editSummaryBar .sep { color:#c3c8ce; margin:0 5px; }
   #editSummaryBar .k { color:#777; }
@@ -7413,15 +7538,18 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
     var base = baselineStats();
     var parts = [];
     function push(k, v, cls) {
-      parts.push('<span class="sep">&middot;</span><span class="k">' + k + '</span> <span class="v' +
-                 (cls ? ' ' + cls : '') + '">' + v + '</span>');
+      // Empty `k` (used for the top-line score, item 3: "instead of access
+      // xx I would like to have just the number xxx") omits the label span
+      // entirely -- just the separator dot and the bare value.
+      parts.push('<span class="sep">&middot;</span>' + (k ? '<span class="k">' + k + '</span> ' : '') +
+                 '<span class="v' + (cls ? ' ' + cls : '') + '">' + v + '</span>');
     }
     if (isReserved(shown)) {
       // The real network: level of service only -- there is nothing to cost and
       // no impact to attribute, since it is not editable.
-      push('score', base ? fmtNum(base.access, 2) : '-');
+      push('', base ? fmtNum(base.access, 2) : '-');
       rest.innerHTML = parts.join('');
-      rest.title = base ? ('Population-weighted mean accessibility_score over the metro study area (' +
+      rest.title = base ? ('Population-weighted median transit level of service over the metro study area (' +
                            fmtNum(base.population, 0) + ' people)') : '';
       return;
     }
@@ -7430,7 +7558,7 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
     var c = scenarioCostMusd(sc);
     var acc = (!stale && lastCompute && lastCompute.new_access != null) ? lastCompute.new_access
               : (base ? base.access : null);
-    push('score', acc == null ? '-' : fmtNum(acc, 2));
+    push('', acc == null ? '-' : fmtNum(acc, 2));
     if (!stale && lastCompute && lastCompute.ok && base) {
       var dv = lastCompute.new_access - base.access;
       parts.push(' <span class="k">(' + (dv >= 0 ? '+' : '') + fmtNum(dv, 2) + ')</span>');
@@ -7458,7 +7586,7 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
     var e = impactEmoji(ipm);
     if (e.emoji) parts.push('<span class="emoji">' + e.emoji + '</span>');
     rest.innerHTML = parts.join('');
-    rest.title = 'access = metro population-weighted mean accessibility_score' +
+    rest.title = 'score = metro population-weighted median transit level of service (baseline median plus this scenario\'s population-weighted delta)' +
       ' | impact = sum over affected res-' + PC.res + ' cells of (new - old) access x population' +
       ' | impact/$M = impact per million USD' +
       (e.score01 == null ? '' : ' | impact_score (0-1, linear between the sad/happy thresholds) = ' + e.score01.toFixed(2)) +
@@ -9646,9 +9774,21 @@ def _maplibre_stops_routes_js(
     // a rendered stop marker/cluster, regardless of which module's JS
     // happened to register its click listener first.
     window.__mapClickPriorityLayers = (window.__mapClickPriorityLayers || []).concat(['__stops_mode_icon', '__stops_cluster']);
+    // Item (verbatim user request): "the stop group circle to be colored
+    // with the stop score colors by the best stops of the group" --
+    // `clusterProperties` asks Supercluster (MapLibre's clustering engine)
+    // to compute `max(stop_score)` per cluster as it builds each zoom
+    // level's clusters, giving a real per-cluster aggregate property
+    // (`max_stop_score`) the paint expression below can read -- the native
+    // MapLibre equivalent of the Leaflet path's `iconCreateFunction`
+    // picking the best child marker by hand.
+    var clusterColorExpr = ['interpolate', ['linear'], ['get', 'max_stop_score']];
+    var scaleN = Math.max(blueScale.length - 1, 1);
+    blueScale.forEach(function(c, i) {{ clusterColorExpr.push(i / scaleN, c); }});
     map.addSource('__stops_overlay', {{
       type: 'geojson', data: stopsFC,
-      cluster: true, clusterRadius: 50, clusterMaxZoom: 16,
+      cluster: true, clusterRadius: 18, clusterMaxZoom: 16,
+      clusterProperties: {{'max_stop_score': ['max', ['coalesce', ['get', 'stop_score'], 0]]}},
     }});
     map.addLayer({{
       id: '__stops_cluster',
@@ -9656,8 +9796,11 @@ def _maplibre_stops_routes_js(
       source: '__stops_overlay',
       filter: ['has', 'point_count'],
       paint: {{
-        'circle-color': '#3a6ea8',
-        'circle-radius': ['step', ['get', 'point_count'], 14, 25, 18, 100, 24],
+        'circle-color': clusterColorExpr,
+        // Item (verbatim user request): "make the stops circles a bit
+        // smaller especially the maximum circles for very large groups" --
+        // shrunk from 14/18/24 to 10/13/16.
+        'circle-radius': ['step', ['get', 'point_count'], 10, 25, 13, 100, 16],
         'circle-stroke-width': 1.5,
         'circle-stroke-color': '#ffffff',
         'circle-opacity': 0.85,
@@ -9730,8 +9873,11 @@ def _maplibre_stops_routes_js(
       filter: ['!', ['has', 'point_count']],
       layout: {{
         'icon-image': ['match', ['get', 'mode'], 'rail', '__mode_icon_rail', 'tram', '__mode_icon_tram', '__mode_icon_bus'],
-        // Bumped from 0.42 (user request: "a bit larger").
-        'icon-size': 0.55,
+        // Bumped from 0.42 to 0.55 (user request: "a bit larger"), then
+        // trimmed slightly (user request: "a bit smaller") alongside
+        // tighter clustering (`clusterRadius`) so more individual stops
+        // stay ungrouped without crowding each other.
+        'icon-size': 0.48,
         'icon-allow-overlap': true,
         'icon-ignore-placement': true,
       }},
@@ -10059,18 +10205,30 @@ def _maplibre_stops_routes_js(
       // headway recomputation on the backend (attempted and reverted --
       // OOM'd a real GTFS feed even at 22 GB, see `stops.py`'s comment).
       var stationMode = (hasRealStation && p.station_modes) ? p.station_modes : p.mode;
-      // The former separate "connecting stops at ..." section (one row per
-      // sibling stop_id sharing this parent station, each with its own
-      // route badges) was dropped: every route it could show is already
-      // covered by "connecting routes via" above, so it only repeated the
-      // same information under stop names instead of route names.
+      // Item (verbatim user request): "connecting routes via [station] here
+      // I would like each single stop id with its routes of the parent
+      // station. So stop id name, routes, stop id name, routes etc" --
+      // replaces the old single flattened/deduplicated route-badge list
+      // (which lost which specific platform each route actually serves)
+      // with one row per sibling stop_id sharing this parent station, each
+      // showing its own name and its own routes -- the same per-platform
+      // breakdown a previous, since-dropped "connecting stops" section
+      // used to show, now merged into this section instead of living
+      // alongside a separate flattened one.
       var connectionsHtml = '';
-      if (hasRealStation && connectionNames.length) {{
-        connectionsHtml += '<div style="margin-top:6px;"><div style="font-weight:600;color:#555;font-size:11px;">connecting routes via ' +
-          stationLabel + '</div><div style="margin-top:2px;">' +
-          connectionNames.map(function(n) {{ return routeBadgeHtml(n, null, 10); }}).join('') + '</div></div>';
-      }} else if (hasRealStation) {{
-        connectionsHtml += '<div style="margin-top:6px;font-size:11px;color:#888;">no other routes at ' + stationLabel + '</div>';
+      if (hasRealStation && siblings.length) {{
+        var siblingRowsHtml = siblings.map(function(s) {{
+          var sRouteNames = splitRoutes(s.stop_routes || s.route || '').filter(function(n) {{
+            return modeVisible(routeStyleFor(n, s.mode).mode);
+          }});
+          var sBadges = sRouteNames.length
+            ? sRouteNames.map(function(n) {{ return routeBadgeHtml(n, s.mode, 10); }}).join('')
+            : '<span style="color:#888;">no routes</span>';
+          return '<div style="margin-top:4px;"><div style="font-size:11px;">' + prettyName(s.stop_name || 'Stop') +
+            '</div><div style="margin-top:2px;">' + sBadges + '</div></div>';
+        }}).join('');
+        connectionsHtml += '<div style="margin-top:6px;"><div style="font-weight:600;color:#555;font-size:11px;">stops at ' +
+          stationLabel + '</div>' + siblingRowsHtml + '</div>';
       }}
       // No `hasRealStation`: this stop_id has no real grouping (its own
       // `parent_station` fallback IS its own `stop_id`, single-member
@@ -10093,8 +10251,9 @@ def _maplibre_stops_routes_js(
       // above -- previously this row just repeated `p.mode`, this
       // platform's own mode, which is the exact bug the user reported).
       rows += '<tr><td colspan="2" style="padding-top:4px;border-top:1px solid #eee;font-weight:600;color:#555;font-size:11px;">' +
-        (hasRealStation ? ('parent station data (' + parentStationLabel + ')') : 'parent station data (same as this platform -- ungrouped)') + '</td></tr>';
-      rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;">mode</td><td>' + stationMode + '</td></tr>';
+        (hasRealStation ? ('parent station data (' + parentStationLabel + ')') : 'parent station data') + '</td></tr>';
+      rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;">mode</td><td>' + stationMode +
+        (p.stop_score != null ? ' <span style="color:#888;">(score ' + fmt2(p.stop_score) + ')</span>' : '') + '</td></tr>';
       if (p.headway_minutes != null) {{
         rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;">headway</td><td>' + fmt2(p.headway_minutes) + ' min' +
           (p.frequency_score != null ? ' <span style="color:#888;">(score ' + fmt2(p.frequency_score) + ')</span>' : '') + '</td></tr>';
@@ -10394,12 +10553,14 @@ def _inject_maplibre_topbar_into_saved_html(path: str, enable_place_comparison: 
     var fields = [];
     if (isBaseline) {
       var base = ed.baselineStats ? ed.baselineStats() : null;
-      if (base && base.access != null) fields.push('access <b>' + fmtNum(base.access, 2) + '</b>');
+      // Item 3 (verbatim user request): "instead of access xx I would like
+      // to have just the number xxx" -- bare value, no "access" label.
+      if (base && base.access != null) fields.push('<b>' + fmtNum(base.access, 2) + '</b>');
       // cost/impact are never applicable to the baseline (no edits) -- omitted, not "-".
     } else {
       var lc = ed.lastCompute ? ed.lastCompute() : null;
       if (lc && lc.ok) {
-        if (lc.new_access != null) fields.push('access <b>' + fmtNum(lc.new_access, 2) + '</b>');
+        if (lc.new_access != null) fields.push('<b>' + fmtNum(lc.new_access, 2) + '</b>');
         if (lc.cost_musd != null) fields.push('cost <b>$' + fmtNum(lc.cost_musd, 1) + 'M</b>');
         if (lc.impact != null) fields.push('impact <b>' + fmtNum(lc.impact, Math.abs(lc.impact) < 100 ? 1 : 0) + '</b>');
       }
@@ -10888,6 +11049,8 @@ def _inject_controls_into_saved_html(
     default_shape: str = "hexagons",
     enable_place_comparison: bool = True,
     share_source_map: Optional[Dict[str, str]] = None,
+    radius_field_domains_by_res: Optional[Dict[int, Dict[str, tuple]]] = None,
+    circle_zoom_bands: Optional[Dict[int, tuple]] = None,
 ) -> None:
     """Post-process an already-`.save()`d map HTML file to add controls + legend + stats panel.
 
@@ -10940,6 +11103,8 @@ def _inject_controls_into_saved_html(
         + _control_panel_js(
             map_var, default_circle_field, radius_field_domains, opacity_field_domains, base_layer_vars,
             default_shape=default_shape,
+            radius_field_domains_by_res=radius_field_domains_by_res,
+            circle_zoom_bands=circle_zoom_bands,
         )
         + "\n});\n</script>\n"
     )

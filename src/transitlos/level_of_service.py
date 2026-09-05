@@ -131,6 +131,7 @@ def compute_level_of_service(
     max_walk_distance_m: Optional[float] = None,
     chunk_h3_resolution: Optional[int] = None,
     chunk_buffer_m: float = 1000.0,
+    stops_crop_buffer_m: float = 500.0,
     **stops_kwargs,
 ) -> gpd.GeoDataFrame:
     """Compute a street-edges GeoDataFrame with a transit-access `level_of_service` column.
@@ -194,6 +195,9 @@ def compute_level_of_service(
             `max_walk_distance_m` above and
             `AccessibilityAnalyzer.run`/`compute_node_access_chunked`'s own
             docstrings) or results near chunk boundaries will be truncated.
+        stops_crop_buffer_m: Metres to buffer `aoi` by before querying
+            stops (only when `stops` is not given directly) -- see the
+            note where it's used, below. `0` for the exact-AOI behavior.
         **stops_kwargs: Extra keyword arguments forwarded to
             `download_and_prepare_stops` (e.g. `route_types`).
 
@@ -206,7 +210,23 @@ def compute_level_of_service(
         network = prepare_street_network(aoi, cache_dir=cache_dir, pbf_path=pbf_path)
 
     if stops is None:
-        stops = download_and_prepare_stops(feed_source, aoi=aoi.gdf, date_range=date_range, **stops_kwargs)
+        # Buffered (2026-09-04, explicit user request: "for stops and
+        # streets use a buffer specified by user (or 500m) to avoid
+        # boundary issues. Everything else should be for the exact aoi")
+        # -- a real stop just outside the exact AOI edge (e.g. a station
+        # whose platform/entrance sits a few dozen metres past the
+        # boundary) still legitimately serves people just inside it; an
+        # unbuffered crop would silently drop it and understate access
+        # right at the border. Population/census attribution stays on the
+        # real, unbuffered AOI elsewhere in the pipeline -- this buffer is
+        # scoped to the stops query alone.
+        stops_aoi_gdf = aoi.gdf.copy()
+        if stops_crop_buffer_m:
+            utm_crs = stops_aoi_gdf.estimate_utm_crs()
+            stops_aoi_gdf = stops_aoi_gdf.to_crs(utm_crs)
+            stops_aoi_gdf["geometry"] = stops_aoi_gdf.geometry.buffer(stops_crop_buffer_m)
+            stops_aoi_gdf = stops_aoi_gdf.to_crs(aoi.gdf.crs)
+        stops = download_and_prepare_stops(feed_source, aoi=stops_aoi_gdf, date_range=date_range, **stops_kwargs)
 
     if "stop_score" not in stops.columns:
         stops = compute_stop_scores(stops, region=region, weights=weights)
@@ -232,9 +252,16 @@ def compute_level_of_service(
         chunk_h3_resolution=chunk_h3_resolution, chunk_buffer_m=chunk_buffer_m,
     )
     result = analyzer.to_gdf()
+    # `AccessibilityAnalyzer.to_gdf()` names its output column `access_score`
+    # (UrbanAccessAnalyzer's own generic naming); this module's public
+    # contract (see this function's docstring) is a `level_of_service`
+    # column, so rename here rather than downstream everywhere it's
+    # consumed.
+    #
     # Final safety-net discretization: `exact_edge_access` can produce
     # edge-interpolated values between matrix grid points, so re-apply the
     # ceiling-to-0.1 rule to the actual output column, not just the matrix
     # cells that fed it.
-    result["level_of_service"] = ceil_to_grid_array(result["level_of_service"].to_numpy())
+    result["level_of_service"] = ceil_to_grid_array(result["access_score"].to_numpy())
+    result = result.drop(columns=["access_score"])
     return result

@@ -1,7 +1,7 @@
 """Unit test for `equity_flag`'s `more_transit`/`more_housing` split, against a
 synthetic dataset with hand-computed expected results.
 
-`code/stats.py` lives in `TransitLOSStudies/CS_transitLOS/code/`, a sibling
+`code/stats.py` lives in `TransitLOSStudies/city_science_network/code/`, a sibling
 project, not a transitLOS dependency -- import it by path.
 """
 
@@ -20,7 +20,7 @@ import numpy as np
 _STATS_PATH = (
     Path(__file__).resolve().parents[2]
     / "TransitLOSStudies"
-    / "CS_transitLOS"
+    / "city_science_network"
     / "code"
     / "stats.py"
 )

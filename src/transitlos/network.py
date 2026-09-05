@@ -37,22 +37,20 @@ def prepare_street_network(
             for `aoi` via Geofabrik (see `StreetNetwork.from_pbf`'s
             docstring). Required when `cache_dir` is `None` or has no cached
             network yet.
-        network_type: Defaults to `"all"` (item 3 fix), not the old
-            `"walk"` profile -- `"walk"` only kept a highway-tag whitelist
-            (`osm_io.WALK_HIGHWAYS`: footway/pedestrian/path/living_street/
-            steps/residential/service/unclassified/track) and silently
-            dropped every other OSM street/way type (primary/secondary/
-            trunk arterials, etc), even though pedestrians walk along those
-            too (sidewalks/shoulders). `"all"` applies no highway-tag
-            filter at all.
-        ignore_oneway: Defaults to `True` (item 3 fix) -- forwarded to
+        network_type: Defaults to `"all"` -- every public road included
+            regardless of walk-permission, including highway/trunk. This
+            was briefly `"walk"` (2026-09-04, an explicit request to
+            exclude highway/trunk roads except where needed for
+            connectivity), reverted the same day (explicit follow-up:
+            "delete this idea of excluding highway and only include edges
+            really needed for the graph. Include all public roads
+            regardless if they are walk or not including highway"). No
+            highway-tag filter at all -- see `osm_io.NETWORK_PROFILES["all"]`.
+        ignore_oneway: Defaults to `True` -- forwarded to
             `StreetNetwork.from_pbf`/`osm_io.load_pbf` so every included
             edge is traversable in both directions for this walking-access
             graph, regardless of any OSM `oneway` tag (a vehicle-traffic
-            restriction pedestrians aren't bound by). Redundant with
-            `network_type="walk"` (which already ignores oneway
-            unconditionally, independent of this flag), but load-bearing
-            now that the default `network_type` is `"all"`.
+            restriction pedestrians aren't bound by).
 
     Returns:
         A `StreetNetwork` already simplified and cropped to `aoi`.
