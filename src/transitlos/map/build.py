@@ -2601,7 +2601,21 @@ function __resForZoom(z) {{
   }});
   if (best != null) return best;
   var keys = Object.keys(__circleZoomBands).map(Number);
-  return keys.length ? String(Math.max.apply(null, keys)) : null;
+  if (!keys.length) return null;
+  // 2026-09-06 bug fix (live report -- circle legend showing a tiny max
+  // value like "10" at very low zoom, when the huge res-5 circles actually
+  // on screen hold thousands of people): `z` past every band means EITHER
+  // zoomed in further than the finest resolution's band (rare, should keep
+  // showing the finest res) OR zoomed OUT further than the coarsest
+  // resolution's band lower bound (the common case at low zoom -- H3
+  // resolution numbers increase with granularity, so the coarsest
+  // resolution is the LOWEST key, not the highest). Picking `Math.max`
+  // unconditionally always answered "finest resolution", so a low-zoom
+  // legend was reading the finest resolution's tiny per-cell domain
+  // instead of the coarse resolution's actual (huge) one.
+  var minKey = Math.min.apply(null, keys), maxKey = Math.max.apply(null, keys);
+  var belowAll = z < __circleZoomBands[String(minKey)][0];
+  return String(belowAll ? minKey : maxKey);
 }}
 // Assigned onto `window`, not a plain top-level `function` declaration --
 // this whole block runs inside its own `window.addEventListener('load',
@@ -2615,11 +2629,48 @@ function __resForZoom(z) {{
 // found 2026-08-12 via headless-browser reproduction). `window` is shared
 // across every closure, so this makes the helper reachable from any of
 // this page's independently-injected scripts.
-window.__fmtLegendNum = function(v) {{
+// 2026-09-06, explicit user request ("numbers with k or M to try avoiding
+// numbers with more than 3 significant digits. No decimals if some of the
+// legend values are above 100"): `refAbs` is the largest magnitude among a
+// legend's related values (e.g. a circle-size legend's min/mid/max shown
+// together) -- when given and >= 100, EVERY value in that group drops
+// decimals for a consistent look, even a small one that would otherwise
+// still show a decimal (a legend reading "0.5 / 50 / 12k" mixes precision
+// levels the moment any sibling value is large). Single-value call sites
+// (regression axis ticks, etc.) omit `refAbs`, keeping this function's
+// original per-value behavior for them.
+window.__fmtLegendNum = function(v, refAbs) {{
   if (v == null || isNaN(v)) return '';
   var abs = Math.abs(v);
   if (abs === 0) return '0';
-  if (abs >= 1000) return Math.round(v).toLocaleString();
+  var ref = (refAbs != null && isFinite(refAbs)) ? Math.abs(refAbs) : abs;
+  var noDecimals = ref >= 100;
+  // >=4-digit values get a k/M suffix instead of a long run of digits (e.g.
+  // 12345 -> "12.3k", not "12,345") -- chosen from the VALUE's own
+  // magnitude, not the group's, so a small sibling in a mixed-magnitude
+  // legend (e.g. min=50 next to max=10050) still reads "50", not a
+  // group-scale "0k". Only the decimals-or-not policy above is shared
+  // across the group.
+  var scale = 1, suffix = '';
+  if (abs >= 1e6) {{ scale = 1e6; suffix = 'M'; }}
+  else if (abs >= 1e3) {{ scale = 1e3; suffix = 'k'; }}
+  if (scale > 1) {{
+    var scaled = v / scale;
+    if (noDecimals) {{
+      var rounded = Math.round(scaled);
+      // A k-value that rounds up to a full 1000 belongs in the next
+      // suffix tier (e.g. 999,999 -> "1M", not the confusing "1,000k").
+      if (suffix === 'k' && Math.abs(rounded) >= 1000) return Math.round(v / 1e6) + 'M';
+      return rounded.toLocaleString() + suffix;
+    }}
+    // 3 significant figures: 2 decimals under 10, 1 decimal under 100, none above.
+    var scaledAbs = Math.abs(scaled);
+    var dec = scaledAbs >= 100 ? 0 : (scaledAbs >= 10 ? 1 : 2);
+    var s = scaled.toFixed(dec);
+    if (dec > 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
+    return s + suffix;
+  }}
+  if (noDecimals) return Math.round(v).toLocaleString();
   if (abs >= 1) {{
     // 1 decimal place, unless that rounds to a whole number (or the field is
     // already an integer) -- then show no decimal at all.
@@ -2659,9 +2710,13 @@ function __updateCircleLegend(field) {{
     if (res != null && __radiusFieldDomainsByRes[res]) domains = __radiusFieldDomainsByRes[res];
   }}
   var d = domains[field];
-  document.getElementById('circleLegendMin').textContent = d ? __fmtLegendNum(d[0]) : '';
-  document.getElementById('circleLegendMid').textContent = d ? __fmtLegendNum((d[0] + d[1]) / 2) : '';
-  document.getElementById('circleLegendMax').textContent = d ? __fmtLegendNum(d[1]) : '';
+  // Shared `refAbs` (the group's own max) so min/mid/max always agree on
+  // one k/M scale and one decimals-or-not policy -- see `__fmtLegendNum`'s
+  // comment on why a per-value decision looks inconsistent across a legend.
+  var refAbs = d ? Math.max(Math.abs(d[0]), Math.abs(d[1])) : null;
+  document.getElementById('circleLegendMin').textContent = d ? __fmtLegendNum(d[0], refAbs) : '';
+  document.getElementById('circleLegendMid').textContent = d ? __fmtLegendNum((d[0] + d[1]) / 2, refAbs) : '';
+  document.getElementById('circleLegendMax').textContent = d ? __fmtLegendNum(d[1], refAbs) : '';
 }}
 
 document.getElementById('circleFieldSelect').addEventListener('change', function(e) {{
@@ -6117,11 +6172,34 @@ def _stats_panel_helper_js() -> str:
     return (
         "<script>\n"
         + _color_interp_js() + "\n"
-        + "window.__fmtLegendNum = function(v) {\n"
+        # Kept in lockstep with `_control_panel_js`'s own `window.__fmtLegendNum`
+        # (see that copy's 2026-09-06 comment on the `refAbs` k/M-suffix rule)
+        # -- this string-literal copy exists only for pages with no circle-size
+        # legend at all (see this function's own docstring), so it never needs
+        # a `refAbs` argument, but keeps the same magnitude-scaling behavior.
+        + "window.__fmtLegendNum = function(v, refAbs) {\n"
         "  if (v == null || isNaN(v)) return '';\n"
         "  var abs = Math.abs(v);\n"
         "  if (abs === 0) return '0';\n"
-        "  if (abs >= 1000) return Math.round(v).toLocaleString();\n"
+        "  var ref = (refAbs != null && isFinite(refAbs)) ? Math.abs(refAbs) : abs;\n"
+        "  var noDecimals = ref >= 100;\n"
+        "  var scale = 1, suffix = '';\n"
+        "  if (abs >= 1e6) { scale = 1e6; suffix = 'M'; }\n"
+        "  else if (abs >= 1e3) { scale = 1e3; suffix = 'k'; }\n"
+        "  if (scale > 1) {\n"
+        "    var scaled = v / scale;\n"
+        "    if (noDecimals) {\n"
+        "      var rounded = Math.round(scaled);\n"
+        "      if (suffix === 'k' && Math.abs(rounded) >= 1000) return Math.round(v / 1e6) + 'M';\n"
+        "      return rounded.toLocaleString() + suffix;\n"
+        "    }\n"
+        "    var scaledAbs = Math.abs(scaled);\n"
+        "    var dec = scaledAbs >= 100 ? 0 : (scaledAbs >= 10 ? 1 : 2);\n"
+        "    var s2 = scaled.toFixed(dec);\n"
+        "    if (dec > 0) s2 = s2.replace(/0+$/, '').replace(/\\.$/, '');\n"
+        "    return s2 + suffix;\n"
+        "  }\n"
+        "  if (noDecimals) return Math.round(v).toLocaleString();\n"
         "  if (abs >= 1) {\n"
         "    var rounded1 = Math.round(v * 10) / 10;\n"
         "    if (Math.abs(rounded1 - Math.round(rounded1)) < 1e-9) return Math.round(rounded1).toLocaleString();\n"
