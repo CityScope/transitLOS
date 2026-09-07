@@ -1053,6 +1053,27 @@ def _column_metadata_rows(gdf, share_source_map: Optional[Dict[str, str]] = None
             del rows_by_col[share_col]
             order.remove(share_col)
 
+    # 2026-09-07 bug fix (live report, Beersheba): a source-prefixed real
+    # census column (e.g. `cbs_population`) and an unrelated bare column
+    # (e.g. `population`, always WorldPop -- see `_metadata_source_for`)
+    # can independently strip/humanize to the exact SAME display name
+    # ("Population") even though they're different columns with different
+    # real values -- `_rename_canonical_columns` in `code/pipeline.py`
+    # already refuses to MERGE them (keeps `cbs_population` prefixed
+    # specifically because bare `population` already exists), but nothing
+    # here accounted for that same collision when building each row's
+    # display label, so both rows silently rendered under one identical
+    # name with no way to tell which was which. Disambiguate generically
+    # (any country/column pair, not just this one) by appending the
+    # source whenever two or more rows share a name.
+    name_counts: Dict[str, int] = {}
+    for col in order:
+        name_counts[rows_by_col[col]["name"]] = name_counts.get(rows_by_col[col]["name"], 0) + 1
+    for col in order:
+        row = rows_by_col[col]
+        if name_counts[row["name"]] > 1:
+            row["name"] = f"{row['name']} ({row['source'] or col})"
+
     return [
         {k: v for k, v in rows_by_col[col].items() if not k.startswith("_")}
         for col in order
@@ -3159,6 +3180,24 @@ def build_city_map(
     has_development_gdf = development_gdf is not None and not development_gdf.empty and "equity_flag" in development_gdf.columns
     show_development = has_development_gdf or (has_census and "equity_flag" in finest.columns)
 
+    # ONE canonical (count_fields, share_fields) split, computed once from
+    # `finest` and reused verbatim by every count-type selector
+    # (circle-size, distribution main/overlay) and every share-type selector
+    # (opacity-by, regression, ANOVA) via `_stats_field_candidates`/
+    # `_stats_count_fields` below, which are now thin wrappers around this
+    # same split rather than independent re-derivations. Real bug fixed
+    # 2026-09-07 (live report, Beersheba): `circleFieldSelect` vs.
+    # `distMainSelect`, and `opacitySelect` vs. `regFieldSelect`, each built
+    # their own field list from scratch -- close but not identical, since
+    # e.g. CS_transitLOS's `_apply_map_field_policy` used to patch
+    # `_stats_count_fields` alone to sneak `population` back in for the
+    # distribution tab without doing the same for `circle_fields`, and
+    # `opacity_fields` applied an extra census-polygon-presence filter (see
+    # its own comment below) that `regression_fields` never did. Building
+    # this ONE pair up front removes the possibility of the two drifting.
+    _all_candidates = _numeric_field_candidates(finest, extra_exclude=[score_col])
+    _canonical_count_fields = absolute_fields(_all_candidates)
+    _canonical_share_fields = relative_fields(_all_candidates)
     if circle_fields is None:
         # 2026-09-05, explicit user request: "circle size by only allow
         # count columns" -- a circle's AREA already encodes magnitude
@@ -3168,7 +3207,7 @@ def build_city_map(
         # `opacity_fields` below), which is what this swaps to. See
         # `is_relative_field`/`absolute_fields` for the naming-convention
         # rule this filters on.
-        circle_fields = absolute_fields(_numeric_field_candidates(finest, extra_exclude=[score_col]))
+        circle_fields = list(_canonical_count_fields)
         if not circle_fields and "population" in finest.columns:
             circle_fields = ["population"]
     if opacity_fields is None:
@@ -3176,42 +3215,29 @@ def build_city_map(
         # relative or density columns" -- the complement of `circle_fields`
         # above, computed independently (not derived FROM circle_fields
         # anymore, since that now holds counts instead of relative fields).
-        opacity_fields = relative_fields(_numeric_field_candidates(finest, extra_exclude=[score_col]))
-        # Real bug (2026-08-25, reported: "opacity by affect all census
-        # polygons by the same amount"): `__opacityFieldDomains`/the "Opacity
-        # by" dropdown are ONE GLOBAL set shared by every shape (hexagons,
-        # circles, AND census polygons -- see `__shapeLayerIdTypes` in
-        # `geohierarchy.maps.maplibre.render`), but `opacity_fields` here was
-        # derived purely from `finest` (the H3 hex grid). Fields that exist
-        # only there -- `pop_density`, `cbs_populationDensity`,
-        # `cbs_jewish_share` and every other `SHARE_COLUMNS` ratio,
-        # `worldpop_*_share`, `foreign_born_share` -- are simply never
-        # materialized on the census-polygon GeoDataFrames that get tiled
-        # for the "census" shape (confirmed by decoding a real built city's
-        # census `.pmtiles`: those keys are entirely absent from every
-        # feature's properties, not just null on some). Selecting ANY of
-        # them while the census shape is active makes `['get', field]`
-        # return `null` on literally every census feature, so `coalesce`
-        # (see `__shapeOpacityExpr`'s own null-safety comment) falls back to
-        # the domain minimum for 100% of them -- a uniform, value-independent
-        # opacity indistinguishable from "opacity by isn't working," even
-        # though the SAME field genuinely varies on hexagons/circles. Only
-        # the minority of fields that are real `*_rate`/`*_share_<bucket>`
-        # columns already published by the census source itself (e.g.
-        # `cbs_renter_rate`) happen to survive onto census polygons and
-        # actually work. Restricting the auto-derived candidate list to
-        # fields present on EVERY census level's own GeoDataFrame (not just
-        # the h3 grid) keeps the shared dropdown honest: every option it
-        # offers now actually varies on whichever shape is currently active,
-        # census included -- at the cost of a few h3-only derived fields no
-        # longer appearing in the (necessarily shared) dropdown at all.
-        if has_census and census_by_level:
-            _census_cols = None
-            for _cbl in census_by_level.values():
-                _cols = set(_cbl.columns)
-                _census_cols = _cols if _census_cols is None else (_census_cols & _cols)
-            if _census_cols:
-                opacity_fields = [f for f in opacity_fields if f in _census_cols]
+        opacity_fields = list(_canonical_share_fields)
+        # 2026-08-25 -> 2026-09-07: this dropdown used to be further
+        # restricted to fields present on EVERY census level's own
+        # GeoDataFrame (not just the h3 grid), because `opacitySelect` is
+        # ONE GLOBAL dropdown shared by every shape (hexagons, circles, AND
+        # census polygons -- see `__shapeLayerIdTypes` in
+        # `geohierarchy.maps.maplibre.render`) and a field absent from a
+        # census polygon's own tiled properties makes `['get', field]`
+        # return `null` there, so `coalesce` (see `__shapeOpacityExpr`'s own
+        # null-safety comment) falls back to the domain minimum for every
+        # census feature -- a uniform, value-independent opacity on that
+        # shape only, even though the SAME field genuinely varies on
+        # hexagons/circles.
+        #
+        # Per explicit user request ("in all share column selectors such as
+        # regression, opacity by show exactly the same column list"),
+        # `opacity_fields` is now the same canonical `share_fields` list
+        # `regression_fields` uses -- no census-presence filtering. The
+        # tradeoff above still applies (a handful of h3-only share/density
+        # fields degrade to a flat minimum opacity specifically while the
+        # census shape is active), but it degrades gracefully (documented
+        # coalesce fallback, not an error) and is preferred over the
+        # dropdowns silently disagreeing with each other.
 
     # Percentile-clipped (not true min/max) for the same reason as
     # `opacity_field_domains` below: a few extreme outliers otherwise stretch
@@ -3556,7 +3582,18 @@ def build_city_map(
                 maplibre_paint=_score_maplibre_paint("polygon", score_col, score_domain),
             )
         _apply_zoom_bands(census_map, census_level_names_real, census_zoom_bands)
-        if len(census_level_names_real) >= 2:
+        # 2026-09-01: widens the second-finest level's zoom band down to
+        # render under the finest level at EVERY zoom -- wanted for a real
+        # coverage hole (Mexico: block data exists but blockgroup polygons
+        # don't, so blockgroup fills the gap). 2026-09-07 bug fix (live
+        # Hamburg report): when the finest level is `census_grid` (a real,
+        # wall-to-wall 100m Zensus raster -- see `_germany_grid_census_loader`),
+        # any area it doesn't cover is genuinely no-data, not a polygon
+        # coverage gap -- applying the same fallback there made municipality
+        # (Gemeinde) polygons visibly show through underneath the grid at
+        # its own high-zoom band, which is the opposite of what a raster's
+        # "no data" should look like.
+        if len(census_level_names_real) >= 2 and census_level_names_real[-1] != "census_grid":
             census_map.set_fallback_level(census_level_names_real[-2])
         if not skip_tile_build:
             with contextlib.chdir(out_dir):
@@ -3801,10 +3838,12 @@ def build_city_map(
                 # config the Folium editor also reads. See
                 # `_maplibre_compute_access_js`'s docstring for what this
                 # scoped port does and doesn't cover.
-                finest = next(iter(stats_by_area.values()))
-                fields = _stats_field_candidates(finest)
-                count_fields = _stats_count_fields(fields)
-                stats_data_json = _stats_json_data(stats_by_area, list(dict.fromkeys(fields + count_fields)))
+                _editor_finest = next(iter(stats_by_area.values()))
+                _editor_fields = _stats_field_candidates(_editor_finest)
+                _editor_count_fields = circle_fields if circle_fields else _stats_count_fields(_editor_fields)
+                stats_data_json = _stats_json_data(
+                    stats_by_area, list(dict.fromkeys(_editor_fields + _editor_count_fields))
+                )
                 _inject_maplibre_editor_into_saved_html(
                     os.path.basename(out_html_abs),
                     params=load_edit_params(),
@@ -6273,15 +6312,29 @@ def _stats_panel_block(
     region: str = "global",
     enable_place_comparison: bool = True,
     share_source_map: Optional[Dict[str, str]] = None,
+    count_fields: Optional[List[str]] = None,
+    share_fields: Optional[List[str]] = None,
 ) -> str:
-    """Assemble the stats-panel data script + HTML + wiring JS for injection into the saved map."""
+    """Assemble the stats-panel data script + HTML + wiring JS for injection into the saved map.
+
+    `count_fields`/`share_fields`, when given, are the SAME canonical lists
+    `build_city_map` already computed for the circle-size/opacity-by
+    dropdowns (`circle_fields`/`opacity_fields`) -- passing them through
+    here (rather than letting this function re-derive its own from
+    `stats_by_area`'s own grid) is what keeps `distMainSelect`/`regFieldSelect`
+    showing the EXACT same options as `circleFieldSelect`/`opacitySelect`,
+    per explicit user request (2026-09-07). `None` (the default, used by
+    `build_place_rank_panel_block`'s caller, which has no per-city grid of
+    its own) falls back to deriving them independently from `stats_by_area`,
+    same as before.
+    """
     finest = next(iter(stats_by_area.values()))
     all_fields = _stats_field_candidates(finest)
     # Regression and ANOVA correlate a variable against level_of_service, which
     # only makes sense for intensive (relative) variables -- see
     # `is_relative_field`. The distribution tab's overlay bar sums its
     # variable per score bin, so it takes the exact complement.
-    regression_fields = relative_fields(all_fields)
+    regression_fields = list(share_fields) if share_fields is not None else relative_fields(all_fields)
     if not regression_fields:
         regression_fields = ["pop_density"] if "pop_density" in finest.columns else []
     # Item 1 fix: this used to be `[] ` for non-US cities, which left the
@@ -6293,7 +6346,7 @@ def _stats_panel_block(
     # `code/pipeline.py`), and `absolute_fields` naturally narrows to just
     # that (pop_density is relative, so it's excluded here) when no ACS
     # columns are present -- so this no longer needs to be US-gated.
-    count_fields = _stats_count_fields(all_fields)
+    count_fields = list(count_fields) if count_fields is not None else _stats_count_fields(all_fields)
     data_json = _stats_json_data(stats_by_area, list(dict.fromkeys(regression_fields + count_fields)))
     # Item 1 (user feedback, 2026-08-19): the "Compare with" popover's area
     # (city core / metro) sub-dimension is only offered when this map
