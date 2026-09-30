@@ -12,7 +12,9 @@ Geometry source, in priority order (per the "shapes if available, else
 straight lines between consecutive stops" requirement):
 
 1. `shapes.txt` polylines referenced by that route's trips (the real,
-   on-street alignment).
+   on-street alignment) -- EXCEPT a shape whose own points turn out to just
+   be that trip's stops connected (see `_stop_derived_shape_ids`), which is
+   treated the same as having no shape at all, not a real alignment.
 2. If a route has no usable shape, the stop sequence of its longest trip
    (`stop_times.txt` ordered by `stop_sequence`, joined to `stops.txt`
    coordinates) connected by straight segments.
@@ -38,7 +40,7 @@ import pandas as pd
 from shapely.geometry import LineString, MultiLineString
 from shapely.ops import unary_union
 
-from ..scoring.mode import mode_category
+from ..scoring.mrc import mode_category
 
 #: Fallback line color per mode when GTFS supplies no `route_color`
 #: (dark green rail / brown tram / dark red bus, per the map's spec). Also
@@ -174,6 +176,95 @@ def _stop_sequence_lines(feed_dir: Path, route_ids: set[str], trips: pd.DataFram
     return out
 
 
+#: A shapes.txt shape with this few points or fewer is cheap enough to
+#: fully vertex-compare against its trip's own stop sequence (see
+#: `_stop_derived_shape_ids`) -- a real GPS/OSM-traced shape almost always
+#: has far more points than a route has stops, so this also keeps the
+#: (otherwise expensive, `stop_times.txt`-reading) check limited to the
+#: shapes actually worth suspecting.
+_SYNTHETIC_MAX_SHAPE_POINTS = 40
+#: How close (in degrees, ~30 m) each of a candidate shape's points must sit
+#: to the correspondingly-ordered stop for the shape to be judged "just the
+#: stops connected", not a real alignment.
+_STOP_SHAPE_MATCH_TOL_DEG = 0.0003
+
+
+def _stop_derived_shape_ids(
+    feed_dir: Path,
+    shape_lines: dict[str, LineString],
+    trips: pd.DataFrame,
+) -> set[str]:
+    """`shape_id`s whose shapes.txt polyline is just that trip's own stops connected.
+
+    2026-09-29, explicit user request: "I dont want maps to render as
+    linestrings routes that do not have a shapes.txt shape id and only have
+    one computed by pygtfshandler based on stop location. In that case I
+    only want to display stops but not the linestrings." A shape_id merely
+    being PRESENT in `shapes.txt` isn't enough to call it a real alignment --
+    some feed producers (and some feed-reconstruction tools, including
+    `pyGTFSHandler.models.shapes`' own straight-line-between-stops fallback
+    when a feed is rebuilt with no real geometry -- see that module's
+    docstring) write a "shape" whose points are literally that trip's own
+    stop coordinates in `stop_sequence` order. `has_real_shape` (this
+    module's whole reason for existing, see `build_route_lines`'s docstring)
+    is meant to catch exactly this, alongside the simpler "no shape_id/no
+    shapes.txt at all" case `by_route`/`missing` already handle below.
+
+    Detected by, for each small-vertex-count shape (see
+    `_SYNTHETIC_MAX_SHAPE_POINTS`'s docstring for why only these are worth
+    checking): finding any one trip that references it and comparing the
+    shape's own point sequence to that trip's own ordered stop coordinates
+    -- same point count, each point within `_STOP_SHAPE_MATCH_TOL_DEG` of
+    its correspondingly-ordered stop.
+    """
+    candidates = {sid for sid, line in shape_lines.items() if len(line.coords) <= _SYNTHETIC_MAX_SHAPE_POINTS}
+    if not candidates or "shape_id" not in trips.columns:
+        return set()
+
+    cand_trips = trips.dropna(subset=["shape_id", "trip_id"])
+    cand_trips = cand_trips[cand_trips["shape_id"].astype(str).isin(candidates)]
+    cand_trips = cand_trips.drop_duplicates("shape_id")  # one representative trip per candidate shape
+    if cand_trips.empty:
+        return set()
+
+    stop_times = _read_csv(feed_dir / "stop_times.txt", ["trip_id", "stop_id", "stop_sequence"])
+    stops = _read_csv(feed_dir / "stops.txt", ["stop_id", "stop_lat", "stop_lon"])
+    if stop_times is None or stops is None:
+        return set()
+
+    wanted_trip_ids = set(cand_trips["trip_id"])
+    st = stop_times[stop_times["trip_id"].isin(wanted_trip_ids)].copy()
+    if st.empty:
+        return set()
+    st["stop_sequence"] = pd.to_numeric(st["stop_sequence"], errors="coerce")
+    st = st.dropna(subset=["stop_sequence"])
+
+    stops = stops.copy()
+    stops["stop_lat"] = pd.to_numeric(stops["stop_lat"], errors="coerce")
+    stops["stop_lon"] = pd.to_numeric(stops["stop_lon"], errors="coerce")
+    stops = stops.dropna(subset=["stop_lat", "stop_lon"])
+    st = st.merge(stops, on="stop_id", how="inner").sort_values(["trip_id", "stop_sequence"])
+
+    trip_to_shape = dict(zip(cand_trips["trip_id"], cand_trips["shape_id"].astype(str)))
+    synthetic: set[str] = set()
+    for trip_id, grp in st.groupby("trip_id", sort=False):
+        shape_id = trip_to_shape.get(trip_id)
+        line = shape_lines.get(shape_id)
+        if line is None or shape_id in synthetic:
+            continue
+        stop_coords = list(zip(grp["stop_lon"].to_numpy(), grp["stop_lat"].to_numpy()))
+        shape_coords = list(line.coords)
+        if len(stop_coords) != len(shape_coords) or len(stop_coords) < 2:
+            continue
+        matches = all(
+            abs(sx - px) <= _STOP_SHAPE_MATCH_TOL_DEG and abs(sy - py) <= _STOP_SHAPE_MATCH_TOL_DEG
+            for (sx, sy), (px, py) in zip(stop_coords, shape_coords)
+        )
+        if matches:
+            synthetic.add(shape_id)
+    return synthetic
+
+
 def _collapse_branches(lines: list[LineString]) -> Optional[Union[LineString, MultiLineString]]:
     """Reduce a route's many trip shapes to one feature, keeping genuine branches.
 
@@ -241,7 +332,7 @@ def build_route_lines(
         `route_uid` (feed-qualified, unique across feeds), `route_id`,
         `feed`, `route_label` (`route_short_name` -> `route_long_name` ->
         `route_id`), `route_short_name`, `route_long_name`, `mode`
-        (`transitlos.scoring.mode.mode_category` of `route_type`), `color`
+        (`transitlos.scoring.mrc.mode_category` of `route_type`), `color`
         (GTFS `route_color` or `MODE_FALLBACK_COLOR[mode]`), `text_color`
         (GTFS `route_text_color` or white), `has_real_shape` (`True` if any
         of the route's trips had real `shapes.txt` geometry, `False` if
@@ -271,6 +362,8 @@ def build_route_lines(
             shape_lines = _shape_lines(shapes)
             for bad_id in EXCLUDED_SHAPE_IDS:
                 shape_lines.pop(bad_id, None)
+            for stop_derived_id in _stop_derived_shape_ids(feed_dir, shape_lines, trips):
+                shape_lines.pop(stop_derived_id, None)
 
         by_route: dict[str, list[LineString]] = {}
         if "shape_id" in trips.columns and shape_lines:

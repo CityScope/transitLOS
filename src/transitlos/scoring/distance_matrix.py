@@ -3,6 +3,22 @@ D(t; stop_score) decay, with output discretized onto a fixed {0.0, 0.1, ..., 1.0
 level_of_service grid -- replacing `UrbanAccessAnalyzer.isochrones.default_distance_matrix`'s
 own step-function decay, at the user's explicit request (2026-08-12).
 
+**2026-09-28 note (restored stop_score/mode coupling)**: `D(t; stop_score)`
+is once again a function of `stop_score` (via `t0(stop_score)`, mode-scaled
+-- see `walk_access.py`), so this module now requires a single `mode` per
+call and treats the *maximum* `stop_score` present as the reference score
+used only to pick distance-column thresholds (the most generous, longest-
+tolerance curve among the given stops, so no real stop's natural D(t)=0.05
+threshold falls beyond the chosen columns). Each stop's own actual
+`stop_score` (not the reference) is still used when computing that stop's
+signature/bucket at those columns, so per-stop accuracy is unaffected --
+only the *set of distance columns* computed is shared. Different modes have
+different `t0_base`, and therefore different distance-column sets; callers
+with a mode-mixed stops table must call this once per mode and run
+`AccessibilityAnalyzer` once per mode's subset of stops (see
+`level_of_service.py`, which does this and combines results by taking the
+per-edge maximum access_score across mode-runs).
+
 Why this exists (read `level_of_service.py`'s module docstring first): the
 previous pipeline deliberately never called `walk_access.walk_decay` because
 `AccessibilityAnalyzer.default_distance_matrix` already applies its own
@@ -102,6 +118,7 @@ def _target_grid_midpoints() -> list[float]:
 
 def build_intelligent_distance_matrix(
     stop_scores: Sequence[float],
+    mode: str,
     region: str = "global",
     max_distance_m: float | None = None,
 ) -> tuple[pl.DataFrame, dict[float, float], list[float]]:
@@ -109,9 +126,13 @@ def build_intelligent_distance_matrix(
 
     Args:
         stop_scores: The distinct (or a representative sample of) stop_score
-            values actually present in the stops being scored. Only their
-            range matters -- used to pick a reference stop_score for
-            distance-step placement and to build the bucket mapping.
+            values actually present in the stops being scored, for ONE mode
+            (see module docstring). Only their range matters -- the maximum
+            is used as the reference stop_score for distance-step placement;
+            each stop's own value is used for its own bucket signature.
+        mode: One of `"bus"`, `"rail"`, `"tram"` -- selects `t0_base` for
+            every stop passed here (see `mrc.mode_category`). All stops
+            passed to one call must share this mode.
         region: Region key forwarded to `accessibility_score`/`walk_decay`
             (see `parameters.py` -- every region uses the same decay-shape
             defaults unless explicitly overridden).
@@ -156,19 +177,19 @@ def build_intelligent_distance_matrix(
 
     params = REGIONS[region]
 
-    # 1. Distance thresholds: invert D(t) directly at each output-tier
-    # midpoint, plus an explicit plateau step (t_sat, D(t)=1.0 exactly) so
+    # 1. Distance thresholds: invert D(t; stop_score) at each output-tier
+    # midpoint, plus an explicit plateau step (t_plateau, D=1.0 exactly), so
     # nodes genuinely at/near a stop register the stop's true max score
-    # (ceiling-discretized) rather than being capped at whatever the
-    # nearest post-plateau column happens to resolve to. Simpler than the
-    # previous "reference stop_score" scaffolding: since D(t) no longer
-    # depends on stop_score at all (2026-08-12 decoupling, see
-    # `walk_access.py`), and `stop_score` is now itself always <= 1.0
-    # (`speed.py`'s saturation cap), the same distance thresholds are
-    # correct for every stop regardless of its own score.
-    t_sat = params.walk_distance_saturation_m / params.walking_speed_mps / 60.0
-    times_min = sorted({t_sat} | {
-        walk_time_for_decay(target, region=region)
+    # rather than being capped at whatever the nearest post-plateau column
+    # happens to resolve to. D(t; stop_score) is coupled to stop_score again
+    # (2026-09-28, see `walk_access.py`), so the reference stop_score used
+    # for column placement matters -- the maximum score present is used, the
+    # most generous (longest-tolerance) curve among these stops, guaranteeing
+    # no real stop's natural thresholds fall beyond the chosen columns.
+    reference_score = float(np.max(scores))
+    t_plateau = params.t_plateau_distance_m / params.walking_speed_mps / 60.0
+    times_min = sorted({t_plateau} | {
+        walk_time_for_decay(target, reference_score, mode, region=region)
         for target in _target_grid_midpoints()
     })
     # Rounded only to 6 decimal places (sub-millimeter) -- just enough to
@@ -190,9 +211,10 @@ def build_intelligent_distance_matrix(
     # 2. Bucket stop_score values: consecutive (ascending) scores collapse
     # into one bucket whenever they produce an identical ceiling-discretized
     # output signature across every chosen distance step -- see module
-    # docstring, point 2.
+    # docstring, point 2. Each stop's OWN stop_score (not `reference_score`)
+    # is used here -- only the distance columns themselves were shared.
     def signature(s: float) -> tuple[float, ...]:
-        return tuple(ceil_to_grid(accessibility_score(s, t_min, region=region)) for t_min in times_min)
+        return tuple(ceil_to_grid(accessibility_score(s, t_min, mode, region=region)) for t_min in times_min)
 
     bucket_map: dict[float, float] = {}
     matrix_rows: list[dict] = []

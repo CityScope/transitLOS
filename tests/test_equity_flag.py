@@ -69,11 +69,32 @@ def test_housing_priority_flag_more_housing():
     np.testing.assert_array_equal(result, expected)
 
 
-def test_equity_flag_labels_match_mirrored_splits():
+def test_equity_flag_labels_match_regression_residuals():
+    """2026-09-22: `equity_flag` no longer uses the median-split helpers above
+    (`development_priority_flag`/`housing_priority_flag`, still tested on
+    their own by the two tests above but no longer called by `equity_flag`
+    itself) -- explicit user request replaced it with an OLS regression of
+    `level_of_service ~ log(pop_density)` over all cells, flagging a cell
+    "more_housing" when its residual is more than one residual standard
+    deviation ABOVE the fitted line (better served than its density
+    predicts) and "more_transit" when more than one std BELOW it (worse
+    served than predicted). Expected values are the exact same regression
+    computed independently here (numpy `polyfit`, not `equity_flag`'s own
+    code) as a cross-check, not asserted as "hand-computed" arithmetic --
+    the synthetic dataset above (`_synthetic_dataset`) has a real dip at
+    density=3,4 and a real rise at density=5,6, which is genuinely why 3,4
+    land BELOW the fitted trend (more_transit) and 5,6 land ABOVE it
+    (more_housing) under this method, unlike the old median-split test's
+    density=1/density=8 endpoints.
+    """
     density, access, population = _synthetic_dataset()
+    x = np.log(density)
+    slope, intercept = np.polyfit(x, access, 1)
+    residuals = access - (slope * x + intercept)
+    std = residuals.std()
+    expected = np.full(8, None, dtype=object)
+    expected[residuals > std] = "more_housing"
+    expected[residuals < -std] = "more_transit"
+
     flags = equity_flag(density, access, population)
-    expected = np.array(
-        ["more_housing", None, None, None, None, None, None, "more_transit"],
-        dtype=object,
-    )
     np.testing.assert_array_equal(flags, expected)

@@ -1,26 +1,29 @@
 """Headway/frequency scoring: converts a service headway into a [0, 1] score.
 
-Implements a monotonic, saturating (diminishing-returns) function of headway,
-per SCORING.md §2 row "Headway-score function" and
-parameters/05_headway_score_function.md. SCORING.md is explicit that no
-single validated closed-form headway-score function exists in the
-literature, and that the fabricated "Universal Frequency Score" construct
-referenced in early notes could not be verified as real and must not be
-used. (Note, 2026-08-10: "Welding" turned out to be a real author --
-Welding, P.I. (1957), "The instability of close interval service," Opnl
-Res. Q. 8, 133-148, cited in Henderson, Kwong & Adkins (1991) -- but
-Welding's actual formula is E(w) = sum(h_i^2) / (2 * sum(h_i)), not the
-E(w) = (H/2)(1+CV^2) form previously guessed at; that (H/2)(1+CV^2) form is
-instead attributable to Bowman & Turnquist (1981), cited below. Neither
-formula is implemented here -- this module still uses a shape-based design
-choice, not a literature closed form.) What *is* literature-grounded is only the
-function's *shape*: score should be flat/near-ceiling below the
-random-vs-scheduled-arrival threshold (~10-12 min, Bowman & Turnquist 1981;
-Ingvardson et al. 2018) and fall off smoothly above it (TCRP 95 Ch.9;
-Balcombe et al. 2004 diminishing-returns elasticity). This module implements
-that hybrid shape -- a flat "frequent enough" plateau followed by
-exponential-style decay -- as a clearly-labeled design choice, consistent
-with parameters/05_headway_score_function.md Step 3's recommended hybrid.
+Implements `H(headway)`, scoring.md §2.2: a single, continuous closed-form
+curve whose local elasticity magnitude grows log-linearly with headway, fit
+directly to a real, tiered empirical elasticity table (TCRP Report 95 Ch.9
+Table 9-2, source Lago, Mayworm & McEnroe 1981):
+
+    H(headway) = 1.0                                            for headway <= 5 min
+    H(headway) = (headway/5)^(-eps5) * exp(-(q/2)*ln^2(headway/5))   for headway > 5 min
+        where eps(headway) = p + q*ln(headway), eps5 = eps(5)
+
+This is the exact closed-form solution of `d(ln H)/d(ln headway) =
+-eps(headway)` when the local elasticity magnitude is log-linear in headway.
+`p`/`q` are a least-squares fit to three geometric-mean-of-band-edges
+representative points (7.07, 22.36, 70.71 min) derived from TCRP 95's three
+elasticity tiers (<10 min: -0.22; 10-50 min: -0.46; >50 min: -0.58).
+
+This is a genuinely different design from the prior version of this module
+(a flat plateau + plain negative-exponential tail, a shape-only design
+choice with no direct empirical fit) -- see scoring.md §2.2 for the full
+derivation, why log-linear elasticity growth beats a fixed exponent or a
+quadratic-in-headway growth rate, and the honesty caveats on the underlying
+1960s-80s North American bus data (small per-tier n, wide SDs).
+
+Cross-checked against `transitLOS/documentation/scoring/scripts/
+compare_methods.py`'s own `H_headway` reference implementation.
 """
 
 from __future__ import annotations
@@ -35,39 +38,31 @@ def frequency_score(
     headway_minutes: float,
     region: str = "global",
     saturation_minutes: float | None = None,
-    decay_scale_minutes: float | None = None,
+    elasticity_p: float | None = None,
+    elasticity_q: float | None = None,
 ) -> float:
-    """Compute a [0, 1] frequency score from a service headway.
+    """Compute `H(headway)`, a [0, 1] frequency score from a service headway.
 
-    Below `saturation_minutes` the score is 1.0 (turn-up-and-go service,
-    where passengers arrive effectively at random rather than consulting a
-    schedule -- SCORING.md §2 "Random- vs. scheduled-arrival threshold").
-    Above it, score decays smoothly (exponential-style) as headway grows,
-    reflecting diminishing marginal value of further frequency improvements
-    once service is already frequent (Balcombe et al. 2004; TCRP 95 Ch.9).
-
-    This exact functional form (flat plateau + exponential tail) is a
-    design choice recommended, but not literature-mandated, by
-    parameters/05_headway_score_function.md Step 3 -- no source provides a
-    validated closed-form headway->score function. Do not treat this as an
-    empirically fitted curve.
+    Below `saturation_minutes` the score is exactly 1.0 (scoring.md §2.2
+    Anchor: 5 min). Above it, the score follows the log-linear-elasticity
+    closed form described in the module docstring.
 
     Args:
         headway_minutes: Scheduled or average headway in minutes. Must be
             >= 0.
-        region: Region key into `parameters.REGIONS` used to select default
-            saturation/decay parameters if not explicitly overridden. One of
-            "global", "europe", "north_america", "global_south".
-        saturation_minutes: Headway below which score is 1.0. Defaults to
-            the region's `headway_saturation_minutes`.
-        decay_scale_minutes: Decay scale for headways above the saturation
-            point. Defaults to the region's `headway_decay_scale_minutes`.
-            NOT a literature-derived constant (parameters/05 Step 2);
-            exposed here so callers can recalibrate it.
+        region: Region key into `parameters.REGIONS`. Kept for backward
+            compatibility -- every region now shares identical, universal
+            parameters (see `parameters.py`'s module docstring).
+        saturation_minutes: Headway (min) at/below which score is 1.0.
+            Defaults to the region's `h_saturation_minutes` (5.0).
+        elasticity_p: Intercept of `eps(headway) = p + q*ln(headway)`.
+            Defaults to the region's `h_elasticity_p`.
+        elasticity_q: Slope of the same fit. Defaults to the region's
+            `h_elasticity_q`.
 
     Returns:
-        A float in [0, 1]; 1.0 means "as frequent as service needs to be
-        scored," 0.0 means effectively unusably infrequent.
+        A float in (0, 1]: 1.0 at/below the saturation headway, decaying
+        smoothly (but never reaching exactly 0) as headway grows.
 
     Raises:
         ValueError: If headway_minutes is negative.
@@ -77,11 +72,14 @@ def frequency_score(
 
     warn_if_unvalidated_region(region)
     params = REGIONS[region]
-    sat = saturation_minutes if saturation_minutes is not None else params.headway_saturation_minutes
-    scale = decay_scale_minutes if decay_scale_minutes is not None else params.headway_decay_scale_minutes
+    sat = saturation_minutes if saturation_minutes is not None else params.h_saturation_minutes
+    p = elasticity_p if elasticity_p is not None else params.h_elasticity_p
+    q = elasticity_q if elasticity_q is not None else params.h_elasticity_q
 
     if headway_minutes <= sat:
         return 1.0
 
-    excess = headway_minutes - sat
-    return math.exp(-excess / scale)
+    eps_sat = p + q * math.log(sat)
+    log_ratio = math.log(headway_minutes / sat)
+    ln_h = -eps_sat * log_ratio - (q / 2.0) * log_ratio * log_ratio
+    return math.exp(ln_h)

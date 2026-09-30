@@ -28,6 +28,7 @@ import ctypes
 import gc
 import warnings
 import json
+import glob
 import os
 import re
 from html import escape
@@ -125,8 +126,17 @@ _FIELD_EXCLUDE = {
 # a real `pop_density` (computed from population before the exclusion) next
 # to a null "Population" row, since the raw count itself was never baked
 # into the tile to look up.
+# 2026-09-23: CS_transitLOS's `pipeline.py` now materializes `census_residents`/
+# `worldpop_residents` (see its `_finalize_population_columns`) and derives
+# `population` itself fresh from those two (plus jobs, for Boston/SF) as the
+# very last step of grid preparation -- so `population` is always present and
+# always real. The old per-country-prefixed names (`cbs_population`,
+# `inegi_population`, ...) and `worldpop_population` are dropped by that same
+# finalize step on any freshly-built grid; they're kept here only as a
+# fallback for map inputs built before this migration landed.
 _POPULATION_COLUMN_CANDIDATES = (
-    "population", "acs5_population", "acs3_population", "acs1_population",
+    "population", "census_residents", "worldpop_residents",
+    "acs5_population", "acs3_population", "acs1_population",
     "dhc_population", "inegi_population", "ine_population", "ine_cl_population",
     "cbs_population", "eustat_population", "statcan_population", "moi_population",
     "estadisticaad_population", "destatis_population", "ba_population",
@@ -486,7 +496,8 @@ def _shape_popup_js() -> str:
         # axis labels), so a field reads the same human, cross-country
         # -comparable name everywhere on the page, not just in dropdowns.
         "var __SOURCE_PREFIXES = ['acs5_','acs3_','acs1_','dhc_','lodes_wac_','lodes_rac_',\n"
-        "  'inegi_','ine_cl_','ine_','cbs_','eustat_','statcan_','moi_','estadisticaad_'];\n"
+        "  'inegi_','ine_cl_','ine_','cbs_','eustat_','statcan_','moi_','estadisticaad_',\n"
+        "  'worldpop_','destatis_','ba_'];\n"
         "function __stripSourcePrefix(key) {\n"
         "  var k = String(key || '');\n"
         "  for (var i = 0; i < __SOURCE_PREFIXES.length; i++) {\n"
@@ -515,6 +526,28 @@ def _shape_popup_js() -> str:
         "}\n"
         "function __fieldLabel(key) {\n"
         "  return __humanizeFieldName(__stripSourcePrefix(key)) + __fieldUnitSuffix(key);\n"
+        "}\n"
+        # 2026-09-29 real bug fix (user report: Beersheba's ANOVA plot shows
+        # two identical "Population density (pop/km2)" rows/bars -- e.g. a
+        # `cbs_population_density` and a `worldpop_population_density`
+        # column both strip their source prefix and humanize to the exact
+        # same text, with no way to tell them apart). Client-side mirror of
+        # `_disambiguated_field_labels` (Python side, `build.py`) -- any
+        # field whose plain `__fieldLabel` collides with another field IN
+        # THE SAME LIST gets its raw column name appended in parens. Needed
+        # here (not just server-side) because several field lists shown
+        # together (ANOVA bars, R^2-by-variable bars, the distribution
+        # tab's dynamically-rebuilt overlay dropdown, `__setRegressionFields`'s
+        # dynamically-rebuilt regression dropdown) are all built/rebuilt
+        # entirely in JS, past the point any Python-side disambiguation ran.
+        "function __fieldLabelsFor(fields) {\n"
+        "  var labels = {};\n"
+        "  fields.forEach(function(f) { labels[f] = __fieldLabel(f); });\n"
+        "  var counts = {};\n"
+        "  Object.keys(labels).forEach(function(f) { var l = labels[f]; counts[l] = (counts[l] || 0) + 1; });\n"
+        "  var out = {};\n"
+        "  fields.forEach(function(f) { out[f] = (counts[labels[f]] > 1) ? (labels[f] + ' (' + f + ')') : labels[f]; });\n"
+        "  return out;\n"
         "}\n"
         "function __shapePopupRow(label, value, strong) {\n"
         "  return '<tr><td style=\"font-weight:600;color:#555;padding:2px 8px 2px 0;white-space:nowrap;\">' + label +\n"
@@ -866,6 +899,14 @@ _SOURCE_PREFIXES = (
     "acs5_", "acs3_", "acs1_", "dhc_", "lodes_wac_", "lodes_rac_",
     "inegi_", "ine_cl_", "ine_", "cbs_", "eustat_", "statcan_", "moi_",
     "estadisticaad_",
+    # 2026-09-23 fix: these three were missing here even though
+    # `_METADATA_SOURCE_INFO` below (a documented superset) already listed
+    # them -- meant every `worldpop_`/`destatis_`/`ba_`-prefixed column
+    # (e.g. `worldpop_malePopulation`) never stripped down to its canonical
+    # global_schema.json name (`malePopulation`), so the Metadata tab's
+    # description lookup always missed and silently fell back to the
+    # humanized column name instead of the real schema definition.
+    "worldpop_", "destatis_", "ba_",
 )
 
 
@@ -908,6 +949,22 @@ _METADATA_SOURCE_INFO: Dict[str, Tuple[str, str]] = {
 }
 
 
+def _source_prefix_for(col: str) -> str:
+    """The matched `_METADATA_SOURCE_INFO` prefix for `col` (e.g. `"estadisticaad_"`), or `""` if none matches.
+
+    Used to key `_per_country_schema_definitions()` lookups -- the same
+    matching this file's other source-prefix helpers
+    (`_metadata_source_for`/`strip_source_prefix`) already do, just
+    returning the raw prefix string instead of the display info tuple.
+    """
+    for prefix in _METADATA_SOURCE_INFO:
+        if col.startswith(prefix):
+            return prefix
+    if col == "population":
+        return "worldpop_"
+    return ""
+
+
 def _metadata_source_for(col: str) -> Tuple[str, str]:
     """`(source label, highest real resolution level)` for a real census/WorldPop column, else `("", "")`."""
     for prefix, info in _METADATA_SOURCE_INFO.items():
@@ -920,6 +977,24 @@ def _metadata_source_for(col: str) -> Tuple[str, str]:
         # rename (see `code/pipeline.py`'s `_RENAME_EXCLUDED_CANONICAL_NAMES`).
         return _METADATA_SOURCE_INFO["worldpop_"]
     return ("", "")
+
+
+# Descriptions for pipeline-DERIVED diagnostic columns that never had a
+# pyCensus schema home to begin with (unlike a real census source column,
+# these aren't published by any statistical agency -- they're computed in
+# `code/pipeline.py`'s `_add_worldpop_pop_and_jobs_density`/
+# `_add_worldpop_outside_census_columns`, comparing WorldPop's raster
+# estimate against the real census count on the same cell). Written here,
+# not in a pyCensus JSON file, since adding them there would misrepresent
+# them as real published census fields. Keyed by the post-`strip_source_prefix`
+# logical name, same as `_global_schema_definitions`/`_per_country_schema_definitions`.
+_PIPELINE_DERIVED_DESCRIPTIONS: Dict[str, str] = {
+    "population_density": "WorldPop-derived population per square kilometer (population / cell area).",
+    "overestimation": "How much MORE the WorldPop raster estimates for this cell than the real census count covering it (max(0, WorldPop population - census population)); zero where WorldPop is at or below the census figure.",
+    "underestimation": "How much LESS the WorldPop raster estimates for this cell than the real census count covering it (max(0, census population - WorldPop population)); zero where WorldPop is at or above the census figure.",
+    "overestimation_share": "Overestimation as a share of the WorldPop estimate itself (overestimation / WorldPop population) -- how much of WorldPop's own count for this cell is excess relative to the real census figure.",
+    "underestimation_share": "Underestimation as a share of the real census count (underestimation / census population) -- how much of the real census population WorldPop's raster estimate misses for this cell.",
+}
 
 
 _GLOBAL_SCHEMA_DEFINITIONS_CACHE: Optional[Dict[str, str]] = None
@@ -950,7 +1025,97 @@ def _global_schema_definitions() -> Dict[str, str]:
     return _GLOBAL_SCHEMA_DEFINITIONS_CACHE
 
 
-def _column_metadata_rows(gdf, share_source_map: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
+_PER_COUNTRY_SCHEMA_DEFINITIONS_CACHE: Optional[Dict[Tuple[str, str], str]] = None
+
+
+def _per_country_schema_definitions() -> Dict[Tuple[str, str], str]:
+    """`{(source_prefix, feature_name): definition}` from every pyCensus per-country `*_schema.json`, memoized.
+
+    2026-09-23 fix: `_global_schema_definitions()` only reads
+    `global_schema.json`, the ~37-field UNIVERSAL/cross-country-comparable
+    schema -- but plenty of real census columns are country-specific
+    extras with no universal equivalent (e.g. Andorra's
+    `estadisticaad_buildingCount`/`activeBusinessCount`, matched to no
+    `global_schema.json` entry on purpose, since they aren't
+    cross-country-comparable). Those columns already have real, carefully
+    written `definition` fields in their OWN country's
+    `pycensus/countries/<country>/schema/<source>_schema.json` (see e.g.
+    `andorra/schema/estadisticaad_schema.json`'s `buildingCount` entry) --
+    `_column_metadata_rows` was just never looking there, so it silently
+    fell back to the humanized column name instead of that real text.
+    Keyed by `(source_prefix, feature_name)` rather than `feature_name`
+    alone since the same bare name (e.g. `population`) can legitimately
+    mean different things/appear in multiple countries' schema files;
+    `source_prefix` is the same prefix `_metadata_source_for`/
+    `strip_source_prefix` already key off (e.g. `"estadisticaad_"`).
+    Returns `{}` (never raises) under the same import-optional contract as
+    `_global_schema_definitions`.
+    """
+    global _PER_COUNTRY_SCHEMA_DEFINITIONS_CACHE
+    if _PER_COUNTRY_SCHEMA_DEFINITIONS_CACHE is None:
+        result: Dict[Tuple[str, str], str] = {}
+        try:
+            import pycensus
+
+            countries_dir = os.path.join(os.path.dirname(pycensus.__file__), "countries")
+            for schema_path in glob.glob(os.path.join(countries_dir, "*", "schema", "*_schema.json")):
+                # Source prefix mirrors this file's own naming convention
+                # (`_SOURCE_PREFIXES`/`_METADATA_SOURCE_INFO`): the schema
+                # filename's stem up to `_schema.json`, plus the trailing
+                # underscore every real column prefix carries.
+                stem = os.path.basename(schema_path)[: -len("_schema.json")]
+                prefix = f"{stem}_"
+                try:
+                    with open(schema_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    continue
+                features = data.get("features") if isinstance(data, dict) else data
+                if not features:
+                    continue
+                for feat in features:
+                    name = feat.get("feature_name")
+                    definition = feat.get("definition")
+                    if name and definition:
+                        result.setdefault((prefix, name), definition)
+        except Exception:
+            result = {}
+        _PER_COUNTRY_SCHEMA_DEFINITIONS_CACHE = result
+    return _PER_COUNTRY_SCHEMA_DEFINITIONS_CACHE
+
+
+def _resampling_methods_for(col: str) -> Tuple[str, str]:
+    """`(up_method, down_method)` this pipeline actually uses to resample `col` across H3/census levels.
+
+    2026-09-22, explicit user request (`census_metadata.json`): every count
+    (absolute) column is summed when aggregating UP to a coarser cell/polygon
+    (`code.pipeline._resample_h3`'s `count_cols`/`h3_ops.resample(...,
+    method="sum")`, and `geohierarchy`'s `Sum(geoweighted=True)` for
+    admin-polygon joins) and split proportionally (area- or
+    population-weighted) when disaggregating DOWN to finer cells (`Sum`'s
+    `downscale_exprs`, a proportional share of the parent's total). Every
+    rate/share/density/mean/median column is a population-weighted mean
+    going UP (`_resample_h3`'s `_weighted_access`/`_weighted_{col}` pattern,
+    same convention `geohierarchy.aggregation.Mean(weight_column=...)`
+    uses for admin-polygon joins) and broadcast unchanged to every child
+    cell going DOWN (intensive quantities don't split -- a neighborhood's
+    median income doesn't change because you zoomed into one block of it).
+    Naming-convention-based (`is_relative_field`), same classifier every
+    other selector in this module already uses -- not a per-column lookup,
+    so it never drifts out of sync with how `_resample_h3` itself decides.
+    """
+    if is_relative_field(col):
+        return "population-weighted mean", "broadcast (same value to every child cell)"
+    return "sum", "proportional split (area- or population-weighted share of the parent total)"
+
+
+def _column_metadata_rows(
+    gdf,
+    share_source_map: Optional[Dict[str, Tuple[str, str]]] = None,
+    h3_by_resolution: Optional[Dict[int, "gpd.GeoDataFrame"]] = None,
+    census_by_level: Optional[Dict[str, "gpd.GeoDataFrame"]] = None,
+    country: Optional[str] = None,
+) -> List[Dict[str, object]]:
     """One metadata row per real census/WorldPop column on `gdf`, for the stats panel's "Metadata" tab.
 
     Only real source columns (recognized by `_metadata_source_for`) are
@@ -1001,7 +1166,8 @@ def _column_metadata_rows(gdf, share_source_map: Optional[Dict[str, str]] = None
     weight_col = "population" if "population" in gdf.columns else None
     weights = gdf[weight_col].to_numpy(dtype=float) if weight_col else None
     definitions = _global_schema_definitions()
-    rows_by_col: Dict[str, Dict[str, str]] = {}
+    per_country_definitions = _per_country_schema_definitions()
+    rows_by_col: Dict[str, Dict[str, object]] = {}
     order: List[str] = []
     for col in gdf.columns:
         source, level = _metadata_source_for(col)
@@ -1016,7 +1182,8 @@ def _column_metadata_rows(gdf, share_source_map: Optional[Dict[str, str]] = None
         finite = np.isfinite(values)
         if not finite.any():
             continue
-        total_str = "" if is_relative_field(col) else f"{np.nansum(values[finite]):,.0f}"
+        is_relative = is_relative_field(col)
+        total_value = None if is_relative else float(np.nansum(values[finite]))
         if weights is not None:
             w = np.where(finite, weights, 0.0)
             w = np.where(np.isfinite(w), w, 0.0)
@@ -1026,30 +1193,57 @@ def _column_metadata_rows(gdf, share_source_map: Optional[Dict[str, str]] = None
         else:
             avg = float(np.mean(values[finite]))
         logical = strip_source_prefix(col)
-        description = definitions.get(logical) or display_field_name(col)
+        prefix = _source_prefix_for(col)
+        description = (
+            definitions.get(logical)
+            or per_country_definitions.get((prefix, logical))
+            or _PIPELINE_DERIVED_DESCRIPTIONS.get(logical)
+            or display_field_name(col)
+        )
+        # `resampled_levels` (2026-09-22, explicit user request,
+        # `census_metadata.json`): which of THIS study's actual map
+        # resolutions/census levels `col` survived onto -- not every source
+        # column reaches every level (e.g. a share/rate recomputed post-resample
+        # via `_add_share_columns` only exists where its numerator/denominator
+        # both did) -- checked directly against the real per-resolution/
+        # per-level frames this map was built from, never assumed.
+        resampled_levels: List[str] = []
+        if h3_by_resolution:
+            resampled_levels += [f"h3_res{res}" for res in sorted(h3_by_resolution) if col in h3_by_resolution[res].columns]
+        if census_by_level:
+            resampled_levels += [f"census_{lvl}" for lvl in census_by_level if col in census_by_level[lvl].columns]
+        up_method, down_method = _resampling_methods_for(col)
         order.append(col)
         rows_by_col[col] = {
             "name": field_label(col),
+            "original_name": col,
             "source": source,
+            "country": country,
             "level": level,
-            "total": total_str,
-            "average": f"{avg:,.2f}",
-            "share": "",
-            "unit": (field_unit_suffix(col).strip(" ()")) or ("count" if not is_relative_field(col) else ""),
+            "native_levels": [level] if level else [],
+            "resampled_levels": resampled_levels,
+            "resampling_up_method": up_method,
+            "resampling_down_method": down_method,
+            "total": total_value,
+            "mean": avg,
+            "share": None,
+            "share_column": None,
+            "unit": (field_unit_suffix(col).strip(" ()")) or ("count" if not is_relative else ""),
             "weight_column": weight_col or "(unweighted)",
             "description": description,
-            "_share_avg_fraction": avg if is_relative_field(col) else None,
+            "_share_avg_fraction": avg if is_relative else None,
         }
 
     if share_source_map:
-        for share_col, numerator_col in share_source_map.items():
+        for share_col, (numerator_col, denominator_col) in share_source_map.items():
             share_row = rows_by_col.get(share_col)
             numerator_row = rows_by_col.get(numerator_col)
             if share_row is None or numerator_row is None:
                 continue
             frac = share_row["_share_avg_fraction"]
             if frac is not None:
-                numerator_row["share"] = f"{frac * 100:,.1f}%"
+                numerator_row["share"] = round(frac * 100, 1)
+                numerator_row["share_column"] = denominator_col
             del rows_by_col[share_col]
             order.remove(share_col)
 
@@ -1120,16 +1314,49 @@ _FIELD_LABEL_OVERRIDES = {
 
 
 def display_field_name(col: str) -> str:
-    """`col`'s cross-country-comparable display name: source prefix stripped, then humanized."""
+    """`col`'s cross-country-comparable display name: source prefix stripped, then humanized.
+
+    2026-09-28, explicit user request: "the worldpop columns should always
+    have worldpop in the column name even in dropdown boxes in all maps" --
+    every OTHER source's prefix is deliberately stripped for cross-country
+    comparability (see `_SOURCE_PREFIXES`'s docstring -- e.g. `cbs_population`/
+    `inegi_population` both just read "Population"), but WorldPop columns
+    specifically must keep a visible "WorldPop" marker in their display
+    label everywhere a column name is shown (dropdowns, legends, metadata
+    "Column" name), since a map can have BOTH a real census count and a
+    WorldPop-derived one for the same logical field (e.g. `population` vs
+    `worldpop_residents`) and losing the source label there would make them
+    indistinguishable in the UI.
+    """
+    is_worldpop = col.startswith("worldpop_")
     logical = strip_source_prefix(col)
     if logical in _FIELD_LABEL_OVERRIDES:
-        return _FIELD_LABEL_OVERRIDES[logical]
-    return _humanize_field_name(logical)
+        name = _FIELD_LABEL_OVERRIDES[logical]
+    else:
+        name = _humanize_field_name(logical)
+    return f"WorldPop {name}" if is_worldpop and not name.lower().startswith("worldpop") else name
 
 
 def field_label(col: str) -> str:
     """A field's dropdown/legend display label, with its unit suffix (see `field_unit_suffix`)."""
     return f"{display_field_name(col)}{field_unit_suffix(col)}"
+
+
+def _disambiguated_field_labels(fields: Sequence[str]) -> Dict[str, str]:
+    """`{col: label}` for a dropdown option list, same collision fix `_column_metadata_rows` uses.
+
+    Two differently-sourced columns (e.g. `population` and `census_residents`)
+    can share an identical `field_label` even though they hold different
+    values -- without this, a dropdown built from `field_label` alone shows
+    two indistinguishable options both literally reading "Population". Any
+    name shared by more than one column in `fields` gets its column name
+    appended in parens to tell them apart.
+    """
+    labels = {f: field_label(f) for f in fields}
+    counts: Dict[str, int] = {}
+    for label in labels.values():
+        counts[label] = counts.get(label, 0) + 1
+    return {f: (f"{label} ({f})" if counts[label] > 1 else label) for f, label in labels.items()}
 
 
 def absolute_fields(fields: Sequence[str]) -> List[str]:
@@ -1265,19 +1492,51 @@ def _census_geoid_override_lookup_js(id_expr: str) -> str:
     )
 
 
-def _circle_radius_expr(field: str, domain: tuple) -> List[Any]:
-    """`["interpolate", ["linear"], ["get", field], d0, 2, d1, 18], ...]`-shaped
+# 2026-09-29 bug fix (live report: "circles maps load very very badly or
+# incompletely but hexagon view not" -- reproduced via screenshot
+# comparison: the circles view showed a SOLID color blob covering the
+# entire visible map, including areas hexagons correctly rendered as
+# empty/no-data). Root cause: circle radius was a flat 2-18px range at
+# EVERY h3 resolution, but resolution-11 cells are only ~25m across --
+# at typical display zoom that's much narrower than an 18px marker, so
+# adjacent circles massively overlap and "bleed" into neighboring cells
+# that have no data of their own, visually blanketing the whole screen.
+# Coarser resolutions (5/7) don't have this problem -- their cells are
+# genuinely km-wide, comparable to or larger than an 18px marker on
+# screen. A pure geometric scale-by-cell-size would shrink fine-resolution
+# circles to sub-pixel (impractical -- they'd become invisible/
+# unclickable), so this is a pragmatic tiered cap, not a precise formula:
+# generous at coarse resolutions, tightened at fine ones specifically to
+# stop the overlap-into-neighboring-cells effect, while keeping every tier
+# comfortably clickable.
+_CIRCLE_MAX_RADIUS_BY_RES = {5: 18, 7: 14, 9: 9, 11: 5}
+
+
+def _circle_max_radius_for_res(res: Optional[int]) -> float:
+    if res is None:
+        return 18.0
+    if res in _CIRCLE_MAX_RADIUS_BY_RES:
+        return _CIRCLE_MAX_RADIUS_BY_RES[res]
+    # Any other resolution: nearest defined tier's value.
+    nearest = min(_CIRCLE_MAX_RADIUS_BY_RES, key=lambda r: abs(r - res))
+    return _CIRCLE_MAX_RADIUS_BY_RES[nearest]
+
+
+def _circle_radius_expr(field: str, domain: tuple, max_radius: float = 18) -> List[Any]:
+    """`["interpolate", ["linear"], ["get", field], d0, 2, d1, max_radius], ...]`-shaped
     MapLibre expression matching `_circle_style_js`'s own `2 + 16 * norm`
-    Folium/Leaflet radius formula (same 2-18px range, same field/domain
-    inputs) -- kept as a small helper so both the static per-layer paint
-    (`_score_maplibre_paint`) and any future live field-switch can build the
-    identical expression from a `(field, domain)` pair.
+    Folium/Leaflet radius formula (same field/domain inputs; `max_radius`
+    -- see `_CIRCLE_MAX_RADIUS_BY_RES` -- replaces the old flat 18px cap
+    for every resolution) -- kept as a small helper so both the static
+    per-layer paint (`_score_maplibre_paint`) and any future live
+    field-switch can build the identical expression from a `(field,
+    domain)` pair.
     """
     d0, d1 = domain
     d1 = d1 if d1 > d0 else d0 + 1e-9
     # Item 8: same `coalesce` null-guard as `_score_maplibre_paint`'s color
     # expression -- a feature missing `field` would otherwise throw.
-    return ["interpolate", ["linear"], ["coalesce", ["get", field], d0], d0, 2, d1, 18]
+    return ["interpolate", ["linear"], ["coalesce", ["get", field], d0], d0, 2, d1, max_radius]
 
 
 def _score_maplibre_paint(
@@ -1287,6 +1546,7 @@ def _score_maplibre_paint(
     radius_field_domains: Optional[Dict[str, tuple]] = None,
     default_circle_field: Optional[str] = None,
     no_outline: bool = False,
+    circle_max_radius: float = 18,
 ) -> Dict[str, Any]:
     """MapLibre `paint` dict approximating `_polygon_style_js`/`_circle_style_js`'s
     red-yellow-green score coloring, via `MapLayer.maplibre_paint` (see that
@@ -1333,7 +1593,9 @@ def _score_maplibre_paint(
     if kind == "circle":
         radius: Any = 5
         if default_circle_field and radius_field_domains and default_circle_field in radius_field_domains:
-            radius = _circle_radius_expr(default_circle_field, radius_field_domains[default_circle_field])
+            radius = _circle_radius_expr(
+                default_circle_field, radius_field_domains[default_circle_field], max_radius=circle_max_radius
+            )
         return {"circle-color": color_expr, "circle-radius": radius, "circle-opacity": 0.75}
     if kind == "line":
         return {"line-color": color_expr, "line-width": 2}
@@ -1487,7 +1749,7 @@ def _development_style_js() -> str:
         "  var z = (window.__leafletMapRef && window.__leafletMapRef.getZoom()) || 12;\n"
         "  var w = Math.max(0.8, Math.min(4, 4 - (z - 12) * 1.2));\n"
         "  if (properties.equity_flag === 'more_transit') {\n"
-        "    return {color: '#ff8c00', weight: w, opacity: 1, fill: false};\n"
+        "    return {color: '#e91e8c', weight: w, opacity: 1, fill: false};\n"
         "  }\n"
         "  if (properties.equity_flag === 'more_housing') {\n"
         "    return {color: '#1e6fd9', weight: w, opacity: 1, fill: false};\n"
@@ -1583,6 +1845,22 @@ def _stops_json_data(stops_gdf: gpd.GeoDataFrame, score_domain: Tuple[float, flo
         except (TypeError, ValueError):
             return None
 
+    def _score01(v):
+        # 2026-09-23, explicit user request (item 4): every 0-1 score
+        # displayed/stored as 0-100. `mode_score`/`speed_score`/
+        # `frequency_score`/`stop_score` (unlike `level_of_service`) stay
+        # genuinely [0, 1] at their Python source
+        # (`transitlos.stop_scores.compute_stop_scores`) -- rescaling them
+        # there would corrupt the internal stop_score_bucket/distance-matrix
+        # math `level_of_service.py` builds from that same column. So the
+        # x100 rescale happens only here, at this popup-data boundary,
+        # purely for display -- consistent with `score_domain` below (itself
+        # derived from the now-0-100 `level_of_service` column) so the blue
+        # badge tint math (`(r.stop_score - sMin)/(sMax-sMin)`) still lines
+        # up with the domain it's compared against.
+        n = _num(v)
+        return None if n is None else round(n * 100.0, 4)
+
     records = []
     for i in range(len(stops_wgs84)):
         # A single non-finite coordinate breaks the whole client-side `forEach` loop
@@ -1609,19 +1887,20 @@ def _stops_json_data(stops_gdf: gpd.GeoDataFrame, score_domain: Tuple[float, flo
         # station" without fabricating anything.
         stop_routes_val = row.get("stop_routes") if "stop_routes" in row else None
         all_routes_val = row.get("all_routes") if "all_routes" in row else route_val
-        # `reliability_score` is NOT a measured metric on this pipeline --
-        # `transitlos.stop_scores.compute_stop_scores` documents that
-        # `headway_cv` (headway variance/regularity) is never available from
-        # pyGTFSHandler today, so it substitutes an assumed default
-        # (`default_headway_cv=0.0`, i.e. "assume perfectly regular service")
-        # and always flags the row `reliability_score_is_assumed=True`. The
-        # resulting `reliability_score` is therefore always a flat 1.0 for
-        # every stop on every real dataset checked -- not real reliability
-        # data. Only pass a real value through when a future pipeline change
-        # actually measures it (`reliability_score_is_assumed is False`);
-        # otherwise the client shows "N/A" rather than a fabricated number.
+        # `reliability` (the optional MR_CV refinement, scoring.md Section
+        # 2.3(b)) is NOT a measured metric on this pipeline -- `headway_cv`
+        # (headway variance/regularity) is never available from
+        # pyGTFSHandler today (`transitlos.stop_scores.compute_stop_scores`),
+        # so `mrc_score` always falls back to the mode-categorical default
+        # (`MR_mode`, Section 2.3(a)) and every row is flagged
+        # `reliability_score_is_assumed=True`. This popup therefore never has
+        # a real, distinct "reliability" number to show separately from
+        # `mrc_score` (mode and reliability are one combined axis in the
+        # current model -- `mrc.py`'s module docstring) -- shown as "N/A" so
+        # nothing is fabricated. Only meaningful once a future pipeline
+        # change actually measures headway_cv.
         reliability_assumed = bool(row.get("reliability_score_is_assumed", True))
-        reliability_val = None if reliability_assumed else _num(row.get("reliability_score"))
+        reliability_val = None
         rec = {
             "lon": float(lon[i]),
             "lat": float(lat[i]),
@@ -1640,10 +1919,11 @@ def _stops_json_data(stops_gdf: gpd.GeoDataFrame, score_domain: Tuple[float, flo
             "all_routes": str(all_routes_val) if pd.notna(all_routes_val) else None,
             "headway_minutes": _num(row.get("headway_minutes")),
             "avg_speed_kmh": _num(row.get("avg_speed_kmh")),
-            "mode_score": _num(row.get("mode_score")),
-            "speed_score": _num(row.get("speed_score")),
-            "frequency_score": _num(row.get("frequency_score")),
-            "stop_score": _num(row.get("stop_score")),
+            "mode_category": row.get("mode_category") if "mode_category" in row and pd.notna(row.get("mode_category")) else None,
+            "mrc_score": _score01(row.get("mrc_score")),
+            "speed_score": _score01(row.get("speed_score")),
+            "frequency_score": _score01(row.get("frequency_score")),
+            "stop_score": _score01(row.get("stop_score")),
             "reliability": reliability_val,
         }
         records.append(rec)
@@ -1819,6 +2099,11 @@ window.__stopsData = {data_json};
   function prettyName(s) {{ return s ? String(s).replace(/_/g, ' ') : s; }}
 
   function fmt2(v) {{ return (v == null) ? null : v.toFixed(2); }}
+  // 2026-09-25, explicit user request: stop_score/level_of_service are a
+  // 0-100 scale, shown with only one decimal (mode_score/frequency_score/
+  // speed_score/reliability stay 0-1/two-decimal internal sub-scores,
+  // unaffected -- only the composed stop_score itself changed scale).
+  function fmt1(v) {{ return (v == null) ? null : v.toFixed(1); }}
   // Sub-scores (mode_score/frequency_score/speed_score) are already on a
   // [0,1] scale, same as stop_score -- reuse the same blue scale to color the
   // "score: X.XX" text itself, so a glance at the color communicates quality
@@ -1862,7 +2147,7 @@ window.__stopsData = {data_json};
     var tint = blueFor(t);
     var html = '<div style="text-align:center;">' +
       modeBadgeHtml(r.mode, tint, 19) +
-      (r.stop_score != null ? scoreBadgeHtml(fmt2(r.stop_score), tint) : '') +
+      (r.stop_score != null ? scoreBadgeHtml(fmt1(r.stop_score), tint) : '') +
       '</div>';
     var icon = L.divIcon({{html: html, className: 'stop-marker-icon', iconSize: [22, 29]}});
     var marker = L.marker([r.lat, r.lon], {{icon: icon}});
@@ -1888,7 +2173,7 @@ window.__stopsData = {data_json};
     rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;vertical-align:top;">route</td>' +
       '<td style="padding:2px 0;">' + routeCell + '</td></tr>';
     rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;">mode</td><td style="padding:2px 0;">' +
-      modeBadgeInline(r.mode, tint) + r.mode + scoreSpan(r.mode_score) + '</td></tr>';
+      modeBadgeInline(r.mode, tint) + r.mode + scoreSpan(r.mrc_score) + '</td></tr>';
     if (r.headway_minutes != null) {{
       rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;">headway</td><td style="padding:2px 0;">' + fmt2(r.headway_minutes) + ' min' + scoreSpan(r.frequency_score) + '</td></tr>';
     }}
@@ -1897,7 +2182,7 @@ window.__stopsData = {data_json};
     }}
     rows += '<tr><td style="font-weight:700;padding:4px 8px 0 0;border-top:1px solid #eee;white-space:nowrap;">stop score</td>' +
       '<td style="padding:4px 0 0;border-top:1px solid #eee;font-weight:700;white-space:nowrap;color:' + (r.stop_score != null ? blueFor(t) : '#333') + ';">' +
-      (r.stop_score != null ? fmt2(r.stop_score) : '-') + '</td></tr>';
+      (r.stop_score != null ? fmt1(r.stop_score) : '-') + '</td></tr>';
     // `minWidth`/`maxWidth` bindPopup options (not just CSS on the inner
     // div) -- Leaflet's popup wrapper otherwise sizes to its own default
     // max-width (300px) first and can still wrap a row's content before the
@@ -2383,15 +2668,18 @@ def _legend_html(score_domain: Tuple[float, float], show_development: bool) -> s
         dev_legend = """
 <div id="devLegend" style="display:none;margin-top:8px;">
   <div style="font-weight:600;">Development opportunity</div>
-  <div><span style="display:inline-block;width:12px;height:12px;border:2px solid #ff8c00;margin-right:5px;"></span>More transit needed</div>
-  <div><span style="display:inline-block;width:12px;height:12px;border:2px solid #1e6fd9;margin-right:5px;"></span>More housing needed</div>
+  <div><span style="display:inline-block;width:12px;height:12px;border:2px solid #e91e8c;margin-right:5px;"></span>More transit viable</div>
+  <div><span style="display:inline-block;width:12px;height:12px;border:2px solid #1e6fd9;margin-right:5px;"></span>More housing viable</div>
 </div>"""
-    # A clean 6-label set every 0.2 (0.0-1.0) instead of every 0.1 (10 labels) --
+    # A clean 6-label set every 20 (0-100) instead of every 10 (11 labels) --
     # fewer, less-crowded labels that still mark the full range unambiguously.
-    score_ticks = "".join(f'<span style="flex:1;text-align:center;">{v:.1f}</span>' for v in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    # 2026-09-25, explicit user request: level_of_service/stop_score are a
+    # 0-100 scale (not 0-1 -- see the 2026-09 rescale), so these legend
+    # ticks must read 0/20/40/60/80/100, one decimal place, not 0.0-1.0.
+    score_ticks = "".join(f'<span style="flex:1;text-align:center;">{v:.1f}</span>' for v in [0.0, 20.0, 40.0, 60.0, 80.0, 100.0])
     stop_gradient = f"linear-gradient(to right, {', '.join(STOP_BLUE_HEX)})"
     stop_score_ticks = "".join(
-        f'<span style="flex:1;text-align:center;">{score_min + (score_max - score_min) * v:.1f}</span>'
+        f'<span style="flex:1;text-align:center;">{(score_min + (score_max - score_min) * v):.1f}</span>'
         for v in [0.0, 0.25, 0.5, 0.75, 1.0]
     )
     return f"""
@@ -2672,9 +2960,16 @@ window.__fmtLegendNum = function(v, refAbs) {{
   // legend (e.g. min=50 next to max=10050) still reads "50", not a
   // group-scale "0k". Only the decimals-or-not policy above is shared
   // across the group.
+  // Bug fix: the tier decision must use the magnitude AFTER whatever
+  // rounding will actually be displayed, not the raw value -- e.g. 999.6
+  // with `noDecimals` true previously read `abs >= 1e3` as false (raw
+  // 999.6 < 1000), fell through to the no-suffix path, and
+  // `Math.round(999.6)` then printed "1,000" with no "k" at all, even
+  // though every neighboring 4-digit value in the same legend got one.
+  var tierAbs = noDecimals ? Math.round(abs) : abs;
   var scale = 1, suffix = '';
-  if (abs >= 1e6) {{ scale = 1e6; suffix = 'M'; }}
-  else if (abs >= 1e3) {{ scale = 1e3; suffix = 'k'; }}
+  if (tierAbs >= 1e6) {{ scale = 1e6; suffix = 'M'; }}
+  else if (tierAbs >= 1e3) {{ scale = 1e3; suffix = 'k'; }}
   if (scale > 1) {{
     var scaled = v / scale;
     if (noDecimals) {{
@@ -2726,8 +3021,16 @@ function __updateCircleLegend(field) {{
   }}
   document.getElementById('circleLegendField').textContent = circleLabel;
   var domains = __radiusFieldDomains;
-  if (window.__leafletMapRef && Object.keys(__radiusFieldDomainsByRes).length) {{
-    var res = __resForZoom(window.__leafletMapRef.getZoom());
+  // Bug fix (live user report): `window.__leafletMapRef` only exists on
+  // the Folium renderer -- on MapLibre (`window.__mainMap`) this whole
+  // branch was always skipped, so the legend stayed frozen at the FINEST
+  // resolution's tiny per-cell domain no matter how far zoomed out, while
+  // the circles themselves correctly grew (real per-resolution radius
+  // expressions, computed separately server-side) -- exactly "circles get
+  // bigger at low zoom but the legend numbers don't track them."
+  var __zoomMapRef = window.__leafletMapRef || window.__mainMap;
+  if (__zoomMapRef && Object.keys(__radiusFieldDomainsByRes).length) {{
+    var res = __resForZoom(__zoomMapRef.getZoom());
     if (res != null && __radiusFieldDomainsByRes[res]) domains = __radiusFieldDomainsByRes[res];
   }}
   var d = domains[field];
@@ -2746,6 +3049,15 @@ document.getElementById('circleFieldSelect').addEventListener('change', function
   __redrawMatching(function(k) {{ return k.indexOf('circles:') === 0; }});
 }});
 __updateCircleLegend(window.__circleField);
+// Bug fix (live user report, same root cause as the `__leafletMapRef` fix
+// in `__updateCircleLegend` above): the ONLY place that re-called this
+// function on zoom was inside `if (__leafletMap) {{...}}`, Folium-only --
+// on MapLibre nothing ever refreshed the legend after the initial call
+// above, so even with the correct per-resolution domain lookup it would
+// stay frozen at whatever resolution was active on page load.
+if (window.__mainMap && typeof window.__mainMap.on === 'function') {{
+  window.__mainMap.on('zoomend', function() {{ __updateCircleLegend(window.__circleField); }});
+}}
 
 document.getElementById('opacitySelect').addEventListener('change', function(e) {{
   window.__opacityField = e.target.value;
@@ -3021,7 +3333,10 @@ def build_city_map(
     renderer: str = "maplibre",
     enable_place_comparison: bool = False,
     downloads_manifest: Optional[dict] = None,
-    share_source_map: Optional[Dict[str, str]] = None,
+    share_source_map: Optional[Dict[str, Tuple[str, str]]] = None,
+    country: Optional[str] = None,
+    special_levels: Optional[Dict[str, gpd.GeoDataFrame]] = None,
+    special_level_labels: Optional[Dict[str, str]] = None,
 ) -> str:
     """Build and save one city's transit-LOS map.
 
@@ -3177,8 +3492,14 @@ def build_city_map(
     finest = h3_by_resolution[resolutions[-1]]
     score_domain = _finite_domain(finest[score_col])
     has_census = bool(census_by_level)
-    has_development_gdf = development_gdf is not None and not development_gdf.empty and "equity_flag" in development_gdf.columns
-    show_development = has_development_gdf or (has_census and "equity_flag" in finest.columns)
+    # 2026-09-22, explicit user request: the development ("more housing" /
+    # "more transit") overlay must always be drawn from h3 resolution-7
+    # cells -- the same resolution `equity_flag` is computed at
+    # (`params.stats_h3_resolution`) -- never from census polygons, even
+    # when a `development_gdf` (census-derived) is available. The old
+    # census-geometry-preferred path is intentionally unused below.
+    has_development_gdf = False
+    show_development = any("equity_flag" in gdf.columns for gdf in h3_by_resolution.values())
 
     # ONE canonical (count_fields, share_fields) split, computed once from
     # `finest` and reused verbatim by every count-type selector
@@ -3481,6 +3802,7 @@ def build_city_map(
                 "circle", score_col, score_domain,
                 radius_field_domains=_res_radius_domains,
                 default_circle_field=default_circle_field,
+                circle_max_radius=_circle_max_radius_for_res(res),
             ),
         )
     _apply_zoom_bands(circ_map, resolutions_levels, zoom_bands)
@@ -3602,6 +3924,45 @@ def build_city_map(
 
         named_maps["census"] = census_map
 
+    # --- "special" shape (2026-09-29, explicit user request): place/
+    # congressional-district/state-legislative-district/school-district
+    # (and any other level a caller passes) -- PEER levels, not a
+    # coarse-to-fine zoom-banded hierarchy the way `census_by_level` is.
+    # The default census dropdown auto-switches purely by zoom; these
+    # levels must instead require an explicit, manual pick (a separate
+    # dropdown, shown only while "special" is the active shape -- see
+    # `geohierarchy.maps.maplibre.render.save_multi_maplibre`'s own
+    # `special_group_levels` docstring for the mechanism). Every level
+    # here gets the SAME full [0, 25] zoom range (never zoom-banded
+    # against each other) precisely so none of them can ever be hidden
+    # by zoom alone -- visibility is 100% the manual dropdown's job.
+    special_level_names: List[str] = []
+    if special_levels:
+        special_level_names = list(special_levels)
+        gh_special = GeoHierarchy(crs=4326)
+        for name in special_level_names:
+            gdf = _with_id(special_levels[name].to_crs(4326))
+            gh_special.add_level(name, _level_frame(gdf, _id_col(gdf)), id_col=_id_col(gdf), agg=Max())
+        special_map = HierarchyMap(
+            gh_special, levels=special_level_names,
+            tiles_dir=str(os.path.join(tiles_dir_rel, "special")), use_pmtiles=use_pmtiles,
+            extract_xyz=(renderer == "folium"),
+            resolutions={name: (0, 25) for name in special_level_names},
+        )
+        for name in special_level_names:
+            gdf = special_levels[name]
+            special_map.configure_level(
+                name, style_js=poly_style, popup_fields=_popup_fields(gdf),
+                popup_js=shape_popup_js,
+                maplibre_paint=_score_maplibre_paint("polygon", score_col, score_domain),
+            )
+        if not skip_tile_build:
+            with contextlib.chdir(out_dir):
+                special_map.build(free_level_data=True)
+                _trim_malloc()
+
+        named_maps["special"] = special_map
+
     # --- "streets" overlay: independent checkbox, always above the active shape layer ---
     # A single-level HierarchyMap must still cover the *full* [0, 25] zoom
     # range on its own (see `_level_zoom_bands`'s docstring). Streets are
@@ -3696,11 +4057,14 @@ def build_city_map(
             # the column, then -- per "h3 resolution 9 or less" -- prefer the
             # finest candidate that is <= 9, falling back to the coarsest
             # available candidate above 9 only if nothing <= 9 has the data.
+            # 2026-09-22, explicit user request: always h3 resolution 7 (the
+            # same resolution `equity_flag`'s regression is fit on) when
+            # available; only fall back to another resolution that actually
+            # carries the column if 7 isn't present on this map.
             dev_candidates = [r for r in resolutions if "equity_flag" in h3_by_resolution[r].columns]
             if not dev_candidates:
                 dev_candidates = resolutions
-            le9 = [r for r in dev_candidates if r <= 9]
-            dev_res = max(le9) if le9 else min(dev_candidates)
+            dev_res = 7 if 7 in dev_candidates else min(dev_candidates, key=lambda r: abs(r - 7))
             dev_gdf = h3_by_resolution[dev_res]
             dev_level = f"h3_{dev_res}"
             resolve_dev_tiles = not skip_tile_build
@@ -3732,9 +4096,37 @@ def build_city_map(
         # safe direction: zooming in past native max reuses/upscales one
         # tile, it never multiplies fetches.
         dev_popup_fields = ["equity_flag", score_col]
+        # 2026-09-22, explicit user request ("transparent fill colored
+        # thick border"): MapLibre's `fill-outline-color` has no width
+        # property -- it always renders at a fixed ~1px regardless of any
+        # setting -- so a real THICK border needs a genuine `line` layer,
+        # not a `fill` layer's outline. `"development_overlay"` (registered
+        # in `geohierarchy.maps.layers.registry`, `kind="line"`) was already
+        # defined for exactly this ("stroke-only border overlay flagging a
+        # categorical condition... transparent otherwise") but never
+        # actually wired up anywhere -- passing it here (plus a real
+        # `maplibre_paint`) replaces the flat `#3388ff` fill-layer fallback
+        # `_sources_and_layers` used for any unstyled polygon level with a
+        # genuinely transparent-fill, thick-colored-border MapLibre line
+        # layer, mirroring `_development_style_js`'s own Folium formula
+        # exactly (`Math.max(0.8, Math.min(4, 4 - (z-12)*1.2))` ==
+        # `["interpolate", ["linear"], ["zoom"], 12, 4, 15.333, 0.8]` --
+        # MapLibre's `interpolate` clamps outside its stop range the same
+        # way `Math.max`/`Math.min` do, so this is the exact same curve).
         dev_map.configure_level(
             dev_level, style_js=dev_style, popup_fields=dev_popup_fields,
             native_zoom_range=(0, 12),
+            layer_type="development_overlay",
+            maplibre_paint={
+                "line-color": [
+                    "match", ["get", "equity_flag"],
+                    "more_transit", "#e91e8c",
+                    "more_housing", "#1e6fd9",
+                    "rgba(0,0,0,0)",
+                ],
+                "line-width": ["interpolate", ["linear"], ["zoom"], 12, 4, 15.333, 0.8],
+                "line-opacity": 1,
+            },
         )
         dev_map.set_resolution(dev_level, min_zoom=0, max_zoom=25)
         overlay_maps["development"] = dev_map
@@ -3818,6 +4210,8 @@ def build_city_map(
                 # layer/zoom instead.
                 radius_field_domains_by_res=radius_field_domains_by_res,
                 circle_zoom_bands={res: zoom_bands[f"h3_{res}"] for res in resolutions},
+                special_group_levels=special_level_names or None,
+                special_group_level_labels=special_level_labels,
             )
             # Item 5 (user feedback, 2026-08-19): stops/routes/labels/popups
             # were entirely absent from the MapLibre page -- `stops_gdf`/
@@ -3872,6 +4266,9 @@ def build_city_map(
                     region=region,
                     enable_place_comparison=enable_place_comparison,
                     share_source_map=share_source_map,
+                    h3_by_resolution=h3_by_resolution,
+                    census_by_level=census_by_level,
+                    country=country,
                 )
                 # Item C (user feedback, round 13): top-center place/
                 # scenario/results bar. Needs `window.__editor` (set by
@@ -3930,6 +4327,9 @@ def build_city_map(
                 share_source_map=share_source_map,
                 radius_field_domains_by_res=radius_field_domains_by_res,
                 circle_zoom_bands={res: zoom_bands[f"h3_{res}"] for res in resolutions},
+                h3_by_resolution=h3_by_resolution,
+                census_by_level=census_by_level,
+                country=country,
             )
 
     if stats_by_area:
@@ -4040,11 +4440,20 @@ def _compare_with_control_html(
     """
     rows = []
     if include_column:
+        # 2026-09-25 reversal (verbatim user request: "under distribution as
+        # compare with should be nothing by default I dont want to see any
+        # purple bars until I do not select anything to compare with") --
+        # supersedes the 2026-09-23 decision recorded here previously,
+        # which deliberately dropped the "None" placeholder so the browser
+        # defaulted to the first real column, turning the secondary series
+        # on by default. Restored: "None" is a real first option, selected
+        # by default, so `renderDistribution()`'s `overlayField !== 'none'`
+        # check reads false until the user actually picks a column.
         rows.append(f"""
         <div style="margin-bottom:6px;">
           <label>Column</label>
           <select id="{prefix}OverlaySelect" style="width:100%;">
-            <option value="none" selected>None</option>
+            <option value="none" selected></option>
             {overlay_options}
           </select>
         </div>""")
@@ -4082,8 +4491,8 @@ def _compare_with_control_html(
         rows.append(f"""
         <div style="margin-bottom:6px;">
           <label>Place</label>
-          <select id="{prefix}ComparePlaceSelect" style="width:100%;">
-            <option value="" selected>None (this place)</option>
+          <select id="{prefix}ComparePlaceSelect" class="comparePlaceSelect" style="width:100%;">
+            <option value="" selected>This place</option>
             {place_options}
           </select>
         </div>""")
@@ -4127,8 +4536,25 @@ def _stats_panel_html(
     offer, so the row is omitted entirely (a per-city `map.html` doesn't
     currently pass one -- see that call site's own comment).
     """
-    reg_options = "".join(f'<option value="{f}">{field_label(f)}</option>' for f in regression_fields)
-    overlay_options = "".join(f'<option value="{f}">{field_label(f)}</option>' for f in count_fields)
+    _reg_labels = _disambiguated_field_labels(regression_fields)
+    _count_labels = _disambiguated_field_labels(count_fields)
+    # 2026-09-25, explicit user request ("I am missing the dotted std lines
+    # on the regression graph"): those lines only draw when the x-axis
+    # field on screen IS the equity-flag's own density field (`__equityDensityField`
+    # in `_stats_panel_js`'s `renderRegression()`, matching `pop_jobs_density`
+    # if present else `pop_density`, matching `code.stats.equity_flag_thresholds`
+    # exactly) -- with no `selected` here, the browser just defaulted to
+    # whichever field happened to be FIRST in `regression_fields`, which is
+    # essentially never the density column, so the lines never showed unless
+    # the user manually picked it. Default-select it instead.
+    _equity_density_field = "pop_jobs_density" if "pop_jobs_density" in regression_fields else (
+        "pop_density" if "pop_density" in regression_fields else None
+    )
+    reg_options = "".join(
+        f'<option value="{f}"{" selected" if f == _equity_density_field else ""}>{_reg_labels[f]}</option>'
+        for f in regression_fields
+    )
+    overlay_options = "".join(f'<option value="{f}">{_count_labels[f]}</option>' for f in count_fields)
     # Place-rank tab's own weight-column options: same field list as
     # `overlay_options`, but with `population` pre-selected (user's explicit
     # ask -- ranking should default to population-weighted, not the plain
@@ -4139,7 +4565,7 @@ def _stats_panel_html(
     # should be pre-selected by design (see that popover's own comment).
     _population_in_counts = "population" in count_fields
     place_rank_weight_options = "".join(
-        f'<option value="{f}"{" selected" if f == "population" else ""}>{field_label(f)}</option>'
+        f'<option value="{f}"{" selected" if f == "population" else ""}>{_count_labels[f]}</option>'
         for f in count_fields
     )
     # "None + field" variants for the item-2/item-3 optional second-column
@@ -4159,23 +4585,24 @@ def _stats_panel_html(
     )
     # Shared static markup for every "Compare with" popover's "Scenario"
     # select (distribution/regression/ANOVA each own one, item 3's fix -- no
-    # more single shared dropdown sitting above every tab). User feedback
-    # (2026-08-19): default to "Current network (baseline)" -- the closest
-    # thing this codebase has to a "default scenario" (the reserved/baseline
-    # network state every map starts on before any user scenario is
-    # created/activated, see `__statsReservedName()`/`getStatsData`) -- rather
-    # than "None", so opening a tab shows a real baseline comparison out of
-    # the box instead of nothing. "None" is still offered (now second) for
-    # users who want single-series view. `__populateSecondaryScenarioSelect`
-    # regenerates this same option list client-side once real scenarios exist,
-    # preserving whichever value was already selected.
-    # Follow-up fix (verbatim user request): nothing in any "Compare with"
-    # popover should be pre-selected -- opening a tab should show the plain/
-    # unweighted single-series view until the user explicitly picks a
-    # comparison, not a baseline-vs-baseline comparison nobody asked for.
+    # more single shared dropdown sitting above every tab).
+    # 2026-09-25 fix (verbatim user request: "compare with should have an
+    # empty option if user doesn't want to compare with anything") -- the
+    # 2026-09-23 change above had repurposed the toggle-off value `'none'`
+    # to DISPLAY as "Original", conflating "no secondary series at all" with
+    # "compare against the real Original-network scenario" (a meaningful,
+    # distinct choice from either "nothing" or "With edits"). Three real
+    # options now: `'none'` (no comparison, default-selected, matching the
+    # older "nothing pre-selected by design" convention), `''` (Original --
+    # `getStatsData`'s reserved/baseline scenario value, same as the
+    # top-center bar's own convention), and `'With edits'`.
+    # `__populateSecondaryScenarioSelect` mirrors this same base-option list
+    # client-side once real scenarios exist, preserving whichever value was
+    # already selected.
     secondary_scenario_options = (
         '<option value="none" selected>None</option>'
-        '<option value="">Current network (baseline)</option>'
+        '<option value="">Original</option>'
+        '<option value="With edits">With edits</option>'
     )
     # Re-added "Compare with place" row's own `<option>`s -- see this
     # function's docstring. "None" first/selected, matching every other
@@ -4205,8 +4632,8 @@ def _stats_panel_html(
     other_tab_btns = "" if place_rank_only else (
         f'<button class="statsTabBtn{" active" if not enable_place_comparison else ""}" data-tab="distribution">Distribution</button>\n'
         '    <button class="statsTabBtn" data-tab="regression">Regression</button>\n'
-        '    <button class="statsTabBtn" data-tab="anova">ANOVA</button>\n'
-        '    <button class="statsTabBtn" data-tab="discretization">Discretization</button>'
+        '    <button class="statsTabBtn" data-tab="anova">Census</button>\n'
+        '    <button class="statsTabBtn" data-tab="discretization">Scoring funcs</button>'
     )
     # Metadata tab: offered whenever the caller passes ANY `metadata_rows`
     # value other than `None` -- `is not None` (not truthy) so an explicit
@@ -4239,7 +4666,8 @@ def _stats_panel_html(
   background:white;width:34px;height:34px;border-radius:50%;box-shadow:0 1px 4px rgba(0,0,0,0.3);
   display:flex;align-items:center;justify-content:center;font-size:18px;cursor:pointer;">📊</div>
 <div id="statsPanel" style="display:none;position:absolute;bottom:100px;left:10px;z-index:1000;background:white;
-  width:460px;max-height:70vh;overflow-y:auto;border-radius:6px;box-shadow:0 1px 6px rgba(0,0,0,0.35);
+  width:460px;height:70vh;min-width:340px;min-height:240px;max-width:95vw;max-height:95vh;
+  overflow:auto;resize:both;border-radius:6px;box-shadow:0 1px 6px rgba(0,0,0,0.35);
   font:12px sans-serif;padding:10px;">
   <style>
     .statsTabBtn, .statsAreaBtn, .statsParamBtn {{
@@ -4306,19 +4734,37 @@ def _stats_panel_html(
        scenarios by `__populateSecondaryScenarioSelect`, see below. -->
 
   {"" if not enable_place_comparison else f'''<div id="statsTab_placerank" class="statsTabPanel">
-    <div style="margin-bottom:6px;color:#666;">
-      Column-weighted median level of service across CS_transitLOS places, used
-      to RANK them (best to worst). Pick a weight column below -- left at
-      "Unweighted", every h3 cell counts equally. Requires this map to be
-      served over http(s) -- opening map.html directly via file:// leaves
-      this list empty.
+    <div style="margin-bottom:6px;display:flex;gap:6px;">
+      <div style="flex:2;">
+        <label>Weight column</label>
+        <select id="placeRankWeightSelect" style="width:100%;">
+          <option value="none"{" selected" if not _population_in_counts else ""}>Unweighted</option>
+          {place_rank_weight_options}
+        </select>
+      </div>
+      <div style="flex:1;">
+        <label>Aggregate</label>
+        <select id="placeRankAggSelect" style="width:100%;">
+          <option value="mean" selected>Mean</option>
+          <option value="median">Median</option>
+        </select>
+      </div>
     </div>
-    <div style="margin-bottom:6px;">
-      <label>Weight column</label>
-      <select id="placeRankWeightSelect" style="width:100%;">
-        <option value="none"{" selected" if not _population_in_counts else ""}>Unweighted (plain median)</option>
-        {place_rank_weight_options}
-      </select>
+    <div style="margin-bottom:6px;display:flex;gap:6px;">
+      <div style="flex:1;">
+        <label>Area</label>
+        <select id="placeRankAreaSelect" style="width:100%;">
+          <option value="metro" selected>Metro</option>
+          <option value="core">Core</option>
+        </select>
+      </div>
+      <div style="flex:1;">
+        <label>Scenario</label>
+        <select id="placeRankScenarioSelect" style="width:100%;">
+          <option value="original" selected>Original</option>
+          <option value="edited">With edits</option>
+        </select>
+      </div>
     </div>
     <div id="placeRankList"></div>
   </div>'''}
@@ -4332,11 +4778,20 @@ def _stats_panel_html(
          "Compare with scenario" were the main/top control for Distribution.
          The two comparison dropdowns now live in their own row below,
          clearly secondary to "Distribute by". -->
-    <div style="margin-bottom:6px;">
-      <label>Distribute by</label>
-      <select id="distMainSelect" style="width:100%;">
-        {main_options}
-      </select>
+    <div style="margin-bottom:6px;display:flex;gap:6px;">
+      <div style="flex:2;">
+        <label>Distribute by</label>
+        <select id="distMainSelect" style="width:100%;">
+          {main_options}
+        </select>
+      </div>
+      <div style="flex:1;">
+        <label>Aggregate</label>
+        <select id="distAggSelect" style="width:100%;">
+          <option value="mean" selected>Mean</option>
+          <option value="median">Median</option>
+        </select>
+      </div>
     </div>
     {_compare_with_control_html("dist", secondary_scenario_options, True, overlay_options, has_multi_area, enable_place_comparison, place_options)}
     <div id="distSummary" style="font-weight:600;margin-bottom:8px;"></div>
@@ -4373,16 +4828,10 @@ def _stats_panel_html(
   </div>
 
   <div id="statsTab_discretization" class="statsTabPanel" style="display:none;">
-    <div style="margin-bottom:6px;color:#666;">
-      Shows the scoring formula's own shape -- x is the raw input, y is the
-      resulting [0,1] sub-score -- using this map's own default parameters,
-      not live per-stop data.
-    </div>
     <div style="display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap;">
       <button class="statsParamBtn active" data-param="speed">Speed</button>
-      <button class="statsParamBtn" data-param="frequency">Frequency</button>
-      <button class="statsParamBtn" data-param="reliability">Reliability</button>
-      <button class="statsParamBtn" data-param="distance">Walk distance</button>
+      <button class="statsParamBtn" data-param="frequency">Headway</button>
+      <button class="statsParamBtn" data-param="distance">Walk</button>
       <!-- "Level of service" is deliberately LAST: it is the composed, top-level
            result (stop_score x walk decay), so the row reads left-to-right
            from raw sub-scores through stop_score to the final score. -->
@@ -4449,45 +4898,108 @@ def _metadata_tab_html(metadata_rows: List[Dict[str, str]]) -> str:
     live per-cell statistic would; see `_column_metadata_rows` for how each
     field is derived.
     """
+    # Fixed PIXEL widths, not percentages: a percentage colgroup under
+    # `table-layout:fixed` always squeezes to fit whatever container width
+    # is available, so the table can never actually overflow -- exactly the
+    # bug behind "need a horizontal scrollbar so the table can take much
+    # more space" (there was nothing for `overflow-x:auto` on the wrapper
+    # div to ever trigger). Pixel widths give the table a real total width
+    # that exceeds the panel on any reasonably-populated map, so the
+    # scrollbar appears and every column gets genuine breathing room.
+    colgroup = (
+        "<colgroup>"
+        "<col style='width:150px;'>"  # Column
+        "<col style='width:130px;'>"  # Original name
+        "<col style='width:110px;'>"  # Source
+        "<col style='width:70px;'>"  # Country
+        "<col style='width:90px;'>"  # Total
+        "<col style='width:90px;'>"  # Mean
+        "<col style='width:70px;'>"  # Share
+        "<col style='width:110px;'>"  # Share column
+        "<col style='width:60px;'>"  # Unit
+        "<col style='width:110px;'>"  # Weight column
+        "<col style='width:100px;'>"  # Native levels
+        "<col style='width:120px;'>"  # Resampled levels
+        "<col style='width:150px;'>"  # Resampling (up / down)
+        "<col style='width:420px;'>"  # Description (largest -- the main content column)
+        "</colgroup>"
+    )
+    # Border/padding shared by every header and body cell except the last
+    # column (Description), which gets no right-border since it's the table
+    # edge; "black lines" per user request -> a clearly visible dark
+    # separator, not the previous near-invisible `#eee` row divider.
+    _COL_BORDER = "border-right:1px solid #333;"
+    _CELL_PAD = "padding:4px 8px;"
+    # Cells whose content can run long get ellipsis-truncate-with-title so a
+    # long value can't blow out the fixed table layout; Description (last
+    # column, `min-width:260px`, most free space) wraps instead since
+    # truncating the one column whose whole point is to be read isn't useful.
+    _TRUNCATE = "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+
+    def _th(label: str, align: str, last: bool = False) -> str:
+        border = "" if last else _COL_BORDER
+        return f"<th style='text-align:{align};{_CELL_PAD}{border}'>{label}</th>"
+
     header = (
         "<tr>"
-        "<th style='text-align:left;'>Column</th>"
-        "<th style='text-align:left;'>Source</th>"
-        "<th style='text-align:left;'>Highest level</th>"
-        "<th style='text-align:right;'>Total</th>"
-        "<th style='text-align:right;'>Average</th>"
-        "<th style='text-align:right;'>Share</th>"
-        "<th style='text-align:left;'>Unit</th>"
-        "<th style='text-align:left;'>Weight column</th>"
-        "<th style='text-align:left;'>Description</th>"
-        "</tr>"
+        + _th("Column", "left")
+        + _th("Original name", "left")
+        + _th("Source", "left")
+        + _th("Country", "left")
+        + _th("Total", "right")
+        + _th("Mean", "right")
+        + _th("Share", "right")
+        + _th("Share column", "left")
+        + _th("Unit", "left")
+        + _th("Weight column", "left")
+        + _th("Native levels", "left")
+        + _th("Resampled levels", "left")
+        + _th("Resampling (up / down)", "left")
+        + _th("Description", "left", last=True)
+        + "</tr>"
     )
-    body = "".join(
-        "<tr style='border-top:1px solid #eee;'>"
-        f"<td style='font-weight:600;'>{escape(str(r['name']))}</td>"
-        f"<td>{escape(str(r['source']))}</td>"
-        f"<td>{escape(str(r['level']))}</td>"
-        f"<td style='text-align:right;'>{escape(str(r['total']))}</td>"
-        f"<td style='text-align:right;'>{escape(str(r['average']))}</td>"
-        f"<td style='text-align:right;'>{escape(str(r.get('share', '')))}</td>"
-        f"<td>{escape(str(r['unit']))}</td>"
-        f"<td>{escape(str(r['weight_column']))}</td>"
-        f"<td style='color:#555;'>{escape(str(r['description']))}</td>"
-        "</tr>"
-        for r in metadata_rows
-    )
+
+    def _fmt_num(v, suffix: str = "") -> str:
+        return "" if v is None else f"{v:,.2f}{suffix}"
+
+    def _td(text: str, extra: str = "", truncate: bool = True, title: str = None) -> str:
+        style = _CELL_PAD + _COL_BORDER + extra
+        if truncate:
+            style += _TRUNCATE
+        title_attr = f" title='{escape(title if title is not None else text)}'" if truncate else ""
+        return f"<td style='{style}'{title_attr}>{text}</td>"
+
+    def _row(r: Dict) -> str:
+        native_levels = ", ".join(r.get("native_levels") or [])
+        resampled_levels = ", ".join(r.get("resampled_levels") or [])
+        resampling = f"{r.get('resampling_up_method') or ''} / {r.get('resampling_down_method') or ''}"
+        description = str(r["description"])
+        cells = [
+            _td(escape(str(r["name"])), extra="font-weight:600;"),
+            _td(escape(str(r.get("original_name") or ""))),
+            _td(escape(str(r["source"]))),
+            _td(escape(str(r.get("country") or ""))),
+            _td(escape(_fmt_num(r.get("total"))), extra="text-align:right;"),
+            _td(escape(_fmt_num(r.get("mean"))), extra="text-align:right;"),
+            _td(escape(_fmt_num(r.get("share"), "%")), extra="text-align:right;"),
+            _td(escape(str(r.get("share_column") or ""))),
+            _td(escape(str(r["unit"]))),
+            _td(escape(str(r["weight_column"]))),
+            _td(escape(native_levels)),
+            _td(escape(resampled_levels)),
+            _td(escape(resampling)),
+            # Description: last column, no right-border, wraps instead of
+            # truncating -- it's the one column meant to be read in full.
+            f"<td style='{_CELL_PAD}color:#555;white-space:normal;word-break:break-word;min-width:260px;'>{escape(description)}</td>",
+        ]
+        return "<tr style='border-top:1px solid #333;'>" + "".join(cells) + "</tr>"
+
+    body = "".join(_row(r) for r in metadata_rows)
     return f"""
   <div id="statsTab_metadata" class="statsTabPanel" style="display:none;">
-    <div style="margin-bottom:6px;color:#666;">
-      Every real census / WorldPop column this map carries -- source, the
-      finest real geography it's published at, this place's total and
-      population-weighted average, and its unit. Densities/shares/rates/
-      medians never show a "Total" (summing them is not a meaningful
-      figure); "Average" is population-weighted whenever a population
-      column exists on this map.
-    </div>
-    <div style="overflow-x:auto;">
-      <table style="width:100%;border-collapse:collapse;font-size:11px;">
+    <div style="overflow-x:auto;overflow-y:visible;max-width:100%;">
+      <table style="width:max-content;min-width:100%;table-layout:fixed;border-collapse:collapse;border:1px solid #333;font-size:11px;">
+        {colgroup}
         <thead>{header}</thead>
         <tbody id="metadataTabBody">{body}</tbody>
       </table>
@@ -4512,16 +5024,18 @@ def _discretization_params_js(region: str) -> str:
     p = REGIONS[region]
     consts = {
         "weights": list(p.weights),
-        "headwaySaturationMinutes": p.headway_saturation_minutes,
-        "headwayDecayScaleMinutes": p.headway_decay_scale_minutes,
-        "maxUsefulHeadwayMinutes": p.max_useful_headway_minutes,
         "walkingSpeedMps": p.walking_speed_mps,
-        "walkT0BaseMinutes": p.walk_t0_base_minutes,
-        "walkDecayShapeP": p.walk_decay_shape_p,
-        "walkDistanceSaturationM": p.walk_distance_saturation_m,
-        "modeSpeedBreakpointsKmh": list(p.mode_speed_breakpoints_kmh),
-        "speedSaturationKmh": p.speed_saturation_kmh,
-        "reliabilityCvScale": p.reliability_cv_scale,
+        "tPlateauDistanceM": p.t_plateau_distance_m,
+        "t0BaseMinutesByMode": dict(p.t0_base_minutes),
+        "kQuality": p.k_quality,
+        "pShape": p.p_shape,
+        "hSaturationMinutes": p.h_saturation_minutes,
+        "hElasticityP": p.h_elasticity_p,
+        "hElasticityQ": p.h_elasticity_q,
+        "vAnchorKmh": p.v_anchor_kmh,
+        "vCeilingBonus": p.v_ceiling_bonus,
+        "vShapeN": p.v_shape_n,
+        "mrMode": dict(p.mr_mode),
     }
     return f"window.__disc = {json.dumps(consts)};\n"
 
@@ -4639,12 +5153,14 @@ function __weightedMedian(values, weights) {{
 }}
 
 function __accessBin(s) {{
-  if (s <= 1e-9) return 0;
-  var upper = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0000001];
-  for (var i = 0; i < upper.length; i++) {{ if (s <= upper[i] + 1e-9) return i + 1; }}
+  // 2026-09-23: level_of_service is now stored on a 0-100 scale (was 0-1) --
+  // bin edges rescaled to match `code.stats.access_distribution`.
+  if (s <= 1e-7) return 0;
+  var upper = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100.0001];
+  for (var i = 0; i < upper.length; i++) {{ if (s <= upper[i] + 1e-7) return i + 1; }}
   return upper.length;
 }}
-var __binLabels = ['0', '0-0.1', '0.1-0.2', '0.2-0.3', '0.3-0.4', '0.4-0.5', '0.5-0.6', '0.6-0.7', '0.7-0.8', '0.8-0.9', '0.9-1'];
+var __binLabels = ['0', '0-10', '10-20', '20-30', '30-40', '40-50', '50-60', '60-70', '70-80', '80-90', '90-100'];
 
 // Regression/R^2/ANOVA read `window.__statsData[area]` through this helper
 // instead of directly, so a scenario that has been Computed at least once
@@ -4855,7 +5371,49 @@ function __secondaryScenarioData(selId) {{
   return getStatsData(area, sel);
 }}
 
+// 2026-09-23 addition (verbatim user request, item 3: Distribution's own
+// "Compare with" Column select should list THAT place's own columns when a
+// Place is picked, not stay stuck on this map's own columns). `null`
+// placeKey (this place's own default) restores the original build-time
+// option list, captured once on first call. A real placeKey reuses
+// `__placeCompareData` -- the exact same cross-place `stats_data.json`
+// fetch/cache every other "Compare with place" lookup already goes
+// through -- so a place still mid-fetch just leaves the select as-is for
+// this pass; `__placeCompareData`'s own resolve handler already calls
+// `__renderActiveTab()`, which re-enters `renderDistribution()` (and thus
+// this function) once the data lands.
+var __distOwnOverlayOptionsHtml = null;
+function __rebuildDistColumnOptions(placeKey, area) {{
+  var sel = document.getElementById('distOverlaySelect');
+  if (!sel) return;
+  if (__distOwnOverlayOptionsHtml === null) __distOwnOverlayOptionsHtml = sel.innerHTML;
+  if (!placeKey) {{
+    if (sel.innerHTML !== __distOwnOverlayOptionsHtml) sel.innerHTML = __distOwnOverlayOptionsHtml;
+    return;
+  }}
+  var data = __placeCompareData(placeKey, area);
+  if (!data) return; // still loading -- __renderActiveTab() re-runs this once it resolves
+  var keys = Object.keys(data).filter(function(k) {{ return k !== 'h3_cell' && k !== 'level_of_service'; }});
+  if (!keys.length) return;
+  var prev = sel.value;
+  var __distLabels = __fieldLabelsFor(keys);
+  sel.innerHTML = '<option value="none"></option>' +
+    keys.map(function(k) {{ return '<option value="' + k + '">' + __distLabels[k] + '</option>'; }}).join('');
+  sel.value = (prev === 'none' || keys.indexOf(prev) !== -1) ? prev : 'none';
+}}
+
 function renderDistribution() {{
+  // 2026-09-23 fix (verbatim user request: "the list of columns should
+  // change when user changes the place on the lower dropout box") -- rebuild
+  // `distOverlaySelect`'s own option list from whichever place is currently
+  // picked BEFORE reading its `.value` below, so a place switch is reflected
+  // immediately (or as soon as that place's `stats_data.json` finishes
+  // fetching -- see `__rebuildDistColumnOptions`, which reuses
+  // `__placeCompareData`'s cache/re-render-on-resolve mechanism, same one
+  // the Place-rank tab and every other cross-place "Compare with" lookup
+  // already use).
+  var __distPlaceSelForCols = document.getElementById('distComparePlaceSelect');
+  __rebuildDistColumnOptions(__distPlaceSelForCols ? __distPlaceSelForCols.value : '', window.__statsArea);
   // Main column: always the active scenario, exactly like every other panel
   // that reads `window.__statsData` -- no override here.
   var data = getStatsData(window.__statsArea);
@@ -4909,22 +5467,29 @@ function renderDistribution() {{
       secSums[__accessBin(ss)] += sv; totalSec += sv;
     }}
   }}
-  // Item 4 (verbatim user request): every "weighted transit score" shown
-  // anywhere in the stats panel is always a WEIGHTED MEDIAN by the
-  // corresponding column, never a mean -- `__weightedMean` used to be used
-  // here, which reads very differently for a skewed distribution (e.g. a
-  // large population share sitting at exactly 0 access pulls a mean down
-  // much further than the median most people actually experience).
-  var weightedAccess = __weightedMedian(score, pop);
-  var weightedAccessSec = secSums ? __weightedMedian(secData.level_of_service, secData[secField]) : null;
-  // Item 3 (verbatim user request): show "Total <column> <n> weighted
-  // transit level of service <value>" instead of the old bare "<column>
-  // -weighted access: <value>".
-  var summary = 'Total ' + mainLabel + ': <b>' + __fmt(totalPop) + '</b> &nbsp;|&nbsp; ' +
-    mainLabel + '-weighted transit level of service: <b>' + weightedAccess.toFixed(2) + '</b>';
+  // 2026-09-24, explicit user request: the OVERALL city/place score (top-
+  // center bar, see `__topBarScore`) is always a population-weighted MEAN,
+  // never user-switchable -- but Distribution's own summary line (and
+  // Place rank's ranking, see `placeRankAggSelect`) gets an explicit
+  // "Aggregate" dropdown (`distAggSelect`, mean/median, defaulting to
+  // mean) since a HISTOGRAM view is exactly where seeing the same number
+  // both ways is useful. Label dynamic to whichever column is actually
+  // driving the weight (`mainLabel`/`secLabel`), never hardcoded to
+  // "Population".
+  var distAggSel = document.getElementById('distAggSelect');
+  var distAgg = distAggSel ? distAggSel.value : 'mean';
+  var aggFn = (distAgg === 'median') ? __weightedMedian : __weightedMean;
+  var weightedAccess = aggFn(score, pop);
+  var weightedAccessSec = secSums ? aggFn(secData.level_of_service, secData[secField]) : null;
+  var aggWord = (distAgg === 'median') ? '-weighted median level of service: <b>' : '-weighted level of service: <b>';
+  // 2026-09-25, explicit user request: one line per value -- a line break
+  // before each "...-weighted level of service" reading, not the whole
+  // summary crammed onto a single " | "-separated line.
+  var summary = 'Total ' + mainLabel + ': <b>' + __fmt(totalPop) + '</b><br>' +
+    mainLabel + aggWord + weightedAccess.toFixed(1) + '</b>';
   if (weightedAccessSec != null) {{
-    summary += ' &nbsp;|&nbsp; Total ' + secLabel + ': <b>' + __fmt(totalSec) + '</b> &nbsp;|&nbsp; ' +
-      secLabel + '-weighted transit level of service: <b>' + weightedAccessSec.toFixed(2) + '</b>';
+    summary += '<br>Total ' + secLabel + ': <b>' + __fmt(totalSec) + '</b><br>' +
+      secLabel + aggWord + weightedAccessSec.toFixed(1) + '</b>';
   }}
 
   // Rescale check: compare the RAW value ranges of mainField (from the main
@@ -5030,7 +5595,16 @@ function __weightedLinReg(xs, ys, ws) {{
     // (only strictly negative weights were rejected) contributing 0 to the
     // fit math while still inflating `n` and cluttering the scatter with a
     // point that has no real weight behind it.
-    if (x == null || y == null || !x || isNaN(x) || isNaN(y) || w == null || isNaN(w) || w <= 0) continue;
+    // 2026-09-25, explicit user request ("take away any cell with 0 level
+    // of service... same for the more housing, more transit cells"): `y`
+    // is level_of_service at every call site of this function (main
+    // regression, its secondary-scenario/place comparison, AND the
+    // more-housing/more-transit std-dotted-line mirror at `eqFit` below)
+    // -- a LOS of exactly 0 is a real "no access at all" outlier that
+    // shouldn't pull the fit (and therefore the equity-flag thresholds
+    // derived from it), same spirit as the existing zero-x/zero-weight
+    // exclusions just above.
+    if (x == null || y == null || !x || !y || isNaN(x) || isNaN(y) || w == null || isNaN(w) || w <= 0) continue;
     sx.push(x); sy.push(y); sw.push(w);
   }}
   var n = sx.length;
@@ -5193,6 +5767,75 @@ function renderRegression() {{
   var mainDraw = scatterAndFit(fit, '#3366cc', '#cc3333');
   var secDraw = haveSecPoints ? scatterAndFit(secFit, '#ff9900', '#8833cc') : '';
 
+  // 2026-09-22, explicit user request ("on the stats panel the regression
+  // plot show a dotted line for one std above and below (without any
+  // label or color just the dotted line)"): the same +-1-residual-std
+  // band the "more housing"/"more transit" layer-control overlay flags
+  // cells against (see `code.stats.equity_flag`'s regression-residual
+  // method) -- drawn here as two lines parallel to the main fit, offset
+  // by the fit's own residual standard deviation, using the exact same
+  // y-range clipping `scatterAndFit` already does for the solid line so
+  // they never poke out past the plot's axes. Deliberately no legend
+  // entry/label and a plain neutral gray stroke (not `lineColor`) -- the
+  // dashed pattern alone is the whole signal, nothing to name.
+  // Real bug fix (2026-09-23): this used to offset the *currently displayed*
+  // `fit` (which follows `regFieldSelect`'s field, auto-picks log-vs-raw by
+  // whichever wins R^2, and is POPULATION-WEIGHTED) by that same fit's own
+  // residual std -- but `code.stats.equity_flag_thresholds` (which the
+  // "more housing"/"more transit" overlay's cells are actually flagged
+  // from) always fits UNWEIGHTED `level_of_service ~ log(density)`, never
+  // raw, never weighted, and always against `development_density_column`
+  // (`pop_jobs_density` if present else `pop_density`), never whatever
+  // field the user happens to have selected here. Those are two different
+  // regressions whenever the selected field isn't exactly the density
+  // column, or whenever the auto log/raw choice or the population
+  // weighting shifts the fit -- which is exactly why the overlay used to
+  // show more (or differently-positioned) flagged cells than the dotted
+  // lines' own scatter showed outside the band. Fix: recompute a SEPARATE
+  // fit here, unweighted and always-log against the equity density field
+  // specifically, matching `equity_flag_thresholds` exactly, and only draw
+  // it when that's genuinely the field on the x-axis (so the line geometry
+  // still lines up with the plotted axes).
+  var stdDraw = '';
+  // 2026-09-29 real bug fix (user report: "I dont see it on the map"): the
+  // 2026-09-23 change above gated this on `field === __equityDensityField
+  // && useLog` -- matching the "more housing"/"more transit" overlay's
+  // OWN fixed regression exactly -- but that means the dotted band only
+  // ever appeared when the user happened to have that one specific field
+  // selected with log fit winning, which is rarely the field actually
+  // shown. Reverted to drawing the band around whichever fit is CURRENTLY
+  // ON SCREEN (`fit`, already computed above for the selected field/log
+  // choice) instead of a separately-recomputed equity-specific one, so the
+  // dotted lines always match the solid regression line the user is
+  // actually looking at.
+  if (isFinite(fit.slope) && fit.xs.length > 1) {{
+    var residuals = fit.xs.map(function(xv, i) {{ return fit.ys[i] - (fit.slope * xv + fit.intercept); }});
+    var meanResid = residuals.reduce(function(a, b) {{ return a + b; }}, 0) / residuals.length;
+    var variance = residuals.reduce(function(a, b) {{ return a + (b - meanResid) * (b - meanResid); }}, 0) / residuals.length;
+    var stdResid = Math.sqrt(variance);
+    if (isFinite(stdResid) && stdResid > 0) {{
+      [stdResid, -stdResid].forEach(function(offset) {{
+        var lx0 = xMin, ly0 = fit.slope * xMin + fit.intercept + offset;
+        var lx1 = xMax, ly1 = fit.slope * xMax + fit.intercept + offset;
+        var dy = ly1 - ly0;
+        var t0 = 0, t1 = 1;
+        if (dy !== 0) {{
+          var tA = (yMin - ly0) / dy, tB = (yMax - ly0) / dy;
+          var tlo = Math.min(tA, tB), thi = Math.max(tA, tB);
+          t0 = Math.max(t0, tlo); t1 = Math.min(t1, thi);
+        }} else if (ly0 < yMin || ly0 > yMax) {{
+          t1 = -1;
+        }}
+        if (t1 >= t0) {{
+          var cx0 = lx0 + (lx1 - lx0) * t0, cy0 = ly0 + dy * t0;
+          var cx1 = lx0 + (lx1 - lx0) * t1, cy1 = ly0 + dy * t1;
+          stdDraw += '<line x1="' + px(cx0).toFixed(1) + '" y1="' + py(cy0).toFixed(1) + '" x2="' + px(cx1).toFixed(1) +
+            '" y2="' + py(cy1).toFixed(1) + '" stroke="#999" stroke-width="1" stroke-dasharray="4,3"></line>';
+        }}
+      }});
+    }}
+  }}
+
   var xTicks = __niceTicks(xMin, xMax, 4), yTicks = __niceTicks(yMin, yMax, 4);
   var axes = '<line x1="' + padL + '" y1="' + (h - padB) + '" x2="' + (w - padR) + '" y2="' + (h - padB) + '" stroke="#999"></line>' +
     '<line x1="' + padL + '" y1="' + padT + '" x2="' + padL + '" y2="' + (h - padB) + '" stroke="#999"></line>';
@@ -5234,7 +5877,7 @@ function renderRegression() {{
   }}
 
   var svg = '<svg width="' + w + '" height="' + h + '" style="background:#fafafa;border:1px solid #ddd;">' +
-    axes + mainDraw + secDraw + labels + legend +
+    axes + mainDraw + stdDraw + secDraw + labels + legend +
     '</svg>';
   document.getElementById('regPlot').innerHTML = svg;
   renderR2Bars(field);
@@ -5287,13 +5930,14 @@ function renderR2Bars(selectedField) {{
   results.sort(function(a, b) {{ return b.r2 - a.r2; }});
   var maxR2 = results.length ? results[0].r2 : 1;
   results.forEach(function(r) {{ if (r.secR2 != null && r.secR2 > maxR2) maxR2 = r.secR2; }});
+  var __r2Labels = __fieldLabelsFor(__anovaFields);
   var html = '';
   results.forEach(function(r) {{
     var barWidth = (r.r2 / maxR2) * 100;
     var isSel = (r.field === selectedField);
     var color = isSel ? '#3a6ea8' : '#33aa55';
     html += '<div style="margin-bottom:6px;">';
-    var rFieldLabel = __fieldLabel(r.field);
+    var rFieldLabel = __r2Labels[r.field];
     html += '<div style="font-size:10.5px;color:#444;margin-bottom:2px;">' +
       (isSel ? '<b>' + rFieldLabel + '</b>' : rFieldLabel) + (r.useLog ? ' <span style="color:#888;">(log)</span>' : '') +
       '  <b>(' + r.r2.toFixed(2) + ')</b>' +
@@ -5336,7 +5980,8 @@ function __setRegressionFields(fields) {{
   var sel = document.getElementById('regFieldSelect');
   if (sel) {{
     var prev = sel.value;
-    sel.innerHTML = fields.map(function(f) {{ return '<option value="' + f + '">' + __fieldLabel(f) + '</option>'; }}).join('');
+    var __setRegLabels = __fieldLabelsFor(fields);
+    sel.innerHTML = fields.map(function(f) {{ return '<option value="' + f + '">' + __setRegLabels[f] + '</option>'; }}).join('');
     sel.value = fields.indexOf(prev) !== -1 ? prev : (fields[0] || '');
   }}
 }}
@@ -5407,6 +6052,7 @@ function renderAnova() {{
   var secData = hasSecondary ? __secondaryScenarioData('anovaSecondaryScenarioSelect') : null;
 
   var results = [];
+  var __anovaLabels = __fieldLabelsFor(__anovaFields);
   __anovaFields.forEach(function(field) {{
     var diff = __anovaDiff(data, field);
     if (diff == null) return;
@@ -5433,7 +6079,7 @@ function renderAnova() {{
   var html = '';
   results.forEach(function(r) {{
     html += '<div style="margin-bottom:6px;">';
-    html += '<div style="font-size:10.5px;color:#444;margin-bottom:2px;">' + __fieldLabel(r.field) +
+    html += '<div style="font-size:10.5px;color:#444;margin-bottom:2px;">' + __anovaLabels[r.field] +
       '  <b>(' + (r.diff >= 0 ? '+' : '') + r.diff.toFixed(2) + ')</b>' +
       (r.secDiff != null ? '  <span style="color:#8833cc;">' + __secondaryLabel('anovaSecondaryScenarioSelect', secSel) + ': ' +
         (r.secDiff >= 0 ? '+' : '') + r.secDiff.toFixed(2) + '</span>' : '') +
@@ -5457,64 +6103,95 @@ function renderAnova() {{
 // a second hand-copied set of numbers.
 
 function __jsSpeedScore(avgSpeedKmh) {{
-  // Mirrors speed.py's 2026-08-12 fix: the score reaches exactly 1.0 at
-  // breakpoints[2] (ITDP's own "zero speed penalty" anchor) and stays
-  // there -- `saturation_kmh` no longer extends the ramp, see that file's
-  // module docstring for the discontinuity bug this replaced.
-  var b = window.__disc.modeSpeedBreakpointsKmh;
-  var b0 = b[0], b1 = b[1], b2 = b[2];
-  if (avgSpeedKmh <= 0) return 0.0;
-  if (avgSpeedKmh < b0) return 0.5 * (avgSpeedKmh / b0);
-  if (avgSpeedKmh < b1) return 0.5 + 0.35 * (avgSpeedKmh - b0) / (b1 - b0);
-  if (avgSpeedKmh < b2) return 0.85 + 0.15 * (avgSpeedKmh - b1) / (b2 - b1);
-  return 1.0;
+  // Mirrors speed.py's V(speed), scoring.md Section 2.4 (2026-09-29 THIRD
+  // SHAPE-FIX revision): a single smooth Hill-function curve
+  // V(v)=M*v^n/(v^n+K^n). M=1+vCeilingBonus is the asymptote -- an explicit
+  // design-judgment ceiling, NOT pinned to any second named speed (an
+  // earlier same-day revision tried pinning it to German Regional-Express's
+  // speed at 80 km/h and was reverted after review -- see speed.py's module
+  // docstring, Revision 4). K is solved so V(vAnchorKmh)=1.0 exactly
+  // (30 km/h, re-derived from real metro commercial-speed data); n
+  // (vShapeN) is a fixed shape parameter correcting a low-speed defect
+  // found in this curve's n=1 (plain Michaelis-Menten) predecessor.
+  var d = window.__disc;
+  var m = 1.0 + d.vCeilingBonus;
+  var n = d.vShapeN;
+  var k = d.vAnchorKmh * Math.pow(m - 1.0, 1.0 / n);
+  return m * Math.pow(avgSpeedKmh, n) / (Math.pow(avgSpeedKmh, n) + Math.pow(k, n));
 }}
 
 function __jsFrequencyScore(headwayMinutes) {{
-  var sat = window.__disc.headwaySaturationMinutes, scale = window.__disc.headwayDecayScaleMinutes;
+  // Mirrors frequency.py's H(headway), scoring.md Section 2.2: log-linear
+  // variable-elasticity closed form, eps(h) = p + q*ln(h).
+  var d = window.__disc, sat = d.hSaturationMinutes, p = d.hElasticityP, q = d.hElasticityQ;
   if (headwayMinutes <= sat) return 1.0;
-  return Math.exp(-(headwayMinutes - sat) / scale);
+  var epsSat = p + q * Math.log(sat);
+  var logRatio = Math.log(headwayMinutes / sat);
+  var lnH = -epsSat * logRatio - (q / 2.0) * logRatio * logRatio;
+  return Math.exp(lnH);
 }}
 
-function __jsReliabilityScore(headwayCv) {{
-  return Math.exp(-headwayCv / window.__disc.reliabilityCvScale);
+function __jsMrCv(headwayCv) {{
+  // Mirrors mrc.py's MR_CV(CV), scoring.md Section 2.3(b): algebraic
+  // inverse of Bowman & Turnquist's (1981) (1+CV^2) wait-inflation factor.
+  return 1.0 / (1.0 + headwayCv * headwayCv);
 }}
 
-// Mirrors mode.py's MODE_SCORES -- fixed per-category constants, not a
-// formula, so baked in directly rather than threaded through window.__disc.
-var __MODE_SCORES = {{
-  rail: 1.0,
-  tram: Math.pow(1.0 * (1.0 / 1.15), 0.5),
-  bus: 1.0 / 1.15,
-}};
-var __MODE_LINE_COLOR = {{ rail: '#006400', tram: '#8b4513', bus: '#8b0000' }};
+// Mirrors mrc.py's MR_mode table -- fixed per-category constants, threaded
+// through window.__disc (mrMode) rather than a second hand-copied literal.
+var __MODE_LINE_COLOR = {{ rail: '#006400', tram: '#e0b400', bus: '#8b0000' }};
 
-// A fixed, representative headway_cv for reliability_score whenever it isn't
-// one of the two axes the "Stop score" curve toggles between (speed and
-// headway per the user's explicit request) -- reliability itself has no
-// third slider here, it's just held steady so the two requested axes are
-// the only things moving.
-var __DISC_STOP_SCORE_DEFAULT_CV = 0.3;
+// A fixed, representative headway_cv for the optional MR_CV refinement
+// whenever it isn't one of the two axes the "Stop score" curve toggles
+// between (speed and headway per the user's explicit request) -- CV itself
+// has no third slider here, it's just held steady so the two requested axes
+// are the only things moving. `null` (the common, load-bearing GTFS-static
+// case) uses the mode-categorical MR_mode default instead of MR_CV, per
+// scoring.md Section 2.3.
+var __DISC_STOP_SCORE_DEFAULT_CV = null;
 
-// `headwayCv` is optional and defaults to `__DISC_STOP_SCORE_DEFAULT_CV`, so
-// every existing Discretization-tab call site is unchanged. It exists for the
-// scenario editor (Phase 4), which takes its CV from
-// `default_edit_params.json`'s `access_recompute.headway_cv` rather than from
-// this file's plot-only constant.
+// `headwayCv` is optional; `null` (the default at every existing call site)
+// uses the mode-categorical MR_mode default rather than the optional MR_CV
+// refinement, matching mrc_score()'s own "MR_CV only if headway_cv supplied"
+// behavior (scoring.md Section 2.3).
+function __jsMrcScore(mode, headwayCv) {{
+  var cv = headwayCv == null ? __DISC_STOP_SCORE_DEFAULT_CV : headwayCv;
+  return cv == null ? window.__disc.mrMode[mode] : __jsMrCv(cv);
+}}
+
 function __jsStopScore(mode, speedKmh, headwayMinutes, headwayCv) {{
-  var w = window.__disc.weights;
-  var m = __MODE_SCORES[mode];
+  // 2026-09-29 aggregation-STRUCTURE revision (scoring.md Section 1.2, stop_score.py):
+  // nested form sqrt(MRC*V)*H -- MRC and V pooled via a plain, equal, unweighted
+  // 2-way geometric mean (substitutable: both describe ride quality once the
+  // vehicle arrives), then gated multiplicatively by H (not substitutable: whether
+  // the vehicle comes in a useful timeframe at all). Supersedes the immediately-
+  // prior flat p=-1 weighted-harmonic-mean form (which itself superseded the
+  // original flat p=0 geometric mean) -- no `weights` parameter applies here by
+  // construction, matching stop_score.py's mode="nested" (the Python default).
+  var mrc = __jsMrcScore(mode, headwayCv);
   var s = __jsSpeedScore(speedKmh);
   var f = __jsFrequencyScore(headwayMinutes);
-  var r = __jsReliabilityScore(headwayCv == null ? __DISC_STOP_SCORE_DEFAULT_CV : headwayCv);
-  return Math.pow(m, w[0]) * Math.pow(s, w[1]) * Math.pow(f, w[2]) * Math.pow(r, w[3]);
+  if (mrc === 0 || s === 0 || f === 0) return 0.0;
+  return Math.sqrt(mrc * s) * f;
 }}
 
-function __jsWalkDecay(walkTimeMinutes) {{
+function __jsT0OfStopScore(mode, stopScore) {{
+  // Falls back to "bus" (the most conservative/shortest t0_base) when no
+  // mode context is available, e.g. the standalone Distance-tab curve,
+  // which plots D(t) in isolation rather than for one specific stop.
   var d = window.__disc;
-  var tSat = d.walkDistanceSaturationM / d.walkingSpeedMps / 60.0;
-  if (walkTimeMinutes <= tSat) return 1.0;
-  return Math.pow(1.0 + (walkTimeMinutes - tSat) / d.walkT0BaseMinutes, -d.walkDecayShapeP);
+  return d.t0BaseMinutesByMode[mode || 'bus'] * (1.0 + d.kQuality * (stopScore == null ? 0.0 : stopScore));
+}}
+
+function __jsWalkDecay(walkTimeMinutes, stopScore, mode) {{
+  // Mirrors walk_access.py's D(t; stop_score), scoring.md Section 2.1:
+  // t0 is itself mode- and stop_score-scaled, restoring the joint-function
+  // coupling (2026-09-28).
+  var d = window.__disc;
+  var tPlateau = d.tPlateauDistanceM / d.walkingSpeedMps / 60.0;
+  if (walkTimeMinutes <= tPlateau) return 1.0;
+  var t0 = __jsT0OfStopScore(mode, stopScore == null ? 0.0 : stopScore);
+  return Math.pow(1.0 + (walkTimeMinutes - tPlateau) / t0, -d.pShape);
 }}
 
 var __discParamDefs = {{
@@ -5534,11 +6211,6 @@ var __discParamDefs = {{
     xMin: 0.5, xMax: 60, steps: 180,
     fn: function(x) {{ return __jsFrequencyScore(x); }},
   }},
-  reliability: {{
-    xLabel: 'headway_cv', yLabel: 'reliability_score',
-    xMin: 0, xMax: 2, steps: 180,
-    fn: function(x) {{ return __jsReliabilityScore(x); }},
-  }},
   distance: {{
     xLabel: {json.dumps(field_label("walk_time_minutes"))}, yLabel: 'walk_decay (D)',
     xMin: 0, xMax: 30, steps: 180,
@@ -5554,7 +6226,7 @@ var __discParamDefs = {{
   access: {{
     axisToggle: 'access', yLabel: 'level_of_service',
   }},
-  // One curve per mode (mode_score fixed per curve, per __MODE_SCORES). X is
+  // One curve per mode (MR_mode fixed per curve, per window.__disc.mrMode). X is
   // whichever of speed/headway `#discStopScoreAxisSelect` picks (default
   // headway, per explicit request); the other one is held fixed at
   // `#discStopScoreSlider`'s value. Handled specially in renderDiscretization
@@ -5621,11 +6293,32 @@ var __discStopScoreAxisDefs = {{
 // window.__disc, hence a function rather than a literal.
 function __discDefaultWalkTime() {{
   var d = window.__disc;
-  return 2 * (d.walkDistanceSaturationM / d.walkingSpeedMps / 60.0);
+  return 2 * (d.tPlateauDistanceM / d.walkingSpeedMps / 60.0);
 }}
 
+// 2026-09-28, explicit user request: "mode, headway, speed and stop scores
+// they all should be in 0-100 range instead of 0-1 but the way of
+// operating with them is in 0-1 range" -- these two axis ranges
+// (`stop_score`'s own x-axis, and `walk_time`'s "Stop score" slider) are
+// display-only UI ranges, rescaled to 0-100 to match; `renderDiscretization()`
+// still does the actual `stopScoreVal * __jsWalkDecay(...)` math with
+// whatever these now-0-100 values are (the composed result naturally comes
+// out on the correct 0-100 scale too -- see that function's own comment).
 var __discAccessAxisDefs = {{
-  stop_score: {{ xLabel: 'stop_score', xMin: 0, xMax: 1, steps: 100,
+  // xMax/otherMax 120, not 100: stop_score is now (2026-09-29 STRUCTURE
+  // revision) the nested form sqrt(MRC*V)*H (stop_score.py), not a flat mean
+  // of all three sub-scores -- and speed_score alone can exceed 1.0 (up to
+  // 1.15), so stop_score itself is bounded to (0, ~1.0724], not a hard [0,1]
+  // -- see stop_score.py's module docstring. The exact ceiling is
+  // sqrt(1.0*1.15)*1.0 ~= 1.0724 (all three sub-scores at their max), a
+  // genuinely different number from either superseded flat form's ceiling
+  // (harmonic mean p=-1: 3/(1/1+1/1.15+1/1)~=1.0455; geometric mean p=0:
+  // (1*1.15*1)^(1/3)~=1.0477) since a 2-way geometric mean of (1.0, 1.15)
+  // behaves differently from a 3-way flat mean at the top end. 120 (i.e.
+  // stop_score = 1.20) still gives comfortable headroom past this real
+  // ~1.07 ceiling without stretching the 0-1 "normal" range too thin on the
+  // track -- unchanged from before, just re-derived for the new ceiling.
+  stop_score: {{ xLabel: 'stop_score', xMin: 0, xMax: 120, steps: 120,
     otherLabel: 'Walk time (minutes)', otherUnit: ' min',
     // step 0.1, not 0.5: the default is a computed value (~6.4 min) and a
     // coarser step would snap the thumb away from the number the label and
@@ -5633,7 +6326,7 @@ var __discAccessAxisDefs = {{
     otherMin: 0, otherMax: 30, otherStep: 0.1, otherDefaultFn: __discDefaultWalkTime }},
   walk_time: {{ xLabel: {json.dumps(field_label("walk_time_minutes"))}, xMin: 0, xMax: 30, steps: 180,
     otherLabel: 'Stop score', otherUnit: '',
-    otherMin: 0, otherMax: 1, otherStep: 0.01, otherDefault: 0.7 }},
+    otherMin: 0, otherMax: 120, otherStep: 1, otherDefault: 70 }},
 }};
 
 var __discAxisGroups = {{
@@ -5710,14 +6403,14 @@ function renderDiscretization() {{
         var x = xMin + (xMax - xMin) * i / axisDef.steps;
         var speedKmh = group.axis === 'speed' ? x : group.other;
         var headwayMin = group.axis === 'headway' ? x : group.other;
-        xs.push(x); ys.push(__jsStopScore(mode, speedKmh, headwayMin));
+        xs.push(x); ys.push(100 * __jsStopScore(mode, speedKmh, headwayMin));
       }}
       series.push({{mode: mode, xs: xs, ys: ys, color: __MODE_LINE_COLOR[mode]}});
     }});
     var otherLabelShort = group.axis === 'speed' ? 'headway' : 'avg_speed_kmh';
     summaryText = yLabel + ' vs ' + xLabel + ' by mode (this map\\'s default parameters, ' +
       otherLabelShort + ' = ' + group.other.toFixed(1) +
-      ', headway_cv = ' + __DISC_STOP_SCORE_DEFAULT_CV.toFixed(2) + ')';
+      ', MRC = mode-categorical default, MR_mode)';
   }} else if (def.axisToggle === 'access') {{
     // level_of_service = stop_score * D(walk_time): whichever of the two is on
     // x sweeps, the other stays at the slider's value.
@@ -5729,20 +6422,26 @@ function renderDiscretization() {{
       var ax = xMin + (xMax - xMin) * a / aDef.steps;
       var stopScoreVal = group.axis === 'stop_score' ? ax : group.other;
       var walkMinutes = group.axis === 'walk_time' ? ax : group.other;
-      axs.push(ax); ays.push(stopScoreVal * __jsWalkDecay(walkMinutes));
+      // __jsWalkDecay's stopScore param feeds __jsT0OfStopScore's `kQuality *
+      // stopScore` term, which is calibrated for the real 0-1(ish) domain
+      // (exactly like every other live caller, e.g. the hover-popup code's
+      // `s.stopScore01` a few thousand lines down) -- NOT this row's 0-100
+      // display scale. Only /100 here, for the curve-shape math; the outer
+      // multiply below deliberately keeps the un-scaled 0-100 `stopScoreVal`
+      // so the plotted level_of_service comes out already display-scaled.
+      axs.push(ax); ays.push(stopScoreVal * __jsWalkDecay(walkMinutes, stopScoreVal / 100));
     }}
     series.push({{mode: null, xs: axs, ys: ays, color: '#3a6ea8'}});
     if (group.axis === 'stop_score') {{
-      summaryText = yLabel + ' vs stop_score (walk_time = ' + group.other.toFixed(1) +
-        ' min, D = ' + __jsWalkDecay(group.other).toFixed(2) + ')';
+      summaryText = yLabel + ' vs stop_score (walk_time = ' + group.other.toFixed(1) + ' min)';
     }} else {{
-      summaryText = yLabel + ' vs walk_time_minutes (stop_score = ' + group.other.toFixed(2) + ')';
+      summaryText = yLabel + ' vs walk_time_minutes (stop_score = ' + group.other.toFixed(1) + ')';
     }}
   }} else {{
     var xs = [], ys = [];
     for (var j = 0; j <= def.steps; j++) {{
       var xv = def.xMin + (def.xMax - def.xMin) * j / def.steps;
-      xs.push(xv); ys.push(def.fn(xv));
+      xs.push(xv); ys.push(100 * def.fn(xv));
     }}
     series.push({{mode: null, xs: xs, ys: ys, color: '#3a6ea8'}});
     xLabel = def.xLabel;
@@ -5762,13 +6461,26 @@ function renderDiscretization() {{
   // now, so in practice this usually still resolves to 1 -- the point is
   // that the chart no longer *asserts* that cap, so a formula change or an
   // out-of-range parameter (e.g. this stop_score curve, which is NOT
-  // individually capped -- it's a geometric mean of sub-scores that are)
+  // individually capped -- it's a generalized power mean, p=-1, of
+  // sub-scores that are)
   // shows up as a visibly taller curve instead of being hidden. [0, 1] is
   // kept only as a MINIMUM extent so the ordinary curves keep their
   // familiar framing rather than zooming to fill.
   var dataMin = __arrMin(allYs), dataMax = __arrMax(allYs);
   var yMin = Math.min(0, isFinite(dataMin) ? dataMin : 0);
-  var yMax = Math.max(1, isFinite(dataMax) ? dataMax * 1.02 : 1);
+  // 2026-09-29, explicit user request: "make sure any scores on the graph
+  // ticks never surpass 100 as this is the maximum score" -- hard-capped
+  // at 100 now, NOT data-driven. This used to be `Math.max(100, dataMax *
+  // 1.02)`, a MINIMUM extent that let the axis grow past 100 whenever a
+  // curve's data did -- and some legitimately do: speed_score alone can
+  // reach 1.05-1.15 (105-115 on this 0-100 display scale) above ~30 km/h's
+  // ceiling-bonus ramp (see __jsSpeedScore), so even the plain standalone
+  // "Speed" curve's default view showed ticks past 100. 100 is the map's
+  // own defined maximum score everywhere else (legend, popups, stats
+  // panel), so the axis stays fixed there regardless of what a formula's
+  // raw output does -- a curve that exceeds it just runs off the top of
+  // the plot instead of stretching the axis to fit.
+  var yMax = 100;
   var xr = xMax - xMin || 1, yr = yMax - yMin || 1;
   function px(x) {{ return padL + (x - xMin) / xr * (w - padL - padR); }}
   function py(y) {{ return h - padB - (y - yMin) / yr * (h - padT - padB); }}
@@ -5793,7 +6505,7 @@ function renderDiscretization() {{
   yTicks.forEach(function(t) {{
     var y = py(t);
     axes += '<line x1="' + (padL - 4) + '" y1="' + y + '" x2="' + padL + '" y2="' + y + '"stroke="#999"></line>';
-    axes += '<text x="' + (padL - 7) + '" y="' + (y + 3) + '" font-size="9" text-anchor="end">' + t.toFixed(2) + '</text>';
+    axes += '<text x="' + (padL - 7) + '" y="' + (y + 3) + '" font-size="9" text-anchor="end">' + t.toFixed(1) + '</text>';
     axes += '<line x1="' + padL + '" y1="' + y + '" x2="' + (w - padR) + '" y2="' + y + '" stroke="#eee"></line>';
   }});
   var labels = '<text x="' + (padL + (w - padL - padR) / 2) + '" y="' + (h - 4) + '" font-size="10" text-anchor="middle" fill="#444">' + xLabel + '</text>' +
@@ -5833,7 +6545,7 @@ function __populateSecondaryScenarioSelect(selId) {{
   var reserved = __statsReservedName();
   var options = [
     {{value: 'none', label: 'None'}},
-    {{value: '', label: 'Current network (baseline)'}}
+    {{value: '', label: 'Original'}}
   ];
   if (ed && ed.state && ed.state.scenarios) {{
     var active = ed.state.activeScenario;
@@ -5859,21 +6571,61 @@ function __populateAllSecondaryScenarioSelects() {{
   __populatePlaceSelects();
 }}
 
+// This map's own place key, derived purely from its URL -- every CS city
+// lives at `CS_transitLOS/<key>/map.html`, so the last non-empty path
+// segment before the filename is `<key>`. No Python-side plumbing needed:
+// the alternative (threading a new `place_key` argument through
+// `build_city_map` -> `_inject_maplibre_stats_panel_into_saved_html` ->
+// `_stats_panel_block`/`_stats_panel_html`/`_stats_panel_js`, plus every
+// pipeline.py call site) was a much larger, riskier change for the same
+// result this page already has for free at runtime.
+function __ownPlaceKey() {{
+  var parts = location.pathname.split('/').filter(function(p) {{ return p; }});
+  if (parts.length && parts[parts.length - 1].indexOf('.') !== -1) parts.pop();
+  return parts.length ? parts[parts.length - 1] : '';
+}}
+
 // Fill every "Compare with" popover's "Place" <select> (`.comparePlaceSelect`,
 // only rendered at all when `enable_place_comparison=True`) from
 // `CS_PLACE_MANIFEST` -- same roster the Place-rank tab uses, minus this map's
 // own place (comparing a place against itself is meaningless). Options
-// beyond "This place only" are populated here rather than baked in at build
+// beyond the default are populated here rather than baked in at build
 // time (`_compare_with_control_html`) because the manifest itself only
 // exists client-side. Runs once on load and again wherever
 // `__populateAllSecondaryScenarioSelects` already runs, matching the
 // scenario select's own refresh pattern.
+//
+// 2026-09-23 fix (verbatim user request: "instead of none by default the
+// current active place should be selected (but appear on the dropout box
+// by its name and not as None)") -- the default option's VALUE stays `""`
+// (every render function's `if (placeKey) return __placeCompareData(...)`
+// check still treats it as "no cross-place comparison", so a fresh popover
+// draws no secondary series, same as before); only its LABEL changes, from
+// "This place only"/"None (this place)" to this map's own real display
+// name (falls back to "This place" if the URL's key isn't in the manifest,
+// e.g. a standalone study map).
 function __populatePlaceSelects() {{
   if (!window.__enablePlaceComparison) return;
+  var ownKey = __ownPlaceKey();
+  var ownEntry = CS_PLACE_MANIFEST.filter(function(c) {{ return c.key === ownKey; }})[0];
+  // 2026-09-26 reversal (verbatim user request: "there has to always exist
+  // a blank field in compare with in case user wants no comparison and
+  // that should be active by default") -- supersedes the 2026-09-25 change
+  // recorded here previously, which (for the combined/overview map, whose
+  // URL has no per-city path segment for `__ownPlaceKey` to resolve)
+  // defaulted the SELECTED VALUE to a real other place's key -- a live
+  // reported bug: opening e.g. Beersheba's own map silently auto-activated
+  // a comparison against Shanghai. The default option's VALUE must always
+  // stay "" (no cross-place comparison, this page's own live data) no
+  // matter what -- only its LABEL varies, falling back to the manifest's
+  // first entry's name for display purposes on a page with no real "own"
+  // place, never changing what's actually selected.
+  var ownLabel = ownEntry ? ownEntry.label : (CS_PLACE_MANIFEST[0] ? CS_PLACE_MANIFEST[0].label : 'This place');
   document.querySelectorAll('.comparePlaceSelect').forEach(function(sel) {{
     var prev = sel.value;
-    var opts = '<option value="" selected>This place only</option>' +
-      CS_PLACE_MANIFEST.map(function(c) {{ return '<option value="' + c.key + '">' + c.label + '</option>'; }}).join('');
+    var opts = '<option value="" selected>' + ownLabel + '</option>' +
+      CS_PLACE_MANIFEST.filter(function(c) {{ return c.key !== ownKey; }})
+        .map(function(c) {{ return '<option value="' + c.key + '">' + c.label + '</option>'; }}).join('');
     sel.innerHTML = opts;
     sel.value = prev || '';
   }});
@@ -5945,7 +6697,24 @@ function renderPlaceRank() {{
   var el = document.getElementById('placeRankList');
   if (!el) return;
   __fetchAllPlaceRankData();
-  var area = window.__statsArea === 'core' ? 'core' : 'metro';
+  // Three new dropdowns (2026-09-23, explicit user request), all actually
+  // driving this fetch/aggregation, not just rendering inertly:
+  //   - Area: metro vs core -- was previously tied silently to whatever tab
+  //     the global stats-panel area toggle (`window.__statsArea`) happened
+  //     to be on; now an independent control local to this tab.
+  //   - Aggregate: mean (default) vs median -- which weighted-aggregation
+  //     function ranks each place.
+  //   - Scenario: original vs with-edits -- reads a per-place `_edited`
+  //     variant of the area's data if the fetched `stats_data.json` bakes
+  //     one in (`cached[area + '_edited']`); a place whose payload has no
+  //     such baked scenario silently falls back to its original data rather
+  //     than erroring, since not every place is guaranteed to ship one.
+  var areaSel = document.getElementById('placeRankAreaSelect');
+  var area = (areaSel ? areaSel.value : window.__statsArea) === 'core' ? 'core' : 'metro';
+  var aggSel = document.getElementById('placeRankAggSelect');
+  var agg = aggSel ? aggSel.value : 'mean';
+  var scenarioSel = document.getElementById('placeRankScenarioSelect');
+  var wantEdited = scenarioSel && scenarioSel.value === 'edited';
   var weightSel = document.getElementById('placeRankWeightSelect');
   var weightCol = weightSel ? weightSel.value : 'none';
   var results = CS_PLACE_MANIFEST.map(function(c) {{
@@ -5953,6 +6722,7 @@ function renderPlaceRank() {{
     if (cached === undefined) return {{key: c.key, label: c.label, value: null, loading: true}};
     if (!cached) return {{key: c.key, label: c.label, value: null, loading: false}};
     var areaData = cached[area] || cached.metro;
+    if (wantEdited && cached[area + '_edited']) areaData = cached[area + '_edited'];
     if (!areaData || !areaData.level_of_service) return {{key: c.key, label: c.label, value: null, loading: false}};
     // A place lacking the selected weight column entirely is EXCLUDED from
     // the ranking (shown as unranked "--"), not silently treated as
@@ -5962,7 +6732,7 @@ function renderPlaceRank() {{
     if (weightCol !== 'none' && !areaData[weightCol]) return {{key: c.key, label: c.label, value: null, loading: false}};
     var score = areaData.level_of_service;
     var weights = (weightCol !== 'none') ? areaData[weightCol] : score.map(function() {{ return 1; }});
-    var value = __weightedMedian(score, weights);
+    var value = (agg === 'median') ? __weightedMedian(score, weights) : __weightedMean(score, weights);
     return {{key: c.key, label: c.label, value: isNaN(value) ? null : value, loading: false}};
   }});
   var ranked = results.filter(function(c) {{ return c.value !== null; }})
@@ -5975,7 +6745,7 @@ function renderPlaceRank() {{
     rows += '<div style="display:flex;justify-content:space-between;padding:3px 0;' +
       (i % 2 === 1 ? 'background:#f7f9fc;' : '') + '">' +
       '<span><span style="color:#888;width:18px;display:inline-block;">' + (i + 1) + '</span>' + c.label + '</span>' +
-      '<span style="font-weight:600;">' + c.value.toFixed(2) + '</span></div>';
+      '<span style="font-weight:600;">' + c.value.toFixed(1) + '</span></div>';
   }}
   for (var p = 0; p < pending.length; p++) {{
     rows += '<div style="display:flex;justify-content:space-between;padding:3px 0;color:#aaa;">' +
@@ -6009,7 +6779,7 @@ function renderPlaceRank() {{
   if (weightCol === 'population' && window.__onPlaceRankComputed) window.__onPlaceRankComputed(results);
 }}
 document.addEventListener('change', function(e) {{
-  if (e.target && e.target.id === 'placeRankWeightSelect') renderPlaceRank();
+  if (e.target && ['placeRankWeightSelect', 'placeRankAggSelect', 'placeRankAreaSelect', 'placeRankScenarioSelect'].indexOf(e.target.id) !== -1) renderPlaceRank();
 }});
 // Test/automation hook, same publication pattern as window.__getStatsData.
 window.__renderPlaceRank = renderPlaceRank;
@@ -6058,8 +6828,32 @@ document.querySelectorAll('.statsTabBtn').forEach(function(btn) {{
     // there implied a non-existent effect.
     document.getElementById('statsAreaBtnRow').style.display =
       (window.__statsTab === 'discretization' || window.__statsTab === 'metadata') ? 'none' : 'flex';
+    // The metadata table has 13 columns (source/country/total/mean/share/
+    // resampling/description...) -- the panel's normal 460px width is far
+    // too cramped for it. Auto-widen on first visit to that tab (only if
+    // the user hasn't already dragged the panel's `resize:both` handle to
+    // something bigger themselves -- tracked via `__statsPanelUserResized`,
+    // set the moment a resize is detected).
+    if (window.__statsTab === 'metadata' && !window.__statsPanelUserResized) {{
+      var panel = document.getElementById('statsPanel');
+      panel.style.width = 'min(1100px, 95vw)';
+      panel.style.height = 'min(600px, 95vh)';
+    }}
     __renderActiveTab();
   }});
+
+// Track manual resizes (native CSS `resize:both` drag handle) so the
+// metadata-tab auto-widen above never fights a size the user picked.
+(function() {{
+  var panel = document.getElementById('statsPanel');
+  if (!panel || typeof ResizeObserver === 'undefined') return;
+  var first = true;
+  var ro = new ResizeObserver(function() {{
+    if (first) {{ first = false; return; }}
+    window.__statsPanelUserResized = true;
+  }});
+  ro.observe(panel);
+}})();
 }});
 
 document.querySelectorAll('.statsAreaBtn').forEach(function(btn) {{
@@ -6107,6 +6901,7 @@ Object.keys(__discAxisGroups).forEach(function(key) {{
 document.getElementById('distOverlaySelect').addEventListener('change', renderDistribution);
 document.getElementById('distMainSelect').addEventListener('change', renderDistribution);
 document.getElementById('distSecondaryScenarioSelect').addEventListener('change', renderDistribution);
+document.getElementById('distAggSelect').addEventListener('change', renderDistribution);
 document.getElementById('regFieldSelect').addEventListener('change', renderRegression);
 document.getElementById('regSecondaryScenarioSelect').addEventListener('change', renderRegression);
 document.getElementById('anovaSecondaryScenarioSelect').addEventListener('change', renderAnova);
@@ -6163,10 +6958,11 @@ Object.keys(__comparePlaceHandlers).forEach(function(id) {{
 // exact functions rather than defining a second copy of the same formulas.
 window.__jsSpeedScore = __jsSpeedScore;
 window.__jsFrequencyScore = __jsFrequencyScore;
-window.__jsReliabilityScore = __jsReliabilityScore;
+window.__jsMrCv = __jsMrCv;
+window.__jsMrcScore = __jsMrcScore;
 window.__jsWalkDecay = __jsWalkDecay;
 window.__jsStopScore = __jsStopScore;
-window.__jsModeScores = __MODE_SCORES;
+window.__jsModeScores = window.__disc.mrMode;
 window.__jsWeightedMean = __weightedMean;
 // Test/automation hook -- getStatsData is otherwise local to this closure
 // (see the comment above), the same reason __jsStopScore etc. are published.
@@ -6267,7 +7063,8 @@ def _stats_panel_helper_js() -> str:
         # `renderDistribution` in `_stats_panel_js`) read raw `inegi_*`/
         # `acs5_*`/etc. column keys the same way the popup table does.
         "var __SOURCE_PREFIXES = ['acs5_','acs3_','acs1_','dhc_','lodes_wac_','lodes_rac_',\n"
-        "  'inegi_','ine_cl_','ine_','cbs_','eustat_','statcan_','moi_','estadisticaad_'];\n"
+        "  'inegi_','ine_cl_','ine_','cbs_','eustat_','statcan_','moi_','estadisticaad_',\n"
+        "  'worldpop_','destatis_','ba_'];\n"
         "function __stripSourcePrefix(key) {\n"
         "  var k = String(key || '');\n"
         "  for (var i = 0; i < __SOURCE_PREFIXES.length; i++) {\n"
@@ -6311,9 +7108,12 @@ def _stats_panel_block(
     is_us: bool,
     region: str = "global",
     enable_place_comparison: bool = True,
-    share_source_map: Optional[Dict[str, str]] = None,
+    share_source_map: Optional[Dict[str, Tuple[str, str]]] = None,
     count_fields: Optional[List[str]] = None,
     share_fields: Optional[List[str]] = None,
+    h3_by_resolution: Optional[Dict[int, gpd.GeoDataFrame]] = None,
+    census_by_level: Optional[Dict[str, gpd.GeoDataFrame]] = None,
+    country: Optional[str] = None,
 ) -> str:
     """Assemble the stats-panel data script + HTML + wiring JS for injection into the saved map.
 
@@ -6354,7 +7154,10 @@ def _stats_panel_block(
     # with more than one key (boston_city passes `{"metro": ..., "core": ...}`,
     # so it gets the dimension; a single-area map wouldn't).
     has_multi_area = len(stats_by_area) > 1
-    metadata_rows = _column_metadata_rows(finest, share_source_map=share_source_map)
+    metadata_rows = _column_metadata_rows(
+        finest, share_source_map=share_source_map,
+        h3_by_resolution=h3_by_resolution, census_by_level=census_by_level, country=country,
+    )
 
     return (
         f"<script>\nwindow.__statsData = {data_json};\n</script>\n"
@@ -6894,7 +7697,7 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
       }
       rows += '<tr><td style="font-weight:700;padding:4px 8px 0 0;border-top:1px solid #eee;white-space:nowrap;">stop score</td>' +
         '<td style="padding:4px 0 0;border-top:1px solid #eee;font-weight:700;white-space:nowrap;color:' + (p.__stopScore != null ? tint : '#333') + ';">' +
-        (p.__stopScore != null && isFinite(p.__stopScore) ? p.__stopScore.toFixed(2) : '-') + '</td></tr>';
+        (p.__stopScore != null && isFinite(p.__stopScore) ? p.__stopScore.toFixed(1) : '-') + '</td></tr>';
       return '<div style="font:12px sans-serif;">' +
         '<div style="font-weight:700;margin-bottom:4px;white-space:nowrap;">' + (r.name || 'Station') + ' (' + r.mode + ')</div>' +
         '<table style="border-collapse:collapse;width:100%;">' + rows + '</table></div>';
@@ -6906,7 +7709,7 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
       var tint = stationTint(p, r);
       var html = '<div style="text-align:center;">' + window.__modeBadgeHtml(r.mode, tint, 20) +
         (p.__stopScore != null && isFinite(p.__stopScore) && window.__scoreBadgeHtml
-          ? window.__scoreBadgeHtml(p.__stopScore.toFixed(2), tint) : '') +
+          ? window.__scoreBadgeHtml(p.__stopScore.toFixed(1), tint) : '') +
         '</div>';
       var icon = L.divIcon({
         html: html,
@@ -7268,7 +8071,7 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
 
   // BRT is drawn/labelled as its own mode but SCORES exactly as tram
   // (`modes.brt.scores_as` in the params file, mirroring
-  // `transitlos.scoring.mode.MODE_SCORES`' rail/tram/bus tiers).
+  // `transitlos.scoring.mrc.MR_mode`' rail/tram/bus tiers).
   function scoringMode(m) { return ((MODES[m] || {}).scores_as) || m; }
 
   // Commercial (door-to-door) average speed of the whole route: track time
@@ -7294,12 +8097,16 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
     return km / hours;
   }
 
-  // Every headway serving this station that may be combined with the new
-  // route's own, per the params' `headway_aggregation` block: SAME scoring
-  // mode only (`combine_across_modes: false`), within `STOP_SNAP_M`. Two
-  // sources -- the real current network (`window.__stopsData`, whose
-  // `headway_minutes` is already the aggregated figure for that stop) and
-  // the scenario's own other routes' stations.
+  // 2026-09-22, explicit user request ("never take into account for the
+  // new stop scores any headways of any other lines"): this used to ALSO
+  // blend in every OTHER route in the active scenario whose station fell
+  // within `STOP_SNAP_M` of this one -- removed. A new stop's score now
+  // depends only on its own route's headway plus the real current
+  // network's already-existing service at that location
+  // (`window.__stopsData`, still included -- that's real, already-there
+  // service a rider would actually experience, not another drawn line),
+  // matching the MapLibre port's `resolvedLines()`, which never blended
+  // across lines to begin with.
   function headwaysAt(lat, lng, route) {
     var out = [];
     if (route.headway_minutes > 0) out.push(route.headway_minutes);
@@ -7312,16 +8119,6 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
       if (haversineM(lat, lng, rec.lat, rec.lon) > STOP_SNAP_M) continue;
       out.push(rec.headway_minutes);
     }
-    var sc = activeScenarioObj();
-    if (sc) sc.routes.forEach(function(r2) {
-      if (r2 === route) return;
-      if (scoringMode(r2.mode) !== want || !(r2.headway_minutes > 0)) return;
-      for (var j = 0; j < r2.points.length; j++) {
-        var p = r2.points[j];
-        if (!p.is_station) continue;
-        if (haversineM(lat, lng, p.lat, p.lng) <= STOP_SNAP_M) { out.push(r2.headway_minutes); return; }
-      }
-    });
     return out;
   }
 
@@ -7342,31 +8139,22 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
     if (sd) {
       var d = sd.metro || sd[Object.keys(sd)[0]];
       if (d && d.level_of_service && d.population) {
-        // 2026-09-02 (explicit user request: "top bar should be median not
-        // mean") -- was a population-weighted MEAN, inconsistent with the
-        // Place-rank tab/combined-map overview, which both show a
-        // population-weighted MEDIAN over this exact same data -- a highly
-        // skewed access distribution (many cells at exactly 0, a smaller
-        // set of well-served dense cells) makes mean and median diverge
-        // sharply (real case: Boston, mean 0.24 vs median 0.02), which
-        // read as "the numbers don't match" even though both were
-        // individually correct. Now genuinely the same statistic
-        // everywhere.
-        var pairs = [];
-        var den = 0;
+        // 2026-09-23, explicit user request (item 4): the ranking/
+        // distribution summary and the top-center bar's overall score must
+        // be a population-weighted MEAN, not a median -- supersedes the
+        // 2026-09-02 "top bar should be median not mean" decision recorded
+        // here previously. Reverted back to a population-weighted mean,
+        // now consistently with the Distribution tab's summary line and
+        // the Place-rank tab's default "Mean" aggregate (both also
+        // switched to mean the same day).
+        var num = 0, den = 0;
         for (var i = 0; i < d.level_of_service.length; i++) {
           var a = d.level_of_service[i], p = d.population[i];
           if (a == null || p == null || isNaN(a) || isNaN(p) || p < 0) continue;
-          pairs.push([a, p]); den += p;
+          num += a * p; den += p;
         }
         if (den > 0) {
-          pairs.sort(function(x, y) { return x[0] - y[0]; });
-          var cum = 0, half = den / 2, median = pairs[pairs.length - 1][0];
-          for (var j = 0; j < pairs.length; j++) {
-            cum += pairs[j][1];
-            if (cum >= half) { median = pairs[j][0]; break; }
-          }
-          _baseline = {access: median, population: den};
+          _baseline = {access: num / den, population: den};
         }
       }
     }
@@ -7458,10 +8246,19 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
       var spd = routeAvgSpeedKmh(r);
       r.points.forEach(function(p) {
         if (!p.is_station) return;
-        var st = {lat: p.lat, lng: p.lng, route: r, point: p, speed_kmh: spd, stop_score: null};
+        var st = {lat: p.lat, lng: p.lng, route: r, point: p, speed_kmh: spd, stop_score: null, mode: scoringMode(r.mode)};
         st.headway_minutes = aggregateHeadway(headwaysAt(p.lat, p.lng, r));
         if (spd && st.headway_minutes) {
-          st.stop_score = window.__jsStopScore(scoringMode(r.mode), spd, st.headway_minutes, HEADWAY_CV);
+          // x100: `window.__jsStopScore` (shared with the Discretization
+          // tab's own 0-1 plot, deliberately left at that scale) returns
+          // 0-1, but real access comparisons here are against 0-100
+          // `level_of_service` -- same fix as the MapLibre editor's own
+          // local `__jsStopScore` copy. `st.stopScore01` keeps the raw 0-1
+          // value too, since `__jsWalkDecay`'s D(t; stop_score) coupling
+          // (2026-09-28) needs the same [0,1]-ish scale `walk_access.py`
+          // itself uses, not the x100 display scale.
+          st.stopScore01 = window.__jsStopScore(st.mode, spd, st.headway_minutes, HEADWAY_CV);
+          st.stop_score = 100 * st.stopScore01;
         }
         // Item 4: stash the computed score directly on the route's own point
         // object (not just this transient `stations` array) -- `stationMarker`
@@ -7542,7 +8339,7 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
               // (`parameters.walking_speed_mps`, via window.__disc), NOT a
               // street-network distance. That simplification is the explicit
               // instruction for this what-if tool.
-              var a = s.stop_score * window.__jsWalkDecay(d / speedMps / 60.0);
+              var a = s.stop_score * window.__jsWalkDecay(d / speedMps / 60.0, s.stopScore01, s.mode);
               // "Best nearby stop wins": accessibility_score is a per-cell
               // max over stops, so a new stop only ever raises a cell's score
               // (never lowers it), and the pre-edit value stands in for every
@@ -7554,7 +8351,10 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
             h3AccessOverrides[row[0]] = {access: best, gainBase: oldA, population: pop};
             if (best > oldA) {
               nImp += 1;
-              impact += (best - oldA) * pop;
+              // See the MapLibre `computeAccess()`'s identical fix for why
+              // /100: best/oldA are 0-100 scale, impact is defined in 0-1
+              // scale points.
+              impact += (best - oldA) / 100 * pop;
               if (!sample || (best - oldA) > (sample.gain)) {
                 sample = {h3_cell: row[0], lat: lat, lng: lng, population: pop,
                           old_access: oldA, new_access: best, gain: best - oldA,
@@ -7680,7 +8480,7 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
       // no impact to attribute, since it is not editable.
       push('', base ? fmtNum(base.access, 2) : '-');
       rest.innerHTML = parts.join('');
-      rest.title = base ? ('Population-weighted median transit level of service over the metro study area (' +
+      rest.title = base ? ('Population-weighted mean transit level of service over the metro study area (' +
                            fmtNum(base.population, 0) + ' people)') : '';
       return;
     }
@@ -7717,7 +8517,7 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
     var e = impactEmoji(ipm);
     if (e.emoji) parts.push('<span class="emoji">' + e.emoji + '</span>');
     rest.innerHTML = parts.join('');
-    rest.title = 'score = metro population-weighted median transit level of service (baseline median plus this scenario\'s population-weighted delta)' +
+    rest.title = 'score = metro population-weighted mean transit level of service (baseline mean plus this scenario\'s population-weighted delta)' +
       ' | impact = sum over affected res-' + PC.res + ' cells of (new - old) access x population' +
       ' | impact/$M = impact per million USD' +
       (e.score01 == null ? '' : ' | impact_score (0-1, linear between the sad/happy thresholds) = ' + e.score01.toFixed(2)) +
@@ -8510,52 +9310,16 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
     return best + 1;
   }
 
-  // Existing real transit stops (published by `_stops_layer_block` as
-  // `window.__stopsData`) plus the stations of the scenario's other routes,
-  // for the "you clicked on an existing stop -- stop there?" prompt.
-  function nearbyStop(latlng) {
-    var best = null, bestD = STOP_SNAP_M;
-    var recs = (window.__stopsData && window.__stopsData.records) || [];
-    for (var i = 0; i < recs.length; i++) {
-      var d = mapRef.distance(latlng, L.latLng(recs[i].lat, recs[i].lon));
-      if (d < bestD) { bestD = d; best = {lat: recs[i].lat, lng: recs[i].lon, name: recs[i].stop_name || 'stop'}; }
-    }
-    var sc = activeScenarioObj();
-    if (sc) sc.routes.forEach(function(r2) {
-      if (r2.id === S.activeRouteId) return;
-      r2.points.forEach(function(p) {
-        if (!p.is_station) return;
-        var d = mapRef.distance(latlng, L.latLng(p.lat, p.lng));
-        if (d < bestD) { bestD = d; best = {lat: p.lat, lng: p.lng, name: r2.name + ' station'}; }
-      });
-    });
-    return best;
-  }
-
-  function askStation(point) {
-    var near = nearbyStop(L.latLng(point.lat, point.lng));
-    if (!near) return false;
-    // Deliberately a plain `confirm()` -- the spec allows it, and it keeps
-    // the prompt synchronous with the click that triggered it.
-    if (window.confirm('There is an existing stop here (' + near.name + '). Stop there?')) {
-      point.is_station = true;
-      // Snap to the existing stop's EXACT coordinates rather than the raw
-      // click point, so the new route genuinely shares that stop (and the
-      // access-recompute / cost model see them as the same location).
-      point.lat = near.lat;
-      point.lng = near.lng;
-      return true;
-    }
-    return false;
-  }
-
-  // Geoman owns the click stream while drawing, so for a brand-new route the
-  // prompt is applied once, over all drawn points, right after the line is
-  // finished. Extending (our own click handler) prompts per click, at click
-  // time, as specified.
-  function maybePromptStations(r) {
-    r.points.forEach(function(p) { askStation(p); });
-  }
+  // 2026-09-22, explicit user request ("Delete the functionality of when
+  // adding a stop adding it to an original stop"): `nearbyStop`/
+  // `askStation`/`maybePromptStations` (the "there's an existing stop
+  // here -- stop there?" `confirm()` prompt that snapped a new point onto
+  // an existing stop's exact coordinates) are removed entirely -- a newly
+  // drawn point is always placed exactly where the user clicked, never
+  // silently relocated. `maybePromptStations` had no remaining call site
+  // even before this (dead code), confirming this was already on its way
+  // out. Matches the MapLibre port, which never had this snap behavior to
+  // begin with.
 
   mapRef.on('click', function(e) {
     if (!S.active) return;
@@ -8566,7 +9330,6 @@ window.__geoidChunkCfg = __GEOIDCHUNKS__;
       var r = activeRoute();
       if (!r) return;
       var pt = {lat: e.latlng.lat, lng: e.latlng.lng, is_station: false};
-      askStation(pt);
       if (S.mode === 'extend' && extendFrom === 'start') r.points.unshift(pt);
       else r.points.push(pt);
       syncSegments(r);
@@ -8901,37 +9664,74 @@ window.__statsData = {stats_data_json};
   // --- formula mirrors, copied verbatim from `_stats_panel_js` (kept in
   // sync via `window.__disc`, baked from the same Python dataclass) ---
   function __jsSpeedScore(avgSpeedKmh) {{
-    var b = window.__disc.modeSpeedBreakpointsKmh;
-    var b0 = b[0], b1 = b[1], b2 = b[2];
-    if (avgSpeedKmh <= 0) return 0.0;
-    if (avgSpeedKmh < b0) return 0.5 * (avgSpeedKmh / b0);
-    if (avgSpeedKmh < b1) return 0.5 + 0.35 * (avgSpeedKmh - b0) / (b1 - b0);
-    if (avgSpeedKmh < b2) return 0.85 + 0.15 * (avgSpeedKmh - b1) / (b2 - b1);
-    return 1.0;
+    // V(speed), scoring.md Section 2.4 (2026-09-29 THIRD SHAPE-FIX
+    // revision): smooth Hill-function curve V(v)=M*v^n/(v^n+K^n).
+    // M=1+vCeilingBonus is an explicit design-judgment asymptote, not
+    // pinned to any second named speed (a same-day revision tried and
+    // reverted pinning it to German Regional-Express's 80 km/h). K solved
+    // from V(vAnchorKmh)=1.0, n=vShapeN a fixed shape parameter -- see the
+    // other __jsSpeedScore copy (_stats_panel_js) and speed.py for the
+    // derivation.
+    var d = window.__disc;
+    var m = 1.0 + d.vCeilingBonus;
+    var n = d.vShapeN;
+    var k = d.vAnchorKmh * Math.pow(m - 1.0, 1.0 / n);
+    return m * Math.pow(avgSpeedKmh, n) / (Math.pow(avgSpeedKmh, n) + Math.pow(k, n));
   }}
   function __jsFrequencyScore(headwayMinutes) {{
-    var sat = window.__disc.headwaySaturationMinutes, scale = window.__disc.headwayDecayScaleMinutes;
+    // H(headway), scoring.md Section 2.2 (2026-09-28): log-linear
+    // variable-elasticity closed form.
+    var d = window.__disc, sat = d.hSaturationMinutes, p = d.hElasticityP, q = d.hElasticityQ;
     if (headwayMinutes <= sat) return 1.0;
-    return Math.exp(-(headwayMinutes - sat) / scale);
+    var epsSat = p + q * Math.log(sat);
+    var logRatio = Math.log(headwayMinutes / sat);
+    var lnH = -epsSat * logRatio - (q / 2.0) * logRatio * logRatio;
+    return Math.exp(lnH);
   }}
-  function __jsReliabilityScore(headwayCv) {{
-    return Math.exp(-headwayCv / window.__disc.reliabilityCvScale);
+  function __jsMrCv(headwayCv) {{
+    return 1.0 / (1.0 + headwayCv * headwayCv);
   }}
-  var __MODE_SCORES = {{ rail: 1.0, tram: Math.pow(1.0 * (1.0 / 1.15), 0.5), bus: 1.0 / 1.15 }};
   function scoringMode(m) {{ return ((MODES[m] || {{}}).scores_as) || m; }}
+  function __jsMrcScore(mode, headwayCv) {{
+    // headwayCv == null uses the mode-categorical MR_mode default (the
+    // primary, load-bearing GTFS-static-only path, scoring.md Section
+    // 2.3(a)); a real CV prefers the optional MR_CV refinement (2.3(b)).
+    return headwayCv == null ? window.__disc.mrMode[scoringMode(mode)] : __jsMrCv(headwayCv);
+  }}
   function __jsStopScore(mode, speedKmh, headwayMinutes, headwayCv) {{
-    var w = window.__disc.weights;
-    var m = __MODE_SCORES[scoringMode(mode)];
+    // 2026-09-29 aggregation-STRUCTURE revision (scoring.md Section 1.2,
+    // stop_score.py): nested form sqrt(MRC*V)*H, matching the Discretization
+    // panel's own __jsStopScore mirror -- this copy had been left on the
+    // original flat p=0 geometric mean through the intervening p=-1 harmonic-
+    // mean revision (a real staleness bug, now fixed here alongside the
+    // structure change) and no longer takes a `weights` parameter by
+    // construction (MRC/V pool unweighted; H is gated, not weighted).
+    var mrc = __jsMrcScore(mode, headwayCv);
     var s = __jsSpeedScore(speedKmh);
     var f = __jsFrequencyScore(headwayMinutes);
-    var r = __jsReliabilityScore(headwayCv == null ? 0.3 : headwayCv);
-    return Math.pow(m, w[0]) * Math.pow(s, w[1]) * Math.pow(f, w[2]) * Math.pow(r, w[3]);
+    // x100: `level_of_service` (and every cached population-chunk `oldA`
+    // this is compared/blended against in computeAccess()) is 0-100 since
+    // the 2026-09 scoring rescale -- this formula mirror's own sub-scores
+    // (mrc/s/f) intentionally stay 0-1-ish internally, only the FINAL stop
+    // score needs to land in the same 0-100 units as everything it's
+    // compared/colored against, or a newly-computed `best` silently reads as
+    // ~100x too low against the map's 0-100 color domain -- exactly the
+    // "Compute doesn't visibly change any colors" bug this originally fixed.
+    if (mrc === 0 || s === 0 || f === 0) return 0.0;
+    return 100 * Math.sqrt(mrc * s) * f;
   }}
-  function __jsWalkDecay(walkTimeMinutes) {{
+  function __jsT0OfStopScore(mode, stopScore) {{
     var d = window.__disc;
-    var tSat = d.walkDistanceSaturationM / d.walkingSpeedMps / 60.0;
-    if (walkTimeMinutes <= tSat) return 1.0;
-    return Math.pow(1.0 + (walkTimeMinutes - tSat) / d.walkT0BaseMinutes, -d.walkDecayShapeP);
+    return d.t0BaseMinutesByMode[scoringMode(mode) || 'bus'] * (1.0 + d.kQuality * (stopScore == null ? 0.0 : stopScore));
+  }}
+  function __jsWalkDecay(walkTimeMinutes, stopScore, mode) {{
+    // D(t; stop_score), scoring.md Section 2.1 (2026-09-28 restored
+    // coupling): t0 is itself mode- and stop_score-scaled.
+    var d = window.__disc;
+    var tPlateau = d.tPlateauDistanceM / d.walkingSpeedMps / 60.0;
+    if (walkTimeMinutes <= tPlateau) return 1.0;
+    var t0 = __jsT0OfStopScore(mode, stopScore);
+    return Math.pow(1.0 + (walkTimeMinutes - tPlateau) / t0, -d.pShape);
   }}
 
   function haversineM(lat1, lng1, lat2, lng2) {{
@@ -8982,279 +9782,100 @@ window.__statsData = {stats_data_json};
     if (sd) {{
       var d = sd.metro || sd[Object.keys(sd)[0]];
       if (d && d.level_of_service && d.population) {{
-        // 2026-09-02 (explicit user request: "top bar should be median not
-        // mean") -- was a population-weighted MEAN, inconsistent with the
-        // Place-rank tab/combined-map overview, which both show a
-        // population-weighted MEDIAN over this exact same data -- a highly
-        // skewed access distribution (many cells at exactly 0, a smaller
-        // set of well-served dense cells) makes mean and median diverge
-        // sharply (real case: Boston, mean 0.24 vs median 0.02), which
-        // read as "the numbers don't match" even though both were
-        // individually correct. Now genuinely the same statistic
-        // everywhere.
-        var pairs = [];
-        var den = 0;
+        // 2026-09-23, explicit user request (item 4): the ranking/
+        // distribution summary and the top-center bar's overall score must
+        // be a population-weighted MEAN, not a median -- supersedes the
+        // 2026-09-02 "top bar should be median not mean" decision recorded
+        // here previously. Reverted back to a population-weighted mean,
+        // now consistently with the Distribution tab's summary line and
+        // the Place-rank tab's default "Mean" aggregate (both also
+        // switched to mean the same day).
+        var num = 0, den = 0;
         for (var i = 0; i < d.level_of_service.length; i++) {{
           var a = d.level_of_service[i], p = d.population[i];
           if (a == null || p == null || isNaN(a) || isNaN(p) || p < 0) continue;
-          pairs.push([a, p]); den += p;
+          num += a * p; den += p;
         }}
         if (den > 0) {{
-          pairs.sort(function(x, y) {{ return x[0] - y[0]; }});
-          var cum = 0, half = den / 2, median = pairs[pairs.length - 1][0];
-          for (var j = 0; j < pairs.length; j++) {{
-            cum += pairs[j][1];
-            if (cum >= half) {{ median = pairs[j][0]; break; }}
-          }}
-          _baseline = {{access: median, population: den}};
+          _baseline = {{access: num / den, population: den}};
         }}
       }}
     }}
     return _baseline;
   }}
 
-  // --- UI: extend the existing route-draw toolbar (`_route_draw_html_js`) ---
-  var toolbar = document.getElementById('route-toolbar');
+  // --- UI: extend the route-draw toolbar (`_route_draw_html_js`) with the
+  // Compute button -- per-line color/mode/headway now live in each line's
+  // own list row (`_route_draw_html_js`'s `refreshLineList`), not here.
+  // Bug fix (user request): Compute (and its cost/status readout) used to
+  // live inside the per-line edit view (`#routeConfigSection`, nested in
+  // `#routeLineEditView`), so it was only reachable while a single line
+  // happened to be open for editing. It now lives in the main line-list
+  // view (`#routeLineListView`), directly below "+ Create new line"
+  // (`#routeCreateNewBtn`), so it always applies to every drawn line at
+  // once regardless of which (if any) line is currently being edited.
   var panel = document.createElement('div');
   panel.className = 'rt-group';
-  var modeOptions = Object.keys(MODES).map(function(m) {{
-    return '<option value="' + m + '">' + (MODES[m].label || m) + '</option>';
-  }}).join('');
   panel.innerHTML =
-    '<label style="display:block;margin-bottom:4px;">Mode <select id="caMode" style="margin-left:4px;">' + modeOptions + '</select></label>' +
-    '<label style="display:block;margin-bottom:4px;">Headway (min) <input id="caHeadway" type="number" value="10" min="0.5" step="0.5" style="width:50px;margin-left:4px;"></label>' +
-    '<label style="display:block;margin-bottom:6px;"><input id="caGradeSep" type="checkbox"> Grade-separated</label>' +
     '<div id="caCostReadout" style="margin-bottom:6px;color:#333;"></div>' +
-    '<button id="caComputeBtn" type="button" class="rt-primary">Compute access</button>' +
-    '<div id="caStatus" style="margin-top:4px;color:#555;max-width:220px;"></div>' +
-    '<div class="rt-group">' +
-      '<button id="caSaveScenarioBtn" type="button" class="rt-primary">Save as scenario</button>' +
-    '</div>';
-  // Round 17 (item 5): this config panel (mode/headway/grade-separation/
-  // cost readout/compute/save) now lives INSIDE the "Create new route"
-  // flow's config section (`#routeConfigSection`, revealed alongside the
-  // draw toolbox), not appended loose onto the toolbar -- matches Folium's
-  // `_editor_html` layout (mode/headway/color/geometry/cost all under one
-  // route-editor block) and the user's explicit ask for "config for the
-  // cost and grade separation" to appear when creating a new route.
-  var configSection = document.getElementById('routeConfigSection');
-  if (configSection) configSection.appendChild(panel);
-  else if (toolbar) toolbar.appendChild(panel);
-  // Panel starts hidden along with the rest of the draw toolbar's tool
-  // buttons -- editing (including this compute/scenario panel) is gated
-  // behind the scenario panel's "+ Create new route" button, matching the
-  // draw tool's own lock in `_route_draw_html_js`. The default/baseline
-  // network AND every already-saved scenario are read-only (round 17: this
-  // now extends round 12's "baseline is read-only" rule to ALL saved
-  // scenarios, not just baseline -- see `saveAsScenario` below, which
-  // re-locks after a successful save).
-  panel.style.display = '';
-
-  // --- Item A (round 6): a real multi-scenario system, ported from Folium's
-  // `_editor_js` scenario save/list/switch model (S.scenarios/activeScenario)
-  // but scoped to this port's single-route-at-a-time editor. Each saved
-  // scenario snapshots the drawn route's points + mode/headway/grade-sep AND
-  // (once Computed) its own `h3AccessOverrides` result, so the stats panel's
-  // `getStatsData(area, scenario)` / `__populateSecondaryScenarioSelect` can
-  // pull a real second series for ANY saved scenario, not just the one
-  // currently showing on the map -- exactly the same `window.__editor.state`
-  // + `computeResultForScenario(name)` shape the stats-panel JS already
-  // expects (see `getStatsData` and `__populateSecondaryScenarioSelect` in
-  // `_stats_panel_js`, unchanged by this port).
-  var RESERVED = ((P.scenarios || {{}}).reserved_current_name) || 'current';
-  var S = {{ scenarios: [], activeScenario: null }};
-  var computeResultsByScenario = {{}};
-
-  function scenarioByName(n) {{
-    for (var i = 0; i < S.scenarios.length; i++) if (S.scenarios[i].name === n) return S.scenarios[i];
-    return null;
-  }}
-
-  // Round 17 (item 5): the scenario picker is now a real LIST
-  // (`#routeScenarioList`, in the panel `_route_draw_html_js` builds),
-  // rendered on open by the edit-mode button, not a `<select>`. Every saved
-  // scenario is view-only -- clicking "View" loads its route onto the map
-  // WITHOUT unlocking the draw tool, extending round 12's "baseline is
-  // read-only" rule to every saved scenario (per the user's explicit
-  // "Existing routes cannot be edited"). Only "+ Create new route" unlocks
-  // editing, for a brand-new, not-yet-saved route.
-  function refreshScenarioList() {{
-    var listEl = document.getElementById('routeScenarioList');
-    var emptyEl = document.getElementById('routeScenarioEmpty');
-    if (!listEl) return;
-    if (!S.scenarios.length) {{
-      listEl.innerHTML = '';
-      if (emptyEl) emptyEl.style.display = '';
-    }} else {{
-      if (emptyEl) emptyEl.style.display = 'none';
-      listEl.innerHTML = S.scenarios.map(function(sc) {{
-        var active = (S.activeScenario === sc.name);
-        return '<div class="rt-scenario-row"' + (active ? ' style="border-color:#2563eb;"' : '') + '>' +
-          '<span class="rt-scenario-name">' + sc.name + '<br><span class="rt-scenario-lock">&#128274; read-only</span></span>' +
-          '<button type="button" data-scenario-view="' + sc.name + '">View</button>' +
-        '</div>';
-      }}).join('');
-      Array.prototype.forEach.call(listEl.querySelectorAll('[data-scenario-view]'), function(btn) {{
-        btn.addEventListener('click', function() {{ viewScenario(btn.getAttribute('data-scenario-view')); }});
-      }});
-    }}
-    window.__populateAllSecondaryScenarioSelects && window.__populateAllSecondaryScenarioSelects();
-  }}
-
-  function saveAsScenario() {{
-    var status = document.getElementById('caStatus');
-    var suggested = S.activeScenario || '';
-    var name = window.prompt('Save current route as scenario named:', suggested);
-    if (!name) return;
-    name = String(name).trim();
-    if (!name) return;
-    if (name === RESERVED) {{ window.alert('"' + RESERVED + '" is reserved for the baseline network.'); return; }}
-    var route = currentRoute();
-    if (!route.points.length) {{ window.alert('Draw a route before saving it as a scenario.'); return; }}
-    var entry = {{
-      name: name, route: route,
-      gradeSepChecked: document.getElementById('caGradeSep').checked,
-    }};
-    var existing = scenarioByName(name);
-    if (existing) {{ existing.route = entry.route; existing.gradeSepChecked = entry.gradeSepChecked; }}
-    else {{ S.scenarios.push(entry); }}
-    S.activeScenario = name;
-    // Carry the most recent Compute forward as this scenario's own result if
-    // it was computed against the same route that's being saved right now.
-    if (lastCompute && lastCompute.ok) computeResultsByScenario[name] = lastCompute;
-    refreshScenarioList();
-    status.textContent = 'Saved scenario "' + name + '". It is now read-only -- use "+ Create new route" to start another.';
-    // Round 17: a scenario becomes IMMUTABLE the moment it's saved -- re-lock
-    // the draw tool/config panel and drop back to the scenario-list view,
-    // exactly like `loadScenario`/`viewScenario` already do for a picked
-    // existing scenario.
-    if (window.__setRouteEditLocked) window.__setRouteEditLocked(true);
-    var scenarioPanel = document.getElementById('routeScenarioPanel');
-    var toolButtons = document.getElementById('routeToolButtons');
-    if (scenarioPanel) scenarioPanel.style.display = 'block';
-    if (toolButtons) toolButtons.style.display = 'none';
-  }}
-
-  // Loads a saved scenario's route for VIEWING only -- does not unlock
-  // editing (round 17: existing routes cannot be edited).
-  function viewScenario(name) {{
-    var status = document.getElementById('caStatus');
-    var sc = scenarioByName(name);
-    if (!sc) return;
-    S.activeScenario = name;
-    var pts = sc.route.points.map(function(p) {{ return [p.lng, p.lat]; }});
-    var stFlags = sc.route.points.map(function(p) {{ return !!p.is_station; }});
-    if (window.__setRoutePoints) window.__setRoutePoints(pts, stFlags);
-    document.getElementById('caMode').value = sc.route.mode;
-    document.getElementById('caHeadway').value = sc.route.headway_minutes;
-    document.getElementById('caGradeSep').checked = !!sc.gradeSepChecked;
-    lastCompute = computeResultsByScenario[name] || null;
-    if (status) status.textContent = 'Viewing scenario "' + name + '" (read-only)' + (lastCompute ? ' -- last computed.' : ' -- not computed yet.');
-    // Viewing never unlocks the draw tool -- show the config/draw panel in
-    // its locked state so mode/headway/cost are visible but not editable.
-    if (window.__setRouteEditLocked) window.__setRouteEditLocked(true);
-    var scenarioPanel = document.getElementById('routeScenarioPanel');
-    var toolButtons = document.getElementById('routeToolButtons');
-    if (scenarioPanel) scenarioPanel.style.display = 'none';
-    if (toolButtons) toolButtons.style.display = '';
-    refreshScenarioList();
-  }}
-  // `loadScenario` kept as an alias -- `window.__editor.loadScenario` (the
-  // top-center bar's own scenario select, round 13) expects this name.
-  var loadScenario = viewScenario;
-
-  document.getElementById('caSaveScenarioBtn').addEventListener('click', function() {{ saveAsScenario(); }});
-  refreshScenarioList();
-
-  // Round 17 (item 4): the edit-mode emoji button (`rtEditModeBtn`, in
-  // `_route_draw_html_js`) is the SOLE entry point into the scenario system
-  // -- clicking it opens the scenario-list panel (replacing round 12's
-  // standalone "+ New Scenario" button). "+ Create new route" inside that
-  // panel is what actually unlocks editing for a brand-new route.
-  // Item 3 (verbatim user request): the whole route-editor box is hidden by
-  // default and only shown once this standalone toggle button (rendered
-  // OUTSIDE `#route-toolbar` so it stays clickable while the box itself is
-  // `display:none`) is clicked -- see the `.rt-open` CSS class added in
-  // `_route_draw_html_js`.
-  var editModeBtn = document.getElementById('routeEditToggleBtn');
-  var routeToolbarBox = document.getElementById('route-toolbar');
-  var scenarioPanelEl = document.getElementById('routeScenarioPanel');
-  if (editModeBtn) editModeBtn.addEventListener('click', function() {{
-    if (!scenarioPanelEl || !routeToolbarBox) return;
-    var opening = !routeToolbarBox.classList.contains('rt-open');
-    routeToolbarBox.classList.toggle('rt-open', opening);
-    scenarioPanelEl.style.display = opening ? 'block' : 'none';
-    editModeBtn.className = opening ? 'rt-active' : '';
-    if (opening) {{
-      // Opening the panel always re-shows the (read-only) list first --
-      // matches the user's explicit "first a list of the user created
-      // routes" flow, even if a "Create new route" draw was in progress.
-      document.getElementById('routeToolButtons').style.display = 'none';
-      refreshScenarioList();
-    }}
-  }});
-
-  function startNewScenario() {{
-    var name = window.prompt('New scenario name:', '');
-    if (!name) return;
-    name = String(name).trim();
-    if (!name) return;
-    if (name === RESERVED) {{ window.alert('"' + name + '" is reserved for the baseline network.'); return; }}
-    if (window.__setRoutePoints) window.__setRoutePoints([], []);
-    S.activeScenario = null; // unsaved-until-"Save as scenario"
-    lastCompute = null;
-    var status = document.getElementById('caStatus');
-    if (status) status.textContent = 'New scenario "' + name + '" started -- draw a route, then Save as scenario.';
-    var savedNameField = document.getElementById('caSaveScenarioBtn');
-    if (savedNameField) savedNameField.setAttribute('data-suggested-name', name);
-    if (window.__setRouteEditLocked) window.__setRouteEditLocked(false);
-    if (scenarioPanelEl) scenarioPanelEl.style.display = 'none';
-    document.getElementById('routeToolButtons').style.display = '';
-    if (editModeBtn) editModeBtn.className = '';
-  }}
+    '<button id="caComputeBtn" type="button" class="rt-primary">Compute</button>' +
+    '<div id="caStatus" style="margin-top:4px;color:#555;max-width:220px;"></div>';
+  var lineListView = document.getElementById('routeLineListView');
   var createNewBtn = document.getElementById('routeCreateNewBtn');
-  if (createNewBtn) createNewBtn.addEventListener('click', startNewScenario);
-  // `saveAsScenario`'s own prompt pre-fills from `S.activeScenario` -- also
-  // honor the name just typed into "+ Create new route" as the suggestion,
-  // so the user doesn't have to retype it.
-  var _origSaveAsScenario = saveAsScenario;
-  saveAsScenario = function() {{
-    var btn = document.getElementById('caSaveScenarioBtn');
-    var suggested = btn ? btn.getAttribute('data-suggested-name') : null;
-    if (suggested && !S.activeScenario) {{
-      var name = window.prompt('Save current route as scenario named:', suggested);
-      if (!name) return;
-      name = String(name).trim();
-      if (!name) return;
-      if (name === RESERVED) {{ window.alert('"' + RESERVED + '" is reserved for the baseline network.'); return; }}
-      var route = currentRoute();
-      if (!route.points.length) {{ window.alert('Draw a route before saving it as a scenario.'); return; }}
-      var entry = {{ name: name, route: route, gradeSepChecked: document.getElementById('caGradeSep').checked }};
-      var existing = scenarioByName(name);
-      if (existing) {{ existing.route = entry.route; existing.gradeSepChecked = entry.gradeSepChecked; }}
-      else {{ S.scenarios.push(entry); }}
-      S.activeScenario = name;
-      if (lastCompute && lastCompute.ok) computeResultsByScenario[name] = lastCompute;
-      btn.removeAttribute('data-suggested-name');
-      refreshScenarioList();
-      document.getElementById('caStatus').textContent = 'Saved scenario "' + name + '". It is now read-only.';
-      if (window.__setRouteEditLocked) window.__setRouteEditLocked(true);
-      var toolButtons2 = document.getElementById('routeToolButtons');
-      if (scenarioPanelEl) scenarioPanelEl.style.display = 'block';
-      if (toolButtons2) toolButtons2.style.display = 'none';
-      if (editModeBtn) editModeBtn.className = '';
-      return;
+  if (lineListView) {{
+    if (createNewBtn && createNewBtn.parentNode === lineListView) {{
+      createNewBtn.insertAdjacentElement('afterend', panel);
+    }} else {{
+      lineListView.appendChild(panel);
     }}
-    _origSaveAsScenario();
+  }}
+
+  // 2026-09-22, explicit user request ("Instead of scenarios I just want
+  // to have 'original' and 'with edits'"): the multi-named-scenario system
+  // (save-as/view/switch, all `window.prompt()`-driven) is gone -- there
+  // are now exactly two states, the always-present read-only baseline
+  // (`RESERVED`, shown as "Original" by the top bar -- see
+  // `_inject_maplibre_topbar_into_saved_html`) and one single, always-
+  // mutable "With edits" scenario holding whatever `lines` the draw tool
+  // currently has. `S`/`RESERVED` are kept (not deleted) because the stats
+  // panel (`_stats_panel_js`'s `getStatsData`/`__populateSecondaryScenarioSelect`)
+  // and the top bar both already read `window.__editor.state.scenarios`/
+  // `.activeScenario` -- keeping that exact shape, just with permanently
+  // one entry, means neither of those needs to change at all.
+  var RESERVED = ((P.scenarios || {{}}).reserved_current_name) || 'current';
+  var WITH_EDITS = 'With edits';
+  var S = {{ scenarios: [{{ name: WITH_EDITS }}], activeScenario: null }};
+  var lastComputeResult = null;
+
+  // 2026-09-22, explicit user request ("When click on 'Draw a new line'
+  // switch automatically to with edits"): `_route_draw_html_js` calls this
+  // the moment the draw-a-new-line panel opens, no prompt/naming step at
+  // all -- there is only ever the one mutable scenario to switch to.
+  window.__onDrawLineOpened = function() {{
+    S.activeScenario = WITH_EDITS;
+    if (window.__refreshTopBar) window.__refreshTopBar();
   }};
 
-  // Route cost estimate (round 17, item 5's "config for the cost"): ported
-  // from Folium's `_editor_js` route-cost formula (see that module's
-  // `// Route cost = sum over segments ... + sum over stations ...`), reusing
-  // the SAME real cost model Folium already has -- `P.costs[mode]` from
-  // `default_edit_params.json` (`cost_per_km_musd`/`station_musd` per
-  // grade-separation tier), not a fabricated/placeholder number. If a build's
-  // params have no cost entry for a mode, the readout says so explicitly.
+  // Mode dropdown options for the "create new line" form -- built once
+  // from `default_edit_params.json`'s real mode roster, same source
+  // `_route_draw_html_js`'s create-line `<select>` used to get inline.
+  if (window.__setRouteModeOptions) {{
+    window.__setRouteModeOptions(Object.keys(MODES).map(function(m) {{
+      return {{ value: m, label: MODES[m].label || m }};
+    }}));
+  }}
+
+  // 2026-09-22, explicit user request: grade separation is no longer a
+  // user-facing toggle -- each mode has one real default grade-separation
+  // tier (tram: street-level-separated, rail: separated, subway:
+  // underground, bus: mixed traffic, BRT: own lane -- `default_edit_params.json`'s
+  // `default_grade_separation[mode]`), applied automatically. `routeCost`/
+  // `speedKmhFor` both already key off `grade_separation` as a plain
+  // string, so this is a lookup, not a new formula.
+  function gradeSeparationFor(mode) {{ return (P.default_grade_separation || {{}})[mode]; }}
+
+  // Real $ line-cost model, ported verbatim from the prior single-route
+  // `routeCostEstimate` -- summed across every drawn line now, not just one.
   function haversineKm(a, b) {{
     var R = 6371.0088, d2r = Math.PI / 180;
     var dLat = (b[1] - a[1]) * d2r, dLng = (b[0] - a[0]) * d2r;
@@ -9262,80 +9883,97 @@ window.__statsData = {stats_data_json};
             Math.cos(a[1] * d2r) * Math.cos(b[1] * d2r) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
     return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
   }}
-  function routeCostEstimate(route) {{
-    var cc = (P.costs || {{}})[route.mode];
+  function lineCostEstimate(line, gradeSep) {{
+    var cc = (P.costs || {{}})[line.mode];
     if (!cc) return null;
-    var kmRate = (cc.cost_per_km_musd || {{}})[route.grade_separation];
-    var stRate = (cc.station_musd || {{}})[route.grade_separation];
+    var kmRates = cc.cost_per_km_musd || {{}};
+    // 2026-09-26, explicit user request: "rail should have a cost per km
+    // 25% elevated, 10% underground and the rest overground" -- a real
+    // rail LINE is never purely one grade separation end to end (unlike
+    // this editor's other modes, which stay one tier for their whole
+    // length), so its per-km rate is a fixed blend of the three real cost
+    // tiers rather than the single `default_grade_separation`-derived
+    // tier every other mode uses.
+    var kmRate = (line.mode === 'rail' && kmRates.elevated != null && kmRates.underground != null && kmRates.normal != null)
+      ? (0.25 * kmRates.elevated + 0.10 * kmRates.underground + 0.65 * kmRates.normal)
+      : kmRates[gradeSep];
+    var stRate = (cc.station_musd || {{}})[gradeSep];
     if (kmRate == null && stRate == null) return null;
     var lengthKm = 0;
-    for (var i = 1; i < route.points.length; i++) {{
-      lengthKm += haversineKm([route.points[i - 1].lng, route.points[i - 1].lat], [route.points[i].lng, route.points[i].lat]);
-    }}
-    var nStations = route.points.filter(function(p) {{ return p.is_station; }}).length;
+    for (var i = 1; i < line.points.length; i++) lengthKm += haversineKm(line.points[i - 1], line.points[i]);
+    var nStops = line.stops.filter(function(s) {{ return s; }}).length;
     var segMusd = kmRate != null ? lengthKm * kmRate : 0;
-    var stMusd = stRate != null ? nStations * stRate : 0;
-    return {{ length_km: lengthKm, n_stations: nStations, segments_musd: segMusd, stations_musd: stMusd, total_musd: segMusd + stMusd }};
+    var stMusd = stRate != null ? nStops * stRate : 0;
+    return {{ length_km: lengthKm, n_stops: nStops, segments_musd: segMusd, stations_musd: stMusd, total_musd: segMusd + stMusd }};
   }}
   function refreshCostReadout() {{
     var el = document.getElementById('caCostReadout');
     if (!el) return;
-    var route = currentRoute();
-    var c = routeCostEstimate(route);
-    if (!c) {{ el.textContent = 'Cost: no cost config for this mode.'; return; }}
-    el.innerHTML = 'Est. cost: <b>$' + c.total_musd.toFixed(1) + 'M</b>' +
-      ' (track $' + c.segments_musd.toFixed(1) + 'M + ' + c.n_stations + ' stop(s) $' + c.stations_musd.toFixed(1) + 'M)';
+    var lines = window.__linesState ? window.__linesState() : [];
+    if (!lines.length) {{ el.textContent = ''; return; }}
+    var totalMusd = 0, totalKm = 0, totalStops = 0, anyCost = false;
+    lines.forEach(function(line) {{
+      var c = lineCostEstimate(line, gradeSeparationFor(line.mode));
+      if (!c) return;
+      anyCost = true;
+      totalMusd += c.total_musd; totalKm += c.length_km; totalStops += c.n_stops;
+    }});
+    el.innerHTML = anyCost
+      ? ('Est. cost (' + lines.length + ' line(s)): <b>$' + totalMusd.toFixed(1) + 'M</b>' +
+         ' (' + totalKm.toFixed(1) + 'km, ' + totalStops + ' stop(s))')
+      : (lines.length + ' line(s) drawn -- no cost config for the chosen mode(s).');
   }}
-  ['caMode', 'caHeadway', 'caGradeSep'].forEach(function(id) {{
-    var el = document.getElementById(id);
-    if (el) el.addEventListener('change', refreshCostReadout);
-  }});
-  // The route's geometry/stops change via map clicks (draw/add-node/add-stop
-  // etc.), not DOM `change` events, so those alone can't trigger a cost
-  // refresh -- a cheap poll (matches the round-13 top bar's own
-  // `setInterval` pattern for the same "many different mutation sites"
-  // reason) keeps the readout live while a route is unlocked/being edited.
-  setInterval(function() {{ if (!window.__routeEditLocked) refreshCostReadout(); }}, 500);
+  setInterval(function() {{ if (document.getElementById('route-toolbar').classList.contains('rt-open')) refreshCostReadout(); }}, 500);
 
-  function currentRoute() {{
-    var rs = window.__routeState ? window.__routeState() : {{points: [], stations: []}};
-    var mode = document.getElementById('caMode').value;
-    var headway = parseFloat(document.getElementById('caHeadway').value);
-    var gradeSepChoices = (P.grade_separations || {{}})[mode] || [];
-    var separated = document.getElementById('caGradeSep').checked;
-    // Simplification (see this function's docstring): one grade-separation
-    // choice for the whole route -- the most-separated option when checked,
-    // the mode's own `default_grade_separation` (its normal at-grade tier)
-    // when not.
-    var gradeSep = separated
-      ? (gradeSepChoices[0] || (P.default_grade_separation || {{}})[mode])
-      : ((P.default_grade_separation || {{}})[mode]);
-    var stFlags = rs.stations || [];
-    return {{
-      mode: mode, headway_minutes: headway, grade_separation: gradeSep,
-      points: rs.points.map(function(p, i) {{ return {{lat: p[1], lng: p[0], is_station: !!stFlags[i]}}; }}),
-    }};
+  // Every drawn line, resolved to what `computeAccess()` actually needs:
+  // its own stop score (mode+headway+grade-separation -> speed -> score,
+  // exactly `__jsStopScore`, never blended with any OTHER line's headway --
+  // explicit user request, "never take into account for the new stop
+  // scores any headways of any other lines" -- each line's score depends
+  // ONLY on its own mode/headway/grade-separation, full stop) and its own
+  // flattened list of real stops (points where `stops[i]` is true; a line
+  // with none yet -- still being drawn -- contributes nothing).
+  function resolvedLines() {{
+    var lines = window.__linesState ? window.__linesState() : [];
+    var out = [];
+    lines.forEach(function(line) {{
+      var gradeSep = gradeSeparationFor(line.mode);
+      var speedKmh = speedKmhFor(line.mode, gradeSep);
+      if (!speedKmh || !line.headway) return;
+      var stopScore = __jsStopScore(line.mode, speedKmh, line.headway, HEADWAY_CV);
+      var stops = [];
+      for (var i = 0; i < line.points.length; i++) {{
+        if (line.stops[i]) stops.push({{ lat: line.points[i][1], lng: line.points[i][0] }});
+      }}
+      if (!stops.length) return;
+      out.push({{ id: line.id, mode: line.mode, headway_minutes: line.headway, grade_separation: gradeSep,
+                  speed_kmh: speedKmh, stop_score: stopScore, stop_score01: stopScore / 100.0, stops: stops }});
+    }});
+    return out;
   }}
 
-  // Cleared individually via `__clearAccessOverride` rather than
-  // `window.__clearAllAccessOverrides(HEX_LEVEL)` -- that clear-all call
-  // needs a feature actually loaded/rendered for the removal to resolve on
-  // this MapLibre version, and throws ("A feature id is required to remove
-  // its specific state property") when called with no id at all, which it
-  // is here. Tracking exactly the ids this function itself set sidesteps
-  // that entirely.
   var lastOverrideIds = [];
-  // Round 18 (item 6 of the user's feedback list): the same override
-  // mechanism extended to circles (identical h3 ids to hexagons, since
-  // `circ_map` is built over the exact same `resolutions_levels` as
-  // `hex_map` -- see `build_city_map`), census polygons (GEOID-keyed, via
-  // a population-weighted delta-sum port of Folium's own
-  // `_census_geoid_override_lookup_js`/`_editor_js` item-6 logic), and
-  // streets (no numeric access ramp of their own -- highlighted with a
-  // fixed color when within the buffer, not recolored along a ramp).
   var lastCircleOverrideIds = [];
   var lastCensusOverrideIds = [];
   var lastStreetOverrideIds = [];
+  // 2026-09-25, explicit user request ("right now the color get altered
+  // when new line created and compute touched but only for the highest
+  // zoom level. For lower zoom levels the colors stay as they are") --
+  // this port's own docstring already documented that gap ("Coarser hex
+  // resolutions and the census/circle levels are NOT live-recolored").
+  // `COARSER_RESOLUTIONS` mirrors `code/params.py`'s fixed
+  // `map_h3_resolutions = (5, 7, 9, 11)` default (no per-map JS constant
+  // exists to read this from; every resolution not present on a given map
+  // simply no-ops via `__hasMapLevel` below, same defensive pattern the
+  // census/circle checks already use). One override-id list PER
+  // resolution/level-prefix pair, so each can be cleared independently on
+  // the next Compute.
+  var COARSER_RESOLUTIONS = [5, 7, 9].filter(function(r) {{ return r < PC.res; }});
+  var lastResOverrideIds = {{}};
+  COARSER_RESOLUTIONS.forEach(function(res) {{
+    lastResOverrideIds['hexagons:h3_' + res] = [];
+    lastResOverrideIds['circles:h3_' + res] = [];
+  }});
   var CIRCLES_LEVEL = 'circles:h3_' + PC.res;
   var CENSUS_LEVEL = 'census:census_' + {json.dumps(CENSUS_LIVE_RECOLOR_LEVEL)};
   var STREETS_LEVEL = 'streets:edges';
@@ -9364,11 +10002,6 @@ window.__statsData = {stats_data_json};
       return geoidChunkCache[key];
     }});
   }}
-  // One-time cache of every currently-loaded census feature's baked
-  // level_of_service/population, keyed by its promoted id (same GEOID the
-  // geoid chunks use) -- used to turn a population-weighted delta SUM
-  // (see below) back into an absolute new score. Rebuilt on every Compute
-  // since which tiles/features are loaded can change as the user pans.
   function censusFeatureLookup() {{
     var out = {{}};
     if (!window.__hasMapLevel(CENSUS_LEVEL)) return out;
@@ -9376,44 +10009,36 @@ window.__statsData = {stats_data_json};
     feats.forEach(function(f) {{
       if (f.id == null) return;
       var p = f.properties || {{}};
-      // Round 18: property naming varies by pipeline vintage -- pre-redesign
-      // `population`/`acs_population`, post-`pyCensus`-redesign (round 16)
-      // `acs5_population`/`dhc_population` (see that round's notes) -- try
-      // them in order, first positive value wins.
       var pop = p.population || p.acs_population || p.acs5_population || p.dhc_population || 0;
       out[String(f.id)] = {{access: p.level_of_service || 0, population: pop}};
     }});
     return out;
   }}
-  var lastCompute = null;
+
+  // 2026-09-22: generalized from a single route's `stations` to the
+  // flattened union of every drawn line's own real stops, each carrying
+  // its OWN line's stop_score (see `resolvedLines()`) -- a population
+  // chunk cell's new access is still the max over every nearby stop
+  // (`accessibility_score`'s own "best nearby wins" convention), now
+  // correctly comparing across DIFFERENT lines' scores rather than
+  // assuming one shared score for the whole buffer.
   function computeAccess() {{
     var status = document.getElementById('caStatus');
-    var route = currentRoute();
+    var lines = resolvedLines();
+    if (!window.__hasMapLevel(HEX_LEVEL)) {{ status.textContent = 'no ' + HEX_LEVEL + ' layer on this map'; return Promise.resolve(null); }}
+    if (!lines.length) {{ status.textContent = 'draw at least one line with stops, mode and headway first'; return Promise.resolve(null); }}
     var base = baselineStats();
-    if (!window.__hasMapLevel(HEX_LEVEL)) {{
-      status.textContent = 'no ' + HEX_LEVEL + ' layer on this map';
-      return Promise.resolve(null);
-    }}
-    if (!route.points.length) {{ status.textContent = 'draw a route first'; return Promise.resolve(null); }}
-    var speedKmh = speedKmhFor(route.mode, route.grade_separation);
-    if (!speedKmh || !route.headway_minutes) {{
-      status.textContent = 'set a valid mode/headway (and grade separation, for bus/tram/brt)';
-      return Promise.resolve(null);
-    }}
-    var stopScore = __jsStopScore(route.mode, speedKmh, route.headway_minutes, HEADWAY_CV);
-    // Round 17 (item 5): only points flagged as stops (`is_station`, from
-    // the "Add stops" checkbox / Add Stop button in `_route_draw_html_js`)
-    // count as stations for the access-recompute buffer -- a plain route
-    // node contributes geometry only. Falls back to treating every point as
-    // a station if none are flagged, so a route drawn before this round's
-    // stop-flagging exists (or with stops never marked) still computes.
-    var stations = route.points.filter(function(p) {{ return p.is_station; }});
-    if (!stations.length) stations = route.points;
+    if (!base) {{ status.textContent = 'no baseline stats'; return Promise.resolve(null); }}
+
+    var allStops = [];
+    lines.forEach(function(line) {{
+      line.stops.forEach(function(s) {{ allStops.push({{lat: s.lat, lng: s.lng, stopScore: line.stop_score, stopScore01: line.stop_score01, mode: line.mode}}); }});
+    }});
 
     return loadChunkIndex().then(function(idx) {{
       if (!idx) {{ status.textContent = 'population chunks not available'; return null; }}
       var keys = {{}};
-      stations.forEach(function(s) {{
+      allStops.forEach(function(s) {{
         var dLat = ACCESS_R_M / 111320.0;
         var dLng = ACCESS_R_M / (111320.0 * Math.max(0.05, Math.cos(s.lat * Math.PI / 180)));
         var i0 = Math.floor((s.lat - dLat) / PC.deg), i1 = Math.floor((s.lat + dLat) / PC.deg);
@@ -9424,10 +10049,6 @@ window.__statsData = {stats_data_json};
         }}
       }});
       var keyList = Object.keys(keys);
-      // Round 18: fetch the matching GEOID chunks alongside the population
-      // chunks (same key/locality scheme, see `loadGeoidChunk` above) --
-      // ported from Folium's `_editor_js` item-6 comment. Degrades to `[]`
-      // (no census overrides) when this study has no geoid_chunks at all.
       var geoidChunksReady = loadGeoidChunkIndex().then(function(gIdx) {{
         if (!gIdx) return [];
         return Promise.all(keyList.filter(function(k) {{ return gIdx[k]; }}).map(loadGeoidChunk));
@@ -9436,14 +10057,6 @@ window.__statsData = {stats_data_json};
         var chunks = both[0];
         var speedMps = (window.__disc && window.__disc.walkingSpeedMps) || 1.4;
         var nBuf = 0, nImp = 0, impact = 0;
-        // childH3 -> {{access, gainBase, population, lat, lng}} -- same shape
-        // the stats panel's `getStatsData(area, scenario)` rollup
-        // (`_stats_panel_js`) already expects from
-        // `window.__editor.lastCompute().h3AccessOverrides` /
-        // `computeResultForScenario(name).h3AccessOverrides`, so a saved
-        // scenario's "Compare with scenario" series is real recomputed data,
-        // not a stub. `lat`/`lng` (round 18) are extra fields only the new
-        // circles/census/stops overrides below read.
         var h3AccessOverrides = {{}};
         lastOverrideIds.forEach(function(id) {{ window.__clearAccessOverride(HEX_LEVEL, id); }});
         lastOverrideIds = [];
@@ -9455,12 +10068,12 @@ window.__statsData = {stats_data_json};
             var row = rows[ci];
             var lat = row[1], lng = row[2], pop = row[3], oldA = row[4];
             var best = oldA, inBuf = false;
-            for (var si = 0; si < stations.length; si++) {{
-              var s = stations[si];
+            for (var si = 0; si < allStops.length; si++) {{
+              var s = allStops[si];
               var d = haversineM(lat, lng, s.lat, s.lng);
               if (d > ACCESS_R_M) continue;
               inBuf = true;
-              var a = stopScore * __jsWalkDecay(d / speedMps / 60.0);
+              var a = s.stopScore * __jsWalkDecay(d / speedMps / 60.0, s.stopScore01, s.mode);
               if (a > best) best = a;
             }}
             if (!inBuf) continue;
@@ -9468,15 +10081,17 @@ window.__statsData = {stats_data_json};
             h3AccessOverrides[row[0]] = {{access: best, gainBase: oldA, population: pop, lat: lat, lng: lng}};
             if (best > oldA) {{
               nImp += 1;
-              impact += (best - oldA) * pop;
+              // 2026-09-26, explicit user request: "impact should be a sum
+              // of the product of people in an h3 res 11 cell that
+              // improves * level of service improvement... always with the
+              // level of service score in the 0-1 range" -- `best`/`oldA`
+              // are 0-100 (the 2026-09 scoring rescale), so /100 converts
+              // the improvement back to the original 0-1-scale points this
+              // metric (and its impact-in-k / $-per-k-impact calibration)
+              // was always defined in, before multiplying by population.
+              impact += (best - oldA) / 100 * pop;
               var color = window.__colorForValue(HEX_LEVEL, best);
-              if (color) {{
-                window.__setAccessOverride(HEX_LEVEL, row[0], color);
-                lastOverrideIds.push(row[0]);
-              }}
-              // Circles: an identical h3 grid to hexagons (same
-              // `resolutions_levels` -- see `build_city_map`), so the exact
-              // same cell id + color applies directly, no re-derivation.
+              if (color) {{ window.__setAccessOverride(HEX_LEVEL, row[0], color); lastOverrideIds.push(row[0]); }}
               if (haveCircles) {{
                 var circleColor = window.__colorForValue(CIRCLES_LEVEL, best) || color;
                 if (circleColor && window.__setAccessOverride(CIRCLES_LEVEL, row[0], circleColor)) {{
@@ -9486,13 +10101,6 @@ window.__statsData = {stats_data_json};
             }}
           }}
         }});
-        // Round 18: census polygons -- GEOID-keyed, no per-feature h3 id, so
-        // roll each touched h3 cell's (new - old) access up to its parent
-        // GEOID via the geoid chunk map, exactly mirroring Folium's own
-        // `_editor_js` item-6 logic (population-weighted delta SUM, then
-        // divided by the polygon's own total population and added to its
-        // baked level_of_service -- see `_census_geoid_override_lookup_js`'s
-        // docstring for why this reproduces the original build-time mean).
         lastCensusOverrideIds.forEach(function(id) {{ window.__clearAccessOverride(CENSUS_LEVEL, id); }});
         lastCensusOverrideIds = [];
         var geoidAccessOverrides = {{}};
@@ -9512,32 +10120,57 @@ window.__statsData = {stats_data_json};
             var delta = geoidAccessOverrides[gid];
             var cf = censusLookup[String(gid)];
             if (!cf || !(cf.population > 0) || delta === 0) return;
-            var newScore = Math.max(0, Math.min(1, cf.access + delta / cf.population));
+            // Bug fix: level_of_service is 0-100 (2026-09 rescale), not
+            // 0-1 -- this clamp still had the pre-rescale bounds.
+            var newScore = Math.max(0, Math.min(100, cf.access + delta / cf.population));
             var color = window.__colorForValue(CENSUS_LEVEL, newScore);
-            if (color && window.__setAccessOverride(CENSUS_LEVEL, gid, color)) {{
-              lastCensusOverrideIds.push(gid);
-            }}
+            if (color && window.__setAccessOverride(CENSUS_LEVEL, gid, color)) {{ lastCensusOverrideIds.push(gid); }}
           }});
         }}
-        // Round 18: streets. `street_overlay` layers ARE colored by a real
-        // numeric score (`_score_maplibre_paint("line", score_col, ...)` in
-        // `build_city_map`, the street's own baked `level_of_service`), and
-        // `_add_group` (geohierarchy's maplibre render.py) now captures
-        // `line-color` ramps into `window.__scoreInterpolators` the same as
-        // fill/circle (round 18 render.py fix) -- so an affected street's
-        // override color is genuinely value-derived via
-        // `window.__colorForValue`, not a flat highlight. "Affected" = any
-        // loaded edge feature passing within ACCESS_R_M of at least one
-        // station (checked against the edge's own vertex coordinates, a
-        // close approximation of point-to-segment distance, cheap in JS);
-        // its new value is the max h3AccessOverrides access among cells near
-        // the triggering vertex, falling back to `STREET_AFFECTED_COLOR`
-        // only if no interpolator/nearby cell exists (e.g. this study has no
-        // streets score ramp at all).
+
+        // Coarser hex/circle resolutions (5/7/9 below the finest PC.res,
+        // e.g. 11 -- the ones a lower zoom level actually renders): same
+        // population-weighted-delta rollup as the census block just above,
+        // using __h3ToParent instead of a geoid chunk lookup. Each parent
+        // cell's own baseline access/population comes straight off its own
+        // already-rendered map feature (`__mapLevelQueryFeatures`), same as
+        // `censusFeatureLookup()` does for census polygons.
+        COARSER_RESOLUTIONS.forEach(function(res) {{
+          ['hexagons', 'circles'].forEach(function(prefix) {{
+            var level = prefix + ':h3_' + res;
+            (lastResOverrideIds[level] || []).forEach(function(id) {{ window.__clearAccessOverride(level, id); }});
+            lastResOverrideIds[level] = [];
+            if (!window.__hasMapLevel(level)) return;
+            var feats = window.__mapLevelQueryFeatures(level, {{sourceLayer: 'h3_' + res}});
+            var lookup = {{}};
+            feats.forEach(function(f) {{
+              if (f.id == null) return;
+              var p = f.properties || {{}};
+              lookup[String(f.id)] = {{access: p.level_of_service || 0, population: p.population || 0}};
+            }});
+            var parentDelta = {{}};
+            Object.keys(h3AccessOverrides).forEach(function(childId) {{
+              var ov = h3AccessOverrides[childId];
+              var parentId = window.__h3ToParent(childId, res);
+              if (!parentId) return;
+              var cpop = (ov.population != null && ov.population >= 0) ? ov.population : 0;
+              parentDelta[parentId] = (parentDelta[parentId] || 0) + (ov.access - ov.gainBase) * cpop;
+            }});
+            Object.keys(parentDelta).forEach(function(parentId) {{
+              var delta = parentDelta[parentId];
+              var pf = lookup[parentId];
+              if (!pf || !(pf.population > 0) || delta === 0) return;
+              var newScore = Math.max(0, Math.min(100, pf.access + delta / pf.population));
+              var color = window.__colorForValue(level, newScore);
+              if (color && window.__setAccessOverride(level, parentId, color)) {{ lastResOverrideIds[level].push(parentId); }}
+            }});
+          }});
+        }});
+
         lastStreetOverrideIds.forEach(function(id) {{ window.__clearAccessOverride(STREETS_LEVEL, id); }});
         lastStreetOverrideIds = [];
         var haveStreets = window.__hasMapLevel(STREETS_LEVEL);
-        if (haveStreets && window.__hasMapLevel(STREETS_LEVEL)) {{
+        if (haveStreets) {{
           var streetH3Cells = Object.keys(h3AccessOverrides).map(function(k) {{ return h3AccessOverrides[k]; }});
           var edgeFeats = window.__mapLevelQueryFeatures(STREETS_LEVEL, {{sourceLayer: 'edges'}});
           edgeFeats.forEach(function(f) {{
@@ -9548,11 +10181,8 @@ window.__statsData = {stats_data_json};
             for (var li = 0; li < coords.length; li++) {{
               for (var vi = 0; vi < coords[li].length; vi++) {{
                 var vlng = coords[li][vi][0], vlat = coords[li][vi][1];
-                for (var si2 = 0; si2 < stations.length; si2++) {{
-                  if (haversineM(vlat, vlng, stations[si2].lat, stations[si2].lng) <= ACCESS_R_M) {{
-                    affected = true;
-                    break;
-                  }}
+                for (var si2 = 0; si2 < allStops.length; si2++) {{
+                  if (haversineM(vlat, vlng, allStops[si2].lat, allStops[si2].lng) <= ACCESS_R_M) {{ affected = true; break; }}
                 }}
                 for (var hi2 = 0; hi2 < streetH3Cells.length; hi2++) {{
                   var hc2 = streetH3Cells[hi2];
@@ -9564,30 +10194,16 @@ window.__statsData = {stats_data_json};
             }}
             if (!affected) return;
             var streetColor = (bestNearby != null && window.__colorForValue(STREETS_LEVEL, bestNearby)) || STREET_AFFECTED_COLOR;
-            if (window.__setAccessOverride(STREETS_LEVEL, f.id, streetColor)) {{
-              lastStreetOverrideIds.push(f.id);
-            }}
+            if (window.__setAccessOverride(STREETS_LEVEL, f.id, streetColor)) {{ lastStreetOverrideIds.push(f.id); }}
           }});
         }}
-        // Round 18: recompute the STOPS' own displayed access -- distinct
-        // from the population-side h3AccessOverrides above. For every real
-        // GTFS stop within ACCESS_R_M of the drawn route's stations, look up
-        // the h3 grid cells (from the SAME `h3AccessOverrides` this Compute
-        // just built) within a small local buffer of the stop's own
-        // coordinates via straight-line (haversine) distance, and take the
-        // max of their NEW access values as that stop's new local-access
-        // number -- the max-over-nearby-cells mirrors the same "best nearby
-        // wins" convention `accessibility_score` itself uses. Written to a
-        // new `__new_access` property (not `stop_score`, which is the
-        // stop's own service-quality metric, a different number) so the
-        // score label can show it without redefining stop_score's meaning.
         var nStopsAffected = 0;
         if (window.__stopsFC && window.__stopsFC.features && window.__stopsFC.features.length) {{
           var STOP_LOCAL_BUFFER_M = Math.min(ACCESS_R_M, 600);
           var h3Cells = Object.keys(h3AccessOverrides).map(function(k) {{ return h3AccessOverrides[k]; }});
           window.__stopsFC.features.forEach(function(sf) {{
             var slng = sf.geometry.coordinates[0], slat = sf.geometry.coordinates[1];
-            var nearStation = stations.some(function(s) {{ return haversineM(slat, slng, s.lat, s.lng) <= ACCESS_R_M; }});
+            var nearStation = allStops.some(function(s) {{ return haversineM(slat, slng, s.lat, s.lng) <= ACCESS_R_M; }});
             if (!nearStation) return;
             var bestNear = null;
             for (var hi = 0; hi < h3Cells.length; hi++) {{
@@ -9596,22 +10212,26 @@ window.__statsData = {stats_data_json};
                 if (bestNear == null || hc.access > bestNear) bestNear = hc.access;
               }}
             }}
-            if (bestNear != null) {{
-              sf.properties.__new_access = bestNear;
-              nStopsAffected += 1;
-            }}
+            if (bestNear != null) {{ sf.properties.__new_access = bestNear; nStopsAffected += 1; }}
           }});
           if (nStopsAffected > 0 && window.__refreshStopsData) window.__refreshStopsData();
         }}
+        var totalCostMusd = 0;
+        (window.__linesState ? window.__linesState() : []).forEach(function(line) {{
+          var c = lineCostEstimate(line, gradeSeparationFor(line.mode));
+          if (c) totalCostMusd += c.total_musd;
+        }});
         var newAccess = base ? (base.access + impact / base.population) : null;
-        status.textContent = nBuf + ' cells in buffer, ' + nImp + ' improved, ' +
-          lastCircleOverrideIds.length + ' circles, ' + lastCensusOverrideIds.length + ' census polys, ' +
-          lastStreetOverrideIds.length + ' streets, ' + nStopsAffected + ' stops recomputed' +
-          (newAccess != null ? ', metro access ' + base.access.toFixed(2) + ' -> ' + newAccess.toFixed(2) : '');
+        // 2026-09-25, explicit user request: no diagnostic status text
+        // ("N cells in buffer, N improved, ...") after Compute -- the real
+        // before/after numbers already surface in the top-center bar
+        // (`refreshTopBar`, reading this same result object), so this
+        // readout would only duplicate them in a less readable form.
+        status.textContent = '';
         var result = {{
           ok: true, n_cells_in_buffer: nBuf, n_cells_improved: nImp, impact: impact,
-          stop_score: stopScore, speed_kmh: speedKmh, baseline_access: base ? base.access : null,
-          new_access: newAccess, mode: route.mode, grade_separation: route.grade_separation,
+          baseline_access: base ? base.access : null, new_access: newAccess,
+          cost_musd: totalCostMusd, n_lines: lines.length,
           h3AccessOverrides: h3AccessOverrides,
           n_circles_overridden: lastCircleOverrideIds.length,
           n_census_overridden: lastCensusOverrideIds.length,
@@ -9619,12 +10239,33 @@ window.__statsData = {stats_data_json};
           n_stops_recomputed: nStopsAffected,
         }};
         window.__lastComputeAccess = result;
-        lastCompute = result;
-        // Cache this Compute under whichever scenario is currently active
-        // (if any) so `computeResultForScenario(name)` can return it later
-        // even after the user switches to/computes a DIFFERENT scenario.
-        if (S.activeScenario) computeResultsByScenario[S.activeScenario] = result;
-        refreshScenarioList();
+        lastComputeResult = result;
+        // 2026-09-25, explicit user request ("only original appears in
+        // compare with even though there is a with edits scenario that is
+        // different"): nothing previously re-ran the "Compare with"
+        // popovers' Scenario dropdowns after a successful Compute, so
+        // "With edits" only started showing up once some UNRELATED action
+        // happened to re-render the stats panel (switching tabs, etc) --
+        // refresh them the moment real computed data for it exists.
+        if (window.__populateAllSecondaryScenarioSelects) window.__populateAllSecondaryScenarioSelects();
+        if (window.__refreshTopBar) window.__refreshTopBar();
+        // 2026-09-25, explicit user request: "I want stop icons of edited
+        // lines to be stop emojis once the line is not being edited and
+        // compute has been clicked" -- flips every line's `computed` flag
+        // (`_route_draw_html_js`'s `render()` then switches a finished,
+        // non-editing line's stop markers from plain circles to the emoji
+        // icon layer).
+        // 2026-09-26, explicit user request ("If the line is rail then use
+        // rail emoji and the color of the stop score when editing"): pass
+        // each line's own already-computed `stop_score` (from
+        // `resolvedLines()` above) through, so the finished-line stop icon
+        // can be colored on the exact same blue scale a stop's score badge
+        // uses everywhere else on the map, not a flat/uncolored icon.
+        if (window.__markLinesComputed) {{
+          var __scoresByLineId = {{}};
+          lines.forEach(function(l) {{ __scoresByLineId[l.id] = l.stop_score; }});
+          window.__markLinesComputed(__scoresByLineId);
+        }}
         return result;
       }});
     }});
@@ -9635,25 +10276,20 @@ window.__statsData = {stats_data_json};
     computeAccess();
   }});
   refreshCostReadout();
-  // Test/automation hook.
   window.__computeAccess = computeAccess;
 
-  // Item A (round 6): the seam the stats panel's `getStatsData`/
-  // `__populateSecondaryScenarioSelect` already read via try/catch fallback
-  // (see `_stats_panel_js`) -- same shape as Folium's `window.__editor`
-  // (`state.scenarios`/`state.activeScenario`, `lastCompute()`,
-  // `computeResultForScenario(name)`), scoped to what this port's
-  // single-route-at-a-time editor actually needs.
+  // Same `window.__editor` shape the stats panel/top bar already read
+  // (`state.scenarios`/`.activeScenario`, `lastCompute()`,
+  // `computeResultForScenario(name)`) -- `saveAsScenario`/`loadScenario`
+  // are now trivial (there is nothing to name/switch between any more,
+  // just the one "With edits" scenario), kept only so neither caller needs
+  // to change.
   window.__editor = {{
     state: S,
-    lastCompute: function() {{ return lastCompute; }},
-    computeResultForScenario: function(name) {{ return computeResultsByScenario[name] || null; }},
-    saveAsScenario: saveAsScenario,
-    loadScenario: loadScenario,
-    // Round-13 top bar (`_inject_maplibre_topbar_into_saved_html`) reads
-    // these to show the baseline level of service for the reserved/"current"
-    // scenario, since `lastCompute()` is null until a real edited scenario
-    // has actually been computed.
+    lastCompute: function() {{ return lastComputeResult; }},
+    computeResultForScenario: function(name) {{ return (name === WITH_EDITS) ? lastComputeResult : null; }},
+    saveAsScenario: function() {{}},
+    loadScenario: function(name) {{ S.activeScenario = name || null; }},
     reservedName: RESERVED,
     baselineStats: function() {{ return baselineStats(); }},
   }};
@@ -9916,9 +10552,45 @@ def _maplibre_stops_routes_js(
     var clusterColorExpr = ['interpolate', ['linear'], ['get', 'max_stop_score']];
     var scaleN = Math.max(blueScale.length - 1, 1);
     blueScale.forEach(function(c, i) {{ clusterColorExpr.push(i / scaleN, c); }});
+    // 2026-09-29 (verbatim user request): "there should be a higher
+    // tolerance (group earlier when they are a bit further away) to
+    // grouping already grouped stops... do this at an earlier threshold
+    // than grouping individual stops into groups" -- a single flat
+    // `clusterRadius` (screen pixels) applies the SAME merge distance at
+    // every zoom, so zoomed-out clusters-of-clusters never got a looser
+    // threshold than zoomed-in individual stops. Supercluster (the
+    // GeoJSON-source clustering engine MapLibre uses under `cluster:
+    // true`) bakes `clusterRadius` into its index at construction time --
+    // it can't be changed on a live source -- so this instead rebuilds the
+    // source+layers with a different radius whenever the map crosses into
+    // a new zoom band, stricter (smaller radius, less eager to merge) when
+    // zoomed in, looser (larger radius, merges already-grouped clusters
+    // together sooner) when zoomed out. Layer ids are kept identical
+    // across rebuilds so every click handler/visibility toggle/mode filter
+    // registered below (by layer id, not object reference -- MapLibre's
+    // `map.on(type, layerId, cb)` re-resolves the layer by id on each
+    // event) keeps working unmodified after a rebuild.
+    var __stopClusterBands = [
+      {{maxZoom: 12, radius: 42}},
+      {{maxZoom: 15, radius: 22}},
+      {{maxZoom: Infinity, radius: 14}},
+    ];
+    function __stopClusterRadiusForZoom(z) {{
+      for (var i = 0; i < __stopClusterBands.length; i++) {{
+        if (z < __stopClusterBands[i].maxZoom) return __stopClusterBands[i].radius;
+      }}
+      return __stopClusterBands[__stopClusterBands.length - 1].radius;
+    }}
+    var __stopOverlayLayerIds = ['__stops_cluster', '__stops_cluster_count', '__stops_mode_icon', '__stops_score_label', '__stops_label'];
+    var __currentStopClusterRadius = null;
+    function __teardownStopsOverlay() {{
+      __stopOverlayLayerIds.forEach(function(id) {{ if (map.getLayer(id)) map.removeLayer(id); }});
+      if (map.getSource('__stops_overlay')) map.removeSource('__stops_overlay');
+    }}
+    function __buildStopsOverlay(radius) {{
     map.addSource('__stops_overlay', {{
       type: 'geojson', data: stopsFC,
-      cluster: true, clusterRadius: 18, clusterMaxZoom: 16,
+      cluster: true, clusterRadius: radius, clusterMaxZoom: 16,
       clusterProperties: {{'max_stop_score': ['max', ['coalesce', ['get', 'stop_score'], 0]]}},
     }});
     map.addLayer({{
@@ -9931,7 +10603,9 @@ def _maplibre_stops_routes_js(
         // Item (verbatim user request): "make the stops circles a bit
         // smaller especially the maximum circles for very large groups" --
         // shrunk from 14/18/24 to 10/13/16.
-        'circle-radius': ['step', ['get', 'point_count'], 10, 25, 13, 100, 16],
+        // 2026-09-29 (verbatim user request, "stop groups symbols smaller
+        // (more than little)"): shrunk further, 10/13/16 -> 7/9/11.
+        'circle-radius': ['step', ['get', 'point_count'], 7, 25, 9, 100, 11],
         'circle-stroke-width': 1.5,
         'circle-stroke-color': '#ffffff',
         'circle-opacity': 0.85,
@@ -10008,7 +10682,9 @@ def _maplibre_stops_routes_js(
         // trimmed slightly (user request: "a bit smaller") alongside
         // tighter clustering (`clusterRadius`) so more individual stops
         // stay ungrouped without crowding each other.
-        'icon-size': 0.48,
+        // 2026-09-29 (verbatim user request, "make the stop symbols a
+        // little bit smaller"): 0.48 -> 0.42.
+        'icon-size': 0.42,
         'icon-allow-overlap': true,
         'icon-ignore-placement': true,
       }},
@@ -10063,6 +10739,22 @@ def _maplibre_stops_routes_js(
         'visibility': 'none',
       }},
       paint: {{'text-color': '#1a1a1a', 'text-halo-color': '#ffffff', 'text-halo-width': 1.2}},
+    }});
+    }} // end __buildStopsOverlay
+    __currentStopClusterRadius = __stopClusterRadiusForZoom(map.getZoom());
+    __buildStopsOverlay(__currentStopClusterRadius);
+    // Rebuild only when the zoom crosses into a different band (not on
+    // every zoomend) -- `__reapplyStopsOverlayUI`, defined further below
+    // alongside the Stops/route-mode checkboxes, restores whatever
+    // visibility/mode-filter state was active before the rebuild reset the
+    // freshly-added layers to their defaults.
+    map.on('zoomend', function() {{
+      var r = __stopClusterRadiusForZoom(map.getZoom());
+      if (r === __currentStopClusterRadius) return;
+      __currentStopClusterRadius = r;
+      __teardownStopsOverlay();
+      __buildStopsOverlay(r);
+      if (window.__reapplyStopsOverlayUI) window.__reapplyStopsOverlayUI();
     }});
 
     // --- Route badge chips (item 1 of the round-15 port) --------------------
@@ -10466,6 +11158,59 @@ def _maplibre_stops_routes_js(
         setVis('__routes_casing_' + m, v);
       });
     });
+    // 2026-09-28, explicit user request: "the bus tram rail checkboxes
+    // should affect to routes and stops" -- these previously ONLY touched
+    // the route-LINE layers (`__routes_line_*`/`__routes_casing_*`), never
+    // the stops themselves, so unchecking e.g. "rail" hid rail route lines
+    // but every rail stop marker stayed fully visible. `__applyStopModeFilter`
+    // applies an `['in', mode, ...checkedModes]`-style filter to every
+    // per-stop layer (icon, score label, high-zoom name label) so checking/
+    // unchecking a mode now hides/shows that mode's stops too, matching the
+    // route lines. Clusters (`__stops_cluster`/`__stops_cluster_count`) are
+    // deliberately left unfiltered -- MapLibre computes cluster membership
+    // at the SOURCE level before any layer filter runs, so a layer filter
+    // can't cleanly un-cluster a hidden mode's stops out of a mixed-mode
+    // cluster; this only affects the already-zoomed-in, non-clustered view.
+    var __stopModeFilterBases = {}; // layerId -> its base filter, captured once
+    function __applyStopModeFilter() {
+      var modes = ['bus', 'tram', 'rail'].filter(function(m) { return window.__routeModeVisible[m] !== false; });
+      var modeFilter = ['in', ['get', 'mode'], ['literal', modes]];
+      ['__stops_mode_icon', '__stops_score_label', '__stops_label'].forEach(function(id) {
+        if (!map.getLayer(id)) return;
+        // Bug fix: `['in', ['get','mode']].concat(modes)` built the
+        // deprecated legacy filter shape (`["in", key, v1, v2, ...]`),
+        // which silently no-ops as a modern expression -- `setFilter`
+        // "succeeded" but the layer's filter never actually changed
+        // (confirmed live: `getFilter` still read the original filter
+        // after calling this). Real MapLibre expression syntax needs
+        // `["in", needle, ["literal", haystack]]`. Also, each of these
+        // layers already carries its OWN base filter (e.g.
+        // `__stops_mode_icon`'s `['!', ['has','point_count']]`, excluding
+        // supercluster's synthetic cluster points) -- replacing it outright
+        // would let cluster points leak through this layer. Combine both
+        // with `all`, preserving whatever base filter was set at layer
+        // creation (captured once into a plain object, not onto the
+        // `getLayer()` result -- that's a fresh snapshot object every call,
+        // not a stable place to stash state).
+        if (!(id in __stopModeFilterBases)) __stopModeFilterBases[id] = map.getFilter(id) || null;
+        var base = __stopModeFilterBases[id];
+        map.setFilter(id, base ? ['all', base, modeFilter] : modeFilter);
+      });
+    }
+    window.__applyStopModeFilter = __applyStopModeFilter;
+    // Called after `__buildStopsOverlay` tears down and re-adds the stop
+    // layers (zoom-band cluster-radius switch, see that function) -- fresh
+    // layers reset to their built-in defaults (visible, unfiltered by
+    // mode), so whatever the user had toggled via these checkboxes needs
+    // re-applying on top, same as it was applied the first time.
+    window.__reapplyStopsOverlayUI = function() {
+      var stopsBox = document.getElementById('ovStopsCheckbox');
+      var stopsOn = !stopsBox || stopsBox.checked;
+      ['__stops_mode_icon', '__stops_score_label', '__stops_cluster', '__stops_cluster_count'].forEach(function(id) { setVis(id, stopsOn); });
+      var namesBox = document.getElementById('ovStopNamesCheckbox');
+      setVis('__stops_label', !!(namesBox && namesBox.checked));
+      __applyStopModeFilter();
+    };
     ['bus', 'tram', 'rail'].forEach(function(m) {
       onChg('ovRoute_' + m + '_Checkbox', function(e) {
         window.__routeModeVisible[m] = e.target.checked;
@@ -10473,8 +11218,11 @@ def _maplibre_stops_routes_js(
         var v = (!master || master.checked) && e.target.checked;
         setVis('__routes_line_' + m, v);
         setVis('__routes_casing_' + m, v);
+        __applyStopModeFilter();
       });
     });
+    if (window.__stopsOverlayLoaded) __applyStopModeFilter();
+    else { var __wait = setInterval(function() { if (window.__stopsOverlayLoaded) { __applyStopModeFilter(); clearInterval(__wait); } }, 100); }
   });
 """)
 
@@ -10661,8 +11409,13 @@ def _inject_maplibre_topbar_into_saved_html(path: str, enable_place_comparison: 
     var sel = document.getElementById('topBarScenarioSelect');
     var out = document.getElementById('topBarResults');
     if (!ed || !sel || !out) return;
-    var reserved = ed.reservedName || 'current';
-    var options = [{value: '', label: reserved + ' (baseline)'}].concat(
+    // 2026-09-22, explicit user request ("instead of scenarios I just want
+    // to have 'original' and 'with edits'"): the baseline option now reads
+    // as plain "Original" (was `reservedName + ' (baseline)'`, e.g. "current
+    // (baseline)") -- `ed.reservedName` is still the real internal value
+    // this option's `<option value="">` maps to (empty string = baseline),
+    // only the user-facing label changed.
+    var options = [{value: '', label: 'Original'}].concat(
       (ed.state.scenarios || []).map(function(sc) { return {value: sc.name, label: sc.name}; })
     );
     var want = (ed.state.activeScenario != null) ? ed.state.activeScenario : '';
@@ -10693,7 +11446,29 @@ def _inject_maplibre_topbar_into_saved_html(path: str, enable_place_comparison: 
       if (lc && lc.ok) {
         if (lc.new_access != null) fields.push('<b>' + fmtNum(lc.new_access, 2) + '</b>');
         if (lc.cost_musd != null) fields.push('cost <b>$' + fmtNum(lc.cost_musd, 1) + 'M</b>');
-        if (lc.impact != null) fields.push('impact <b>' + fmtNum(lc.impact, Math.abs(lc.impact) < 100 ? 1 : 0) + '</b>');
+        // 2026-09-25, explicit user request: impact (population-weighted
+        // sum of level_of_service INCREASE across every touched cell --
+        // e.g. 10 people * +10 LOS-points + 20 people * +20 LOS-points --
+        // shown in thousands ("k", i.e. divided by 1000), plus the M$/k
+        // cost-per-impact ratio and a happy/sad face that scales linearly
+        // with that ratio. Calibrated from the user's own worked example:
+        // at a $400M cost, 50k impact is "good", half that (25k) is "bad",
+        // and the face's happiness interpolates linearly IN THE RATIO
+        // between those two anchors (400/50=8 M$/k -> happiest, 400/25=16
+        // M$/k -> saddest) -- a ratio, not a raw impact number, so the same
+        // calibration applies at any cost magnitude, not just $400M.
+        if (lc.impact != null) {
+          var impactK = lc.impact / 1000;
+          fields.push('impact <b>' + fmtNum(impactK, Math.abs(impactK) < 10 ? 1 : 0) + 'k</b>');
+          if (lc.cost_musd != null && impactK > 0) {
+            var ratio = lc.cost_musd / impactK;
+            var GOOD_RATIO = 8, BAD_RATIO = 16;
+            var happiness = Math.max(0, Math.min(1, (BAD_RATIO - ratio) / (BAD_RATIO - GOOD_RATIO)));
+            var face = happiness >= 0.8 ? '😄' : happiness >= 0.6 ? '🙂' :
+              happiness >= 0.4 ? '😐' : happiness >= 0.2 ? '🙁' : '😢';
+            fields.push(fmtNum(ratio, 1) + ' $/k ' + face);
+          }
+        }
       }
     }
     var html = fields.length ? fields.join(' &nbsp;|&nbsp; ') : '<span style="color:#888;">not computed yet</span>';
@@ -11113,7 +11888,7 @@ def _inject_maplibre_editor_into_saved_html(
     and live-recolor plumbing this hooks into; this function runs AFTER that
     save, appending the computeAccess port's JS just before the page's
     single closing `</script>` tag so it shares that script's scope (`map`,
-    `window.__routeState`, `window.__setAccessOverride`, etc. are all
+    `window.__linesState`, `window.__setAccessOverride`, etc. are all
     already defined there by the time this code runs, since script tags
     execute top-to-bottom).
     """
@@ -11135,7 +11910,10 @@ def _inject_maplibre_stats_panel_into_saved_html(
     is_us: bool,
     region: str = "global",
     enable_place_comparison: bool = True,
-    share_source_map: Optional[Dict[str, str]] = None,
+    share_source_map: Optional[Dict[str, Tuple[str, str]]] = None,
+    h3_by_resolution: Optional[Dict[int, gpd.GeoDataFrame]] = None,
+    census_by_level: Optional[Dict[str, gpd.GeoDataFrame]] = None,
+    country: Optional[str] = None,
 ) -> str:
     """Splice the Distribution/Regression/ANOVA/R2/City-rank stats panel into a MapLibre `map.html`.
 
@@ -11153,7 +11931,8 @@ def _inject_maplibre_stats_panel_into_saved_html(
     with open(path, "r", encoding="utf-8") as f:
         html = f.read()
     block = _stats_panel_helper_js() + _stats_panel_block(
-        stats_by_area, is_us, region, enable_place_comparison, share_source_map=share_source_map
+        stats_by_area, is_us, region, enable_place_comparison, share_source_map=share_source_map,
+        h3_by_resolution=h3_by_resolution, census_by_level=census_by_level, country=country,
     )
     marker = "</body>"
     if marker not in html:
@@ -11179,9 +11958,12 @@ def _inject_controls_into_saved_html(
     region: str = "global",
     default_shape: str = "hexagons",
     enable_place_comparison: bool = True,
-    share_source_map: Optional[Dict[str, str]] = None,
+    share_source_map: Optional[Dict[str, Tuple[str, str]]] = None,
     radius_field_domains_by_res: Optional[Dict[int, Dict[str, tuple]]] = None,
     circle_zoom_bands: Optional[Dict[int, tuple]] = None,
+    h3_by_resolution: Optional[Dict[int, gpd.GeoDataFrame]] = None,
+    census_by_level: Optional[Dict[str, gpd.GeoDataFrame]] = None,
+    country: Optional[str] = None,
 ) -> None:
     """Post-process an already-`.save()`d map HTML file to add controls + legend + stats panel.
 
@@ -11202,6 +11984,11 @@ def _inject_controls_into_saved_html(
     default_circle_field = _preferred_density_field(circle_fields) or (circle_fields[0] if circle_fields else None)
 
     base_layer_vars = _extract_base_layer_vars(html)
+    # Hoisted here (previously only extracted inside the `stops_gdf` branch
+    # below) so the legend/layer-control click-cycle toggle -- which needs
+    # to show/hide the native Leaflet layer control regardless of whether
+    # this map has a stops layer -- always has it available.
+    layer_control_var = _extract_layer_control_var(html)
 
     controls_and_legend_js = ""
     if map_var:
@@ -11218,6 +12005,89 @@ def _inject_controls_into_saved_html(
 }})();
 """
 
+    # Legend/layer-control click-cycle toggle icon (2026-09-29, explicit user
+    # request). A single small icon button cycles through four states on
+    # repeated clicks:
+    #   0: icon only -- legend AND the native Leaflet layer control both hidden
+    #   1: legend visible, layer control still hidden
+    #   2: legend visible, layer control ALSO visible
+    #   3: layer control hidden again, legend still visible
+    #   (next click) -> back to 0: legend hidden too
+    # i.e. open legend -> open layer control -> close layer control -> close
+    # legend -> repeat. `mapLegend`'s own Leaflet control container and the
+    # native layer control's container (`window.__layerControlRef.getContainer()`)
+    # are toggled directly via `style.display`, rather than re-adding/removing
+    # them from the map, so Leaflet's own corner-stacking layout is undisturbed
+    # (removing/re-adding a control changes stacking order relative to
+    # whatever else shares that corner).
+    #
+    # Default starting state is 1 (legend open, layer control closed) --
+    # matching this project's prior "legend always visible" default as
+    # closely as possible while still enabling the new toggle. A URL whose
+    # path ends in `/nolegend` (trailing slash optional, case-insensitive --
+    # e.g. `.../boston/nolegend`) instead starts at state 0 (icon only,
+    # nothing open) -- the same served `index.html` file handles both URLs;
+    # no separate server-side route or duplicate file is needed, only this
+    # client-side path check, which sidesteps the still-open nginx
+    # index-directive issue entirely.
+    legend_toggle_js = ""
+    if map_var:
+        layer_control_js_ref = (
+            f'window.__layerControlRef || (typeof {layer_control_var} !== "undefined" ? {layer_control_var} : null)'
+            if layer_control_var else "window.__layerControlRef || null"
+        )
+        legend_toggle_js = f"""
+(function() {{
+  var startCollapsed = /\\/nolegend\\/?$/i.test(window.location.pathname);
+  window.__legendCycleState = startCollapsed ? 0 : 1;
+
+  function legendContainer() {{
+    var el = document.getElementById('mapLegend');
+    return el ? el.parentElement : null;
+  }}
+  function layerControlContainer() {{
+    var ref = {layer_control_js_ref};
+    if (!ref) {{ window.__layerControlRef = ref = {layer_control_js_ref}; }}
+    try {{ return ref && ref.getContainer ? ref.getContainer() : null; }}
+    catch (e) {{ return null; }}
+  }}
+  function applyState() {{
+    var legendEl = legendContainer();
+    var lcEl = layerControlContainer();
+    var s = window.__legendCycleState;
+    if (legendEl) legendEl.style.display = (s >= 1) ? '' : 'none';
+    if (lcEl) lcEl.style.display = (s === 2) ? '' : 'none';
+  }}
+
+  var btn = document.createElement('div');
+  btn.id = 'legendToggleBtn';
+  btn.title = 'Toggle legend / layers';
+  btn.textContent = '\\ud83d\\uddfa\\ufe0f';
+  btn.style.cssText = 'position:absolute;top:10px;right:10px;z-index:1001;'
+    + 'width:34px;height:34px;line-height:34px;text-align:center;font-size:18px;'
+    + 'background:#fff;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.4);'
+    + 'cursor:pointer;user-select:none;transition:transform 0.12s, box-shadow 0.12s;';
+  btn.addEventListener('mouseenter', function() {{ btn.style.transform = 'scale(1.08)'; btn.style.boxShadow = '0 2px 8px rgba(0,0,0,0.4)'; }});
+  btn.addEventListener('mouseleave', function() {{ btn.style.transform = ''; btn.style.boxShadow = '0 1px 4px rgba(0,0,0,0.4)'; }});
+  btn.addEventListener('click', function(e) {{
+    e.stopPropagation();
+    window.__legendCycleState = (window.__legendCycleState + 1) % 4;
+    applyState();
+  }});
+  L.DomEvent.disableClickPropagation(btn);
+  document.body.appendChild(btn);
+
+  // Applied on load (below) AND once more shortly after, since the native
+  // layer control may not exist yet on first pass for maps that set
+  // `window.__layerControlRef` inside their own later `load` handler (see
+  // the `stops_gdf` branch further down in this function).
+  window.addEventListener('load', function() {{
+    applyState();
+    setTimeout(applyState, 300);
+  }});
+}})();
+"""
+
     # `mapControls` + its `mapSettingsButton` toggle are their own
     # absolutely-positioned bottom-right elements (mirroring
     # `statsButton`/`statsPanel`'s bottom-left pattern) -- unlike
@@ -11231,6 +12101,7 @@ def _inject_controls_into_saved_html(
         + "<script>\nwindow.addEventListener('load', function() {\n"
         + "document.getElementById('mapLegend').parentElement.style.display = '';\n"
         + controls_and_legend_js
+        + legend_toggle_js
         + _control_panel_js(
             map_var, default_circle_field, radius_field_domains, opacity_field_domains, base_layer_vars,
             default_shape=default_shape,
@@ -11242,7 +12113,8 @@ def _inject_controls_into_saved_html(
 
     if stats_by_area:
         injected += _stats_panel_block(
-            stats_by_area, is_us, region, enable_place_comparison, share_source_map=share_source_map
+            stats_by_area, is_us, region, enable_place_comparison, share_source_map=share_source_map,
+            h3_by_resolution=h3_by_resolution, census_by_level=census_by_level, country=country,
         )
 
     if stops_gdf is not None and not stops_gdf.empty:

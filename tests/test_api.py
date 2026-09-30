@@ -46,7 +46,7 @@ def test_compute_stop_scores_adds_expected_columns():
     )
     out = compute_stop_scores(df, region="global")
 
-    for col in ("mode_score", "speed_score", "frequency_score", "reliability_score", "stop_score"):
+    for col in ("mode_category", "mrc_score", "speed_score", "frequency_score", "stop_score"):
         assert col in out.columns
 
     # Row 0: fully specified, everything should be a finite score in [0, 1].
@@ -70,18 +70,20 @@ def test_compute_stop_scores_adds_expected_columns():
 
 
 def test_compute_stop_scores_respects_custom_weights():
+    # Custom weights only apply to the legacy flat "harmonic"/"geometric"
+    # stop_score_mode -- the default "nested" mode has no weight parameter
+    # by construction (scoring.md Section 1.2, 2026-09-29 structure revision).
     df = pd.DataFrame(
         {"headway_minutes": [5.0], "headway_cv": [0.1], "avg_speed_kmh": [20.0]}
     )
-    out_equal = compute_stop_scores(df, weights=(0.25, 0.25, 0.25, 0.25))
-    out_speed_heavy = compute_stop_scores(df, weights=(0.05, 0.85, 0.05, 0.05))
+    out_equal = compute_stop_scores(df, weights=(1 / 3, 1 / 3, 1 / 3), stop_score_mode="harmonic")
+    out_speed_heavy = compute_stop_scores(df, weights=(0.1, 0.8, 0.1), stop_score_mode="harmonic")
     # Different weights on identical sub-scores should generally change the
-    # combined stop_score (unless all four sub-scores are equal).
+    # combined stop_score (unless all three sub-scores are equal).
     assert out_equal["stop_score"].iloc[0] != out_speed_heavy["stop_score"].iloc[0] or (
-        out_equal["mode_score"].iloc[0]
+        out_equal["mrc_score"].iloc[0]
         == out_equal["speed_score"].iloc[0]
         == out_equal["frequency_score"].iloc[0]
-        == out_equal["reliability_score"].iloc[0]
     )
 
 

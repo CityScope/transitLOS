@@ -56,13 +56,17 @@ from typing import Optional, Sequence, Union
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import polars as pl
 import shapely
 
 from UrbanAccessAnalyzer.api import AccessibilityAnalyzer, AreaOfInterest, PointsOfInterest, StreetNetwork
 
 from .network import prepare_street_network
-from .scoring.distance_matrix import build_intelligent_distance_matrix, ceil_to_grid_array
+from .scoring.accessibility_score import accessibility_score
+from .scoring.distance_matrix import build_intelligent_distance_matrix, ceil_to_grid, ceil_to_grid_array
+from .scoring.mrc import mode_category
+from .scoring.parameters import REGIONS
 from .stop_scores import compute_stop_scores
 from .stops import download_and_prepare_stops
 
@@ -202,9 +206,11 @@ def compute_level_of_service(
             `download_and_prepare_stops` (e.g. `route_types`).
 
     Returns:
-        `geopandas.GeoDataFrame` of street edges (network CRS) with an
+        `geopandas.GeoDataFrame` of street edges (network CRS) with a
         `level_of_service` column, ceiling-discretized onto `{0.0, 0.1, ...,
-        1.0}` (see module docstring, point 3).
+        1.0}` internally (see module docstring, point 3) and then rescaled
+        to `{0, 10, ..., 100}` -- 2026-09-23, explicit user request that
+        every 0-1 score be displayed/stored on a 0-100 scale.
     """
     if network is None:
         network = prepare_street_network(aoi, cache_dir=cache_dir, pbf_path=pbf_path)
@@ -231,18 +237,86 @@ def compute_level_of_service(
     if "stop_score" not in stops.columns:
         stops = compute_stop_scores(stops, region=region, weights=weights)
 
-    # Build the distance_matrix from transitlos's own decay curve, bucket
-    # every stop's stop_score to its output-equivalent representative (the
-    # exact join key `AccessibilityAnalyzer.run` needs against
-    # `distance_matrix["poi_score"]`), and remap stops onto that bucketed
-    # column before handing them to UrbanAccessAnalyzer -- see module
-    # docstring and `scoring/distance_matrix.py`.
-    distance_matrix, bucket_map, _distance_steps_m = build_intelligent_distance_matrix(
-        stops["stop_score"].to_numpy(), region=region, max_distance_m=max_walk_distance_m
-    )
+    # `D(t; stop_score)`'s scale (`t0`) is now mode-dependent (see
+    # `walk_access.py`), so the distance_matrix/bucketing must be built, and
+    # `AccessibilityAnalyzer` run, once per mode -- a single shared
+    # distance-column set would silently use the wrong mode's t0_base for
+    # every stop but one. Results are combined by taking the per-edge
+    # maximum access_score across mode-runs, matching
+    # `UrbanAccessAnalyzer.isochrones`'s own "best tier any stop/distance
+    # combination can justify" reconciliation rule (see that module's
+    # docstring) extended across mode-runs instead of just within one.
+    #
+    # **2026-09-29 bug fix**: this used to run `network.snap_points` and
+    # `AccessibilityAnalyzer` once per mode, then combine the per-mode
+    # `access_score` columns positionally via `np.maximum`. That is invalid:
+    # `network.snap_points` (and `AccessibilityAnalyzer.run`'s own internal
+    # re-snap) *splits* street edges at each POI's projected snap point, so
+    # different modes' point sets produce structurally different edge tables
+    # (different length, different `u`/`v` node ids from the newly-inserted
+    # snap nodes) -- there is no valid positional (or even a stable `u,v`-id)
+    # alignment between two separate per-mode runs' edge outputs. This
+    # crashed in production on every multi-mode city with
+    # `ValueError: operands could not be broadcast together with shapes
+    # (...) (...)` as soon as two modes produced different edge counts.
+    #
+    # The fix: snap every mode's stops against the SAME network in a single
+    # `AccessibilityAnalyzer` run, so edges are only ever split once (by the
+    # union of all points), by building one combined distance_matrix whose
+    # `poi_score` values are made unique per mode (via a disjoint numeric
+    # offset) and whose distance columns are the *union* of every mode's own
+    # natural distance steps -- each mode's bucket score is (cheaply)
+    # re-evaluated at every column in the union using that mode's own
+    # `D(t; stop_score)` curve (`accessibility_score`), not just the subset
+    # of columns its own `build_intelligent_distance_matrix` call chose, so
+    # every mode's stops remain scored by their own genuine mode-specific
+    # decay curve at every distance actually searched.
     stops = stops.copy()
-    stops["stop_score_bucket"] = stops["stop_score"].map(bucket_map)
+    if "mode_category" not in stops.columns or stops["mode_category"].isna().any():
+        rtype = stops["route_type"] if "route_type" in stops.columns else pd.Series([None] * len(stops), index=stops.index)
+        stops["mode_category"] = [mode_category(None if pd.isna(rt) else rt) for rt in rtype]
 
+    per_mode_bucket_maps: dict[str, dict[float, float]] = {}
+    per_mode_distance_steps_m: dict[str, list[float]] = {}
+    union_distance_steps_m: set[float] = set()
+    for mode, mode_stops in stops.groupby("mode_category"):
+        _dm, bucket_map, distance_steps_m = build_intelligent_distance_matrix(
+            mode_stops["stop_score"].to_numpy(), mode, region=region, max_distance_m=max_walk_distance_m
+        )
+        per_mode_bucket_maps[mode] = bucket_map
+        per_mode_distance_steps_m[mode] = distance_steps_m
+        union_distance_steps_m.update(distance_steps_m)
+
+    union_steps_m = sorted(union_distance_steps_m)
+    walking_speed_mps = REGIONS[region].walking_speed_mps
+
+    # Disjoint per-mode offset (a full order of magnitude past any real
+    # bucket score, which live in [0, ~1.05]) so one shared `poi_score`
+    # column never collides across modes.
+    mode_offset = {mode: 10.0 * i for i, mode in enumerate(sorted(per_mode_bucket_maps))}
+
+    combined_stop_parts = []
+    combined_matrix_rows: list[dict] = []
+    for mode, mode_stops in stops.groupby("mode_category"):
+        mode_stops = mode_stops.copy()
+        mode_stops["stop_score_bucket"] = mode_stops["stop_score"].map(per_mode_bucket_maps[mode]) + mode_offset[mode]
+        combined_stop_parts.append(mode_stops)
+
+        for bucket_score in sorted(set(per_mode_bucket_maps[mode].values())):
+            row = {"poi_score": bucket_score + mode_offset[mode]}
+            for d_m in union_steps_m:
+                t_min = d_m / walking_speed_mps / 60.0
+                row[str(d_m)] = ceil_to_grid(
+                    accessibility_score(bucket_score, t_min, mode, region=region)
+                )
+            combined_matrix_rows.append(row)
+
+    stops = pd.concat(combined_stop_parts).sort_index()
+    distance_matrix = pl.DataFrame(combined_matrix_rows) if combined_matrix_rows else pl.DataFrame({"poi_score": []})
+
+    # Single analyzer run across every mode's stops together (see the fix
+    # note above) -- edges are snapped/split exactly once, so there is no
+    # cross-run combination step needed at all.
     points = _stops_to_points_of_interest(stops, crs=network.crs)
     network, points = network.snap_points(points)
 
@@ -262,6 +336,21 @@ def compute_level_of_service(
     # edge-interpolated values between matrix grid points, so re-apply the
     # ceiling-to-0.1 rule to the actual output column, not just the matrix
     # cells that fed it.
-    result["level_of_service"] = ceil_to_grid_array(result["access_score"].to_numpy())
+    # 2026-09-23, explicit user request: every 0-1 score is now
+    # displayed/stored on a 0-100 scale. `ceil_to_grid_array` itself is left
+    # untouched (still operates on its native [0, 1] grid -- it's also used
+    # internally elsewhere in this module's own decay-curve/bucket math,
+    # which must stay in [0, 1] for the multiplicative stop_score * D(t)
+    # math to remain correct), so the x100 rescale happens only here, once,
+    # on this function's actual public-contract output column -- everything
+    # downstream (population-weighted means/medians, `code.stats`'s
+    # regression + equity-flag residual/std math, distribution bucketing)
+    # is linear in `level_of_service` and therefore scale-consistent
+    # automatically; `equity_flag`/`equity_flag_thresholds` in particular
+    # need no code change at all, since a regression's residual-vs-std test
+    # is scale-invariant (multiplying y by a constant scales slope,
+    # intercept, residuals, and std together, so which cells land outside
+    # +-1 std is unchanged).
+    result["level_of_service"] = ceil_to_grid_array(result["access_score"].to_numpy()) * 100.0
     result = result.drop(columns=["access_score"])
     return result

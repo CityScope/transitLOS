@@ -5,6 +5,10 @@ Covers `ceil_to_grid`'s ceiling-not-rounding semantics, and
 truly indistinguishable at every chosen distance, every matrix value is on
 the {0, 0.1, ..., 1.0} grid, and a stop_score of exactly 1.0 reaches a
 perfect 1.0 at/near the stop.
+
+**2026-09-28**: `build_intelligent_distance_matrix` now requires a `mode`
+argument (D(t; stop_score)'s t0 is mode-scaled again) -- every call below
+passes `"bus"` unless testing mode sensitivity specifically.
 """
 
 import numpy as np
@@ -33,7 +37,7 @@ from transitlos.scoring.distance_matrix import (
         (0.30, 0.3),
         (0.05, 0.1),
         (1.0, 1.0),
-        (1.2, 1.0),  # stop_score can exceed 1.0 (uncapped speed_score) -- clip
+        (1.2, 1.0),  # stop_score can exceed 1.0 (V(speed)'s ceiling bonus) -- clip
     ],
 )
 def test_ceil_to_grid(value, expected):
@@ -51,7 +55,7 @@ def test_ceil_to_grid_array_matches_scalar():
 
 def test_matrix_values_are_all_on_grid():
     scores = np.random.default_rng(0).beta(2, 3, 200)
-    matrix, bucket_map, distances = build_intelligent_distance_matrix(scores, region="global")
+    matrix, bucket_map, distances = build_intelligent_distance_matrix(scores, "bus", region="global")
     value_cols = [c for c in matrix.columns if c != "poi_score"]
     for col in value_cols:
         for v in matrix[col].to_list():
@@ -66,7 +70,7 @@ def test_buckets_are_truly_output_equivalent():
     # collapse together (there are far more scores here than possible
     # distinct output signatures).
     scores = np.linspace(0.01, 1.0, 300)
-    matrix, bucket_map, distances = build_intelligent_distance_matrix(scores, region="global")
+    matrix, bucket_map, distances = build_intelligent_distance_matrix(scores, "bus", region="global")
     assert matrix.height < len(scores)  # bucketing actually collapsed something
 
     from collections import defaultdict
@@ -81,7 +85,7 @@ def test_buckets_are_truly_output_equivalent():
         row = matrix.filter(matrix["poi_score"] == rep).to_dicts()[0]
         for member in members_by_rep[rep]:
             expected = tuple(
-                ceil_to_grid(accessibility_score(member, d / REGIONS["global"].walking_speed_mps / 60.0, region="global"))
+                ceil_to_grid(accessibility_score(member, d / REGIONS["global"].walking_speed_mps / 60.0, "bus", region="global"))
                 for d in distances
             )
             actual = tuple(row[str(d)] for d in distances)
@@ -89,7 +93,7 @@ def test_buckets_are_truly_output_equivalent():
 
 
 def test_perfect_stop_score_reaches_one_at_plateau():
-    matrix, bucket_map, distances = build_intelligent_distance_matrix([1.0], region="global")
+    matrix, bucket_map, distances = build_intelligent_distance_matrix([1.0], "bus", region="global")
     rep = bucket_map[1.0]
     row = matrix.filter(matrix["poi_score"] == rep).to_dicts()[0]
     assert max(v for k, v in row.items() if k != "poi_score") == pytest.approx(1.0)
@@ -97,32 +101,40 @@ def test_perfect_stop_score_reaches_one_at_plateau():
 
 def test_distances_are_monotonically_increasing():
     scores = np.random.default_rng(1).beta(2, 3, 100)
-    _matrix, _bucket_map, distances = build_intelligent_distance_matrix(scores, region="global")
+    _matrix, _bucket_map, distances = build_intelligent_distance_matrix(scores, "bus", region="global")
     assert distances == sorted(distances)
     assert len(distances) == len(set(distances))
 
 
 def test_empty_scores_returns_empty_matrix():
-    matrix, bucket_map, distances = build_intelligent_distance_matrix([], region="global")
+    matrix, bucket_map, distances = build_intelligent_distance_matrix([], "bus", region="global")
     assert matrix.height == 0
     assert bucket_map == {}
     assert distances == []
 
 
 def test_bucket_representative_gives_same_accessibility_score_signature():
-    # The matrix cell values should equal accessibility_score(rep, t) at the
-    # chosen distances, ceiling-discretized -- not some other formula.
+    # The matrix cell values should equal accessibility_score(rep, t, mode)
+    # at the chosen distances, ceiling-discretized -- not some other formula.
     scores = [0.7]
-    matrix, bucket_map, distances_m = build_intelligent_distance_matrix(scores, region="global")
+    matrix, bucket_map, distances_m = build_intelligent_distance_matrix(scores, "bus", region="global")
     rep = bucket_map[0.7]
     row = matrix.filter(matrix["poi_score"] == rep).to_dicts()[0]
-    from transitlos.scoring.parameters import REGIONS
 
     speed = REGIONS["global"].walking_speed_mps
     for d_m in distances_m:
         t_min = d_m / speed / 60.0
-        expected = ceil_to_grid(accessibility_score(rep, t_min, region="global"))
+        expected = ceil_to_grid(accessibility_score(rep, t_min, "bus", region="global"))
         assert row[str(d_m)] == pytest.approx(expected)
+
+
+def test_different_modes_give_different_distance_columns():
+    # t0_base differs by mode (bus < rail < tram), so the distance columns
+    # chosen for the same stop_score set should differ across modes.
+    scores = [0.3, 0.5, 0.7]
+    _m_bus, _b_bus, distances_bus = build_intelligent_distance_matrix(scores, "bus", region="global")
+    _m_tram, _b_tram, distances_tram = build_intelligent_distance_matrix(scores, "tram", region="global")
+    assert distances_bus != distances_tram
 
 
 def test_max_distance_m_caps_the_search_radius():
@@ -131,11 +143,11 @@ def test_max_distance_m_caps_the_search_radius():
     # cap, no distance step should exceed it, and the cap itself should be
     # the final step with a real (not truncated-early) discretized value.
     scores = [0.3, 0.5, 0.7, 0.9, 1.0]
-    _matrix, _bucket_map, uncapped = build_intelligent_distance_matrix(scores, region="global")
+    _matrix, _bucket_map, uncapped = build_intelligent_distance_matrix(scores, "bus", region="global")
     assert max(uncapped) > 2000
 
     matrix, bucket_map, capped = build_intelligent_distance_matrix(
-        scores, region="global", max_distance_m=2000
+        scores, "bus", region="global", max_distance_m=2000
     )
     assert max(capped) == pytest.approx(2000.0)
     assert all(d <= 2000.0 for d in capped)
@@ -145,9 +157,8 @@ def test_max_distance_m_caps_the_search_radius():
     # tier happened to fall just under the cap.
     rep = bucket_map[1.0]
     row = matrix.filter(matrix["poi_score"] == rep).to_dicts()[0]
-    from transitlos.scoring.parameters import REGIONS
 
     speed = REGIONS["global"].walking_speed_mps
     t_min = 2000.0 / speed / 60.0
-    expected = ceil_to_grid(accessibility_score(rep, t_min, region="global"))
+    expected = ceil_to_grid(accessibility_score(rep, t_min, "bus", region="global"))
     assert row["2000.0"] == pytest.approx(expected)

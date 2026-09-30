@@ -80,7 +80,7 @@ class _FakeFeed:
     def routes(self):
         return pl.DataFrame({
             "route_id": ["ROUTE_BUS", "ROUTE_RAIL"],
-            "route_type": [3, 2],  # 3 = bus, 2 = rail (transitlos.scoring.mode._RAIL_ROUTE_TYPES)
+            "route_type": [3, 2],  # 3 = bus, 2 = rail (transitlos.scoring.mrc._RAIL_ROUTE_TYPES)
             "route_short_name": ["B1", "R1"],
         })
 
