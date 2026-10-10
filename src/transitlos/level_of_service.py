@@ -271,6 +271,16 @@ def compute_level_of_service(
     # of columns its own `build_intelligent_distance_matrix` call chose, so
     # every mode's stops remain scored by their own genuine mode-specific
     # decay curve at every distance actually searched.
+    if len(stops) == 0 or network.edges.height == 0:
+        # No transit stops in reach (or no streets near them): every edge is
+        # unserved (LOS 0).
+        import shapely
+        import geopandas as gpd
+        edges = network.edges
+        geom = shapely.from_wkb(edges["geometry_wkb"].to_numpy())
+        result = gpd.GeoDataFrame(edges.drop("geometry_wkb").to_pandas(), geometry=geom, crs=network.crs)
+        result["level_of_service"] = 0.0
+        return result
     stops = stops.copy()
     if "mode_category" not in stops.columns or stops["mode_category"].isna().any():
         rtype = stops["route_type"] if "route_type" in stops.columns else pd.Series([None] * len(stops), index=stops.index)

@@ -1926,8 +1926,13 @@ def _stops_json_data(stops_gdf: gpd.GeoDataFrame, score_domain: Tuple[float, flo
             "stop_score": _score01(row.get("stop_score")),
             "reliability": reliability_val,
         }
-        records.append(rec)
-    return json.dumps({"records": records, "score_domain": list(score_domain), "blue_scale": STOP_BLUE_HEX})
+        # Compact payload (a nationwide map embeds 100k+ stops): coordinates to ~0.1 m and no null-valued keys
+        # (the client reads absent fields as null).
+        rec["lon"], rec["lat"] = round(rec["lon"], 6), round(rec["lat"], 6)
+        records.append({k: v for k, v in rec.items() if v is not None})
+    return json.dumps(
+        {"records": records, "score_domain": list(score_domain), "blue_scale": STOP_BLUE_HEX}, separators=(",", ":")
+    )
 
 
 def _stops_layer_block(stops_gdf: gpd.GeoDataFrame, score_domain: Tuple[float, float], map_var: Optional[str], layer_control_var: Optional[str]) -> str:
@@ -3328,6 +3333,7 @@ def build_city_map(
     routes_gdf: Optional[gpd.GeoDataFrame] = None,
     region: str = "global",
     skip_tile_build: bool = False,
+    external_tile_writers: Optional[Dict[tuple, Any]] = None,
     development_gdf: Optional[gpd.GeoDataFrame] = None,
     use_pmtiles: bool = True,
     renderer: str = "maplibre",
@@ -3420,6 +3426,10 @@ def build_city_map(
             parameters genuinely behind the map's own data, not a mismatched
             default. Only affects that one tab; every other layer/score is
             unaffected by this value.
+        external_tile_writers: Optional `{(map_kind, level_name): writer}` for levels whose tiles are written
+            externally, e.g. one state at a time for continent-scale levels (`map_kind` is one of
+            "hexagons", "circles", "census", "special", "streets"); see `HierarchyMap.external_tile_writers`.
+            Those levels' frames only supply schema/domains; their geometry is never tiled in-process.
         skip_tile_build: If True, skip regenerating vector tiles entirely
             and reuse whatever already exists on disk under `tiles_dir`
             (added 2026-08-12, for fast HTML/JS/CSS-only iteration). Tile
@@ -3737,6 +3747,11 @@ def build_city_map(
         # a bare slice of the caller's grid would write through to it.
         return gdf[keep].copy()
 
+    def _use_external_writers(hmap, kind: str) -> None:
+        for (k, lvl), fn in (external_tile_writers or {}).items():
+            if k == kind and lvl in hmap.levels:
+                hmap.external_tile_writers[lvl] = fn
+
     # --- "hexagons" shape: h3 polygons colored/opacity'd by poly_style ---
     gh_hex = GeoHierarchy(crs=4326)
     for res in resolutions:
@@ -3767,6 +3782,7 @@ def build_city_map(
         # shape's construction even starts, keeps at most one shape's data
         # resident at a time instead of all of them.
         with contextlib.chdir(out_dir):
+            _use_external_writers(hex_map, "hexagons")
             hex_map.build(free_level_data=True)
             _trim_malloc()
 
@@ -3782,6 +3798,12 @@ def build_city_map(
         gh_circ, levels=resolutions_levels, tiles_dir=str(os.path.join(tiles_dir_rel, "circles")), use_pmtiles=use_pmtiles,
         extract_xyz=(renderer == "folium"),
     )
+    # Res 7 stays drawn (overzoomed, no extra tiling) underneath the finer
+    # levels, so where res 9/11 don't exist (low-density / no-transit areas)
+    # high zoom still shows res 7 instead of a gap.
+    if 7 in resolutions and any(r > 7 for r in resolutions):
+        circ_map.set_fallback_level("h3_7")
+        hex_map.set_fallback_level("h3_7")
     for res in resolutions:
         _res_radius_domains = radius_field_domains_by_res.get(res) or radius_field_domains
         circ_map.configure_level(
@@ -3808,6 +3830,7 @@ def build_city_map(
     _apply_zoom_bands(circ_map, resolutions_levels, zoom_bands)
     if not skip_tile_build:
         with contextlib.chdir(out_dir):
+            _use_external_writers(circ_map, "circles")
             circ_map.build(free_level_data=True)
             _trim_malloc()
 
@@ -3919,6 +3942,7 @@ def build_city_map(
             census_map.set_fallback_level(census_level_names_real[-2])
         if not skip_tile_build:
             with contextlib.chdir(out_dir):
+                _use_external_writers(census_map, "census")
                 census_map.build(free_level_data=True)
                 _trim_malloc()
 
@@ -3948,11 +3972,16 @@ def build_city_map(
             tiles_dir=str(os.path.join(tiles_dir_rel, "special")), use_pmtiles=use_pmtiles,
             extract_xyz=(renderer == "folium"),
             resolutions={name: (0, 25) for name in special_level_names},
+            allow_overlapping_zoom_ranges=True,
         )
         for name in special_level_names:
             gdf = special_levels[name]
             special_map.configure_level(
                 name, style_js=poly_style, popup_fields=_popup_fields(gdf),
+                # Few, very large polygons shown over the full zoom range:
+                # tiling them natively down to z18 explodes (millions of tile
+                # features); MapLibre overzooms this last native zoom instead.
+                native_zoom_range=(0, 10),
                 popup_js=shape_popup_js,
                 maplibre_paint=_score_maplibre_paint("polygon", score_col, score_domain),
             )
@@ -4004,6 +4033,7 @@ def build_city_map(
     streets_map.set_resolution("edges", min_zoom=street_min_zoom, max_zoom=25)
     if not skip_tile_build:
         with contextlib.chdir(out_dir):
+            _use_external_writers(streets_map, "streets")
             streets_map.build(free_level_data=True)
             _trim_malloc()
 
@@ -4212,6 +4242,8 @@ def build_city_map(
                 circle_zoom_bands={res: zoom_bands[f"h3_{res}"] for res in resolutions},
                 special_group_levels=special_level_names or None,
                 special_group_level_labels=special_level_labels,
+                # Zoomed far out, show the states even if another special level is picked.
+                special_group_fallback_level="state" if "state" in special_level_names else None,
             )
             # Item 5 (user feedback, 2026-08-19): stops/routes/labels/popups
             # were entirely absent from the MapLibre page -- `stops_gdf`/
