@@ -1,6 +1,6 @@
 [project]
 name = "transitlos"
-version = "0.1.0"
+version = "1.0.0"
 description = "Transit Level of Service (transitLOS): ties street-network accessibility, transit stops, and population/census data together into a single transit level-of-service accessibility score."
 readme = "README.md"
 requires-python = ">=3.11"
