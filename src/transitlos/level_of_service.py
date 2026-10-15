@@ -141,8 +141,8 @@ def compute_level_of_service(
     """Compute a street-edges GeoDataFrame with a transit-access `level_of_service` column.
 
     Args:
-        aoi: Area of interest for the network and (if `stops` not given)
-            the GTFS feed.
+        aoi: Area of interest (a GeoDataFrame, or an `AreaOfInterest`) for the network and
+            (if `stops` not given) the GTFS feed.
         feed_source: GTFS feed source forwarded to
             `stops.download_and_prepare_stops` if `stops` is not given.
         network: A pre-built `StreetNetwork`; if `None`,
@@ -212,6 +212,9 @@ def compute_level_of_service(
         to `{0, 10, ..., 100}` -- 2026-09-23, explicit user request that
         every 0-1 score be displayed/stored on a 0-100 scale.
     """
+    if not isinstance(aoi, AreaOfInterest):
+        aoi = AreaOfInterest(aoi)  # a plain GeoDataFrame is fine
+
     if network is None:
         network = prepare_street_network(aoi, cache_dir=cache_dir, pbf_path=pbf_path)
 

@@ -97,3 +97,16 @@ api_keys.json
 
 # Test fixtures are code assets: keep them trackable even though they match the types above.
 !tests/**
+
+# --- Caches and generated data. Keep this block LAST: it must come after any "!tests/**"-style re-include. ---
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+**/.ipynb_checkpoints/
+.cache/
+**/*_cache/
+population_data/
+output/
+**/map_tiles/

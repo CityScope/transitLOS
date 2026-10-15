@@ -8,6 +8,7 @@ together into a single transit level-of-service accessibility score. See
 surface re-exported below.
 """
 
+from .workflow import level_of_service_map
 from .api import (
     level_of_service_to_h3,
     compute_level_of_service,
@@ -19,6 +20,7 @@ from .api import (
 )
 
 __all__ = [
+    "level_of_service_map",
     "download_and_prepare_stops",
     "compute_stop_scores",
     "prepare_street_network",
