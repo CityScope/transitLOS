@@ -52,6 +52,56 @@ from pyGTFSHandler.feed import Feed
 _REPRESENTATIVE_DATE_HORIZON_DAYS = 60
 
 
+def pick_analysis_date(feed: Feed, route_types=None) -> date:
+    """Automatically pick the analysis weekday for `feed` (no hard-coded dates needed).
+
+    1. `feed.get_representative_date` over the part of the feed's calendar within
+       `_REPRESENTATIVE_DATE_HORIZON_DAYS` of today (or the whole calendar if that
+       doesn't overlap -- stale/historical feeds).
+    2. Sanity check against total scheduled trips per working day (Mon-Fri, public holidays
+       excluded) in that window: if the pick is a holiday/weekend or has under 80% of the busiest working day's trips (real case: Taipei's `tdx_bus`,
+       a sparse baseline plus a short dense span the station-median score can't tell apart),
+       use the middle date among weekdays with >= 95% of the maximum trips.
+
+    Raises:
+        ValueError: if the feed has no dates to pick from.
+    """
+    cal_lo = getattr(feed.calendar, "min_date", None)
+    cal_hi = getattr(feed.calendar, "max_date", None)
+    today = date.today()
+    lo = hi = None
+    if cal_lo is not None and cal_hi is not None:
+        c_lo = max(cal_lo, today - timedelta(days=_REPRESENTATIVE_DATE_HORIZON_DAYS))
+        c_hi = min(cal_hi, today + timedelta(days=_REPRESENTATIVE_DATE_HORIZON_DAYS))
+        if c_lo <= c_hi:
+            lo, hi = c_lo, c_hi
+    picked = feed.get_representative_date(start_date=lo, end_date=hi, date_type="weekday", route_types=route_types)
+    if picked is None:
+        lo = hi = None
+        picked = feed.get_representative_date(start_date=None, end_date=None, date_type="weekday", route_types=route_types)
+    if picked is None:
+        raise ValueError("feed exposes no service-intensity dates to pick an analysis day from")
+    try:
+        per_service = dict(feed.trips.lf.group_by("service_id").len().collect().iter_rows())
+        days = feed.calendar.get_services_in_date_range(lo, hi, date_type=None)
+        try:  # public holidays (network lookup by the feed's mean stop location); falls back to weekdays only
+            xy = feed.stops.lf.select(pl.col("stop_lon").mean(), pl.col("stop_lat").mean()).collect().row(0)
+            days = feed.calendar.filter_by_date_type(days, "workday", xy[0], xy[1])
+        except Exception as exc:
+            import warnings
+            warnings.warn(f"pick_analysis_date: holiday lookup failed ({exc}); excluding weekends only")
+            days = feed.calendar.filter_by_date_type(days, "weekday", None, None)
+        counts = {str(r[0]): sum(per_service.get(sid, 0) for sid in r[1]) for r in days.select("date", "service_ids").iter_rows()}
+        best = max(counts.values(), default=0)
+        if best > 0 and counts.get(picked.isoformat(), 0) < 0.8 * best:
+            good = sorted(d for d, n in counts.items() if n >= 0.95 * best)
+            picked = date.fromisoformat(good[len(good) // 2])
+    except Exception as exc:  # the guard is best-effort; keep the representative-date pick
+        import warnings
+        warnings.warn(f"pick_analysis_date: sanity check skipped: {exc}")
+    return picked
+
+
 def download_and_prepare_stops(
     feed_source: Union[str, Path, Sequence[Union[str, Path]]],
     aoi: Optional[gpd.GeoDataFrame] = None,
@@ -205,33 +255,7 @@ def download_and_prepare_stops(
         # window doesn't overlap the feed's calendar at all (e.g. a
         # deliberate historical-replay analysis on old GTFS data), so nothing
         # regresses for that case.
-        cal_lo = getattr(feed.calendar, "min_date", None)
-        cal_hi = getattr(feed.calendar, "max_date", None)
-        today = date.today()
-        horizon_lo = today - timedelta(days=_REPRESENTATIVE_DATE_HORIZON_DAYS)
-        horizon_hi = today + timedelta(days=_REPRESENTATIVE_DATE_HORIZON_DAYS)
-        bounded_lo, bounded_hi = None, None
-        if cal_lo is not None and cal_hi is not None:
-            candidate_lo = max(cal_lo, horizon_lo)
-            candidate_hi = min(cal_hi, horizon_hi)
-            if candidate_lo <= candidate_hi:
-                bounded_lo, bounded_hi = candidate_lo, candidate_hi
-
-        analysis_date = feed.get_representative_date(
-            start_date=bounded_lo, end_date=bounded_hi, date_type="weekday", route_types=route_types
-        )
-        if analysis_date is None:
-            # Bounded window found nothing (feed has no near-term service --
-            # e.g. historical data) -- fall back to the original unbounded
-            # search across the feed's full calendar range.
-            analysis_date = feed.get_representative_date(
-                start_date=None, end_date=None, date_type="weekday", route_types=route_types
-            )
-        if analysis_date is None:
-            raise ValueError(
-                "No date_range given and the feed exposes no service-intensity "
-                "dates to pick a representative day from; pass date_range explicitly."
-            )
+        analysis_date = pick_analysis_date(feed, route_types)
         analysis_date = datetime(analysis_date.year, analysis_date.month, analysis_date.day)
 
     headway_lf = feed.get_headway_at_stops(
@@ -436,7 +460,7 @@ def download_and_prepare_stops(
                 # headway/speed restricted to just the dominant mode's own
                 # route_types via 1-2 EXTRA full `feed.get_headway_at_stops`/
                 # `get_speed_at_stops` calls -- correct in principle, but
-                # verified live (2026-08-29, real Concepcion GTFS/BusMaps
+                # verified live (2026-08-29, real Concepcion GTFS
                 # feed) to blow well past 22 GB and get OOM-killed, because
                 # each extra call reprocesses the whole feed's
                 # stop_times/trips joins again. Reverted: this pipeline runs
@@ -692,14 +716,7 @@ def download_and_prepare_stops_per_feed(
                 feed_date_range = explicit_date_range
             if feed_date_range is None:
                 probe_feed = Feed(gtfs_dirs=gtfs_dir, aoi=aoi, route_types=route_types)
-                picked = probe_feed.get_representative_date(
-                    start_date=None, end_date=None, date_type="weekday", route_types=route_types
-                )
-                if picked is None:
-                    raise ValueError(
-                        f"feed {gtfs_dir!r} exposes no service-intensity dates to pick a "
-                        "representative day from"
-                    )
+                picked = pick_analysis_date(probe_feed, route_types)
                 feed_date_range = (picked, picked)
             per_feed_results.append(
                 download_and_prepare_stops(gtfs_dir, **{**kwargs, "date_range": feed_date_range})

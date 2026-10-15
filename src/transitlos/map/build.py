@@ -146,15 +146,21 @@ _POPULATION_COLUMN_CANDIDATES = (
 # A handful of well-known, no-API-key-required tile sources for the
 # background-map dropdown.
 BACKGROUND_MAPS = {
+    # MapLibre vector-tile styles (OpenFreeMap), drawn with maplibre-gl-leaflet.
     "positron": {
-        "label": "CartoDB Positron (light)",
-        "url": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-        "attribution": "&copy; OpenStreetMap contributors &copy; CARTO",
+        "label": "OpenFreeMap Positron (light)",
+        "style": "https://tiles.openfreemap.org/styles/positron",
+        "attribution": "&copy; OpenFreeMap &copy; OpenStreetMap contributors",
     },
-    "dark_matter": {
-        "label": "CartoDB Dark Matter",
-        "url": "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-        "attribution": "&copy; OpenStreetMap contributors &copy; CARTO",
+    "bright": {
+        "label": "OpenFreeMap Bright",
+        "style": "https://tiles.openfreemap.org/styles/bright",
+        "attribution": "&copy; OpenFreeMap &copy; OpenStreetMap contributors",
+    },
+    "dark": {
+        "label": "OpenFreeMap Dark",
+        "style": "https://tiles.openfreemap.org/styles/dark",
+        "attribution": "&copy; OpenFreeMap &copy; OpenStreetMap contributors",
     },
     "osm": {
         "label": "OpenStreetMap",
@@ -2341,6 +2347,9 @@ window.__stopsData = {data_json};
         '<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">\n'
         '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">\n'
         '<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>\n'
+        '<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.13.0/dist/maplibre-gl.css">\n'
+        '<script src="https://unpkg.com/maplibre-gl@5.13.0/dist/maplibre-gl.js"></script>\n'
+        '<script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.1.3/leaflet-maplibre-gl.js"></script>\n'
         "<script>\nwindow.addEventListener('load', function() {\n" + js + "\n});\n</script>\n"
     )
 
@@ -3281,7 +3290,9 @@ function __setBackground(key) {{
   if (!__leafletMap) return;
   if (!__backgroundLayers[key]) {{
     var spec = __backgroundSpecs[key];
-    __backgroundLayers[key] = L.tileLayer(spec.url, {{attribution: spec.attribution, maxZoom: 20, pane: 'basemapPane'}});
+    __backgroundLayers[key] = spec.style
+      ? L.maplibreGL({{style: spec.style, attribution: spec.attribution, pane: 'basemapPane'}})
+      : L.tileLayer(spec.url, {{attribution: spec.attribution, maxZoom: 20, pane: 'basemapPane'}});
   }}
   if (__defaultBasemapSwapped && __backgroundLayers[__activeBackground]) {{
     __leafletMap.removeLayer(__backgroundLayers[__activeBackground]);
@@ -3292,7 +3303,7 @@ function __setBackground(key) {{
     // first user-driven switch OR the one-time swap-in below (so the basemap
     // opacity slider works on the very first drag, not only after the user
     // has changed the background dropdown at least once).
-    __leafletMap.eachLayer(function(layer) {{ if (layer instanceof L.TileLayer) __leafletMap.removeLayer(layer); }});
+    __leafletMap.eachLayer(function(layer) {{ if (layer instanceof L.TileLayer || (L.MaplibreGL && layer instanceof L.MaplibreGL)) __leafletMap.removeLayer(layer); }});
     __defaultBasemapSwapped = true;
   }}
   __backgroundLayers[key].addTo(__leafletMap);
