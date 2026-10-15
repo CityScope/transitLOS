@@ -127,6 +127,7 @@ def compute_level_of_service(
     stops: Optional[gpd.GeoDataFrame] = None,
     region: str = "global",
     cache_dir: Optional[str] = None,
+    cache_by_aoi: bool = False,
     walk_distance_steps: Sequence[float] = (400, 800, 1200),
     weights: Optional[tuple[float, float, float]] = None,
     pbf_path: Optional[str] = None,
@@ -157,6 +158,8 @@ def compute_level_of_service(
             `build_intelligent_distance_matrix` (selects the decay-shape
             defaults `walk_decay`/`accessibility_score` use).
         cache_dir: Passed to `prepare_street_network` for network caching.
+        cache_by_aoi: Passed to `prepare_street_network`: cache entries named after the area, so one `cache_dir`
+            can hold many areas (default `False`).
         walk_distance_steps: **Deprecated/unused by default** as of
             2026-08-12 -- distance thresholds are now derived automatically
             by `build_intelligent_distance_matrix` from transitLOS's own
@@ -216,7 +219,7 @@ def compute_level_of_service(
         aoi = AreaOfInterest(aoi)  # a plain GeoDataFrame is fine
 
     if network is None:
-        network = prepare_street_network(aoi, cache_dir=cache_dir, pbf_path=pbf_path)
+        network = prepare_street_network(aoi, cache_dir=cache_dir, pbf_path=pbf_path, cache_by_aoi=cache_by_aoi)
 
     if stops is None:
         # Buffered (2026-09-04, explicit user request: "for stops and

@@ -8,7 +8,9 @@ together into a single transit level-of-service accessibility score. See
 surface re-exported below.
 """
 
-from .workflow import level_of_service_map
+from geohierarchy import EMPTY_CELL_METHODS, handle_empty_cells, weighted_mean  # hexagons without streets
+
+from .workflow import level_of_service_map, level_of_service_results, top_stops
 from .api import (
     level_of_service_to_h3,
     compute_level_of_service,
@@ -20,7 +22,12 @@ from .api import (
 )
 
 __all__ = [
+    "EMPTY_CELL_METHODS",
+    "handle_empty_cells",
+    "weighted_mean",
     "level_of_service_map",
+    "level_of_service_results",
+    "top_stops",
     "download_and_prepare_stops",
     "compute_stop_scores",
     "prepare_street_network",

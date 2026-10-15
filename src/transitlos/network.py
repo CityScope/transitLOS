@@ -21,15 +21,19 @@ def prepare_street_network(
     pbf_path: Optional[str] = None,
     network_type: str = "all",
     ignore_oneway: bool = True,
+    cache_by_aoi: bool = False,
 ) -> StreetNetwork:
     """Return a simplified, AOI-cropped `StreetNetwork`, using a cache if available.
 
     Args:
-        aoi: Area of interest the network is built/cropped for.
+        aoi: Area of interest (a GeoDataFrame, or an `AreaOfInterest`) the network is built/cropped for.
         cache_dir: Directory to load a previously `.save()`d network from
             (via `StreetNetwork.load`), and to `.save()` a freshly built one
             to. If `None`, no caching is attempted -- the network is always
             rebuilt and never persisted.
+        cache_by_aoi: If ``True`` the cache entry is a subfolder of ``cache_dir`` named after a hash of the area and
+            the settings, so one ``cache_dir`` can hold many areas and a different area never reuses a
+            stale network. Default ``False``: ``cache_dir`` itself is the entry (it must belong to one area).
         cluster_distance: Cluster distance (meters) passed to
             `StreetNetwork.simplify`.
         pbf_path: Path to a local `.osm.pbf` file, forwarded to
@@ -58,6 +62,14 @@ def prepare_street_network(
     Raises:
         ValueError: If no cached network is found and `pbf_path` is `None`.
     """
+    if not isinstance(aoi, AreaOfInterest):
+        aoi = AreaOfInterest(aoi)  # a plain GeoDataFrame is fine
+
+    if cache_dir is not None and cache_by_aoi:
+        from UrbanAccessAnalyzer.utils import aoi_key
+
+        cache_dir = os.path.join(cache_dir, "network_" + aoi_key(aoi.gdf, network_type, cluster_distance, ignore_oneway))
+
     if cache_dir is not None and os.path.isfile(os.path.join(cache_dir, "meta.txt")):
         return StreetNetwork.load(cache_dir)
 

@@ -52,6 +52,9 @@ def level_of_service_to_h3(
     `no_access_value` rather than a null, matching the `fillna(0.0)`
     convention used elsewhere in the downstream pipeline for "no coverage".
 
+    See also :func:`geohierarchy.handle_empty_cells` (re-exported as ``transitlos.handle_empty_cells``): three
+    shared ways (nearest value, relocate population, ignore) to treat hexagons that have people but no street.
+
     Args:
         access_gdf: Street-edges GeoDataFrame with `score_col` (e.g. the
             output of `transitlos.level_of_service.compute_level_of_service`).
