@@ -3329,11 +3329,15 @@ def build_city_map(
     opacity_fields: Optional[List[str]] = None,
     stats_by_area: Optional[Dict[str, gpd.GeoDataFrame]] = None,
     is_us: bool = False,
+    stops_chunks: Optional[Dict[str, gpd.GeoDataFrame]] = None,
     stops_gdf: Optional[gpd.GeoDataFrame] = None,
     routes_gdf: Optional[gpd.GeoDataFrame] = None,
     region: str = "global",
     skip_tile_build: bool = False,
     external_tile_writers: Optional[Dict[tuple, Any]] = None,
+    force_development_tiles: bool = False,
+    force_census_tiles: bool = False,
+    stats_scope_cfg: Optional[dict] = None,
     development_gdf: Optional[gpd.GeoDataFrame] = None,
     use_pmtiles: bool = True,
     renderer: str = "maplibre",
@@ -3940,7 +3944,7 @@ def build_city_map(
         # "no data" should look like.
         if len(census_level_names_real) >= 2 and census_level_names_real[-1] != "census_grid":
             census_map.set_fallback_level(census_level_names_real[-2])
-        if not skip_tile_build:
+        if (not skip_tile_build) or force_census_tiles:  # the latter: rebuild only the census levels that have no external writer
             with contextlib.chdir(out_dir):
                 _use_external_writers(census_map, "census")
                 census_map.build(free_level_data=True)
@@ -4097,7 +4101,7 @@ def build_city_map(
             dev_res = 7 if 7 in dev_candidates else min(dev_candidates, key=lambda r: abs(r - 7))
             dev_gdf = h3_by_resolution[dev_res]
             dev_level = f"h3_{dev_res}"
-            resolve_dev_tiles = not skip_tile_build
+            resolve_dev_tiles = (not skip_tile_build) or force_development_tiles
 
         gh_dev = GeoHierarchy(crs=4326)
         gh_dev.add_level(dev_level, dev_gdf, id_col="h3_cell", agg=Max())
@@ -4173,6 +4177,7 @@ def build_city_map(
         # `skip_tile_build=False` run) both already produce correctly.
         if resolve_dev_tiles:
             with contextlib.chdir(out_dir):
+                _use_external_writers(dev_map, "development")
                 dev_map.build()
 
     # 2026-09-05, explicit user request: "on all maps by default on startup
@@ -4257,6 +4262,7 @@ def build_city_map(
                 stops_gdf=stops_gdf,
                 routes_gdf=routes_gdf,
                 score_domain=score_domain,
+                stops_chunks=stops_chunks,
             )
             if stats_by_area:
                 # computeAccess() port (item 2 of the session's port) --
@@ -4302,6 +4308,10 @@ def build_city_map(
                     census_by_level=census_by_level,
                     country=country,
                 )
+                if stats_scope_cfg:
+                    from .scope_panel import inject_scope_into_saved_html
+
+                    inject_scope_into_saved_html(os.path.basename(out_html_abs), stats_scope_cfg)
                 # Item C (user feedback, round 13): top-center place/
                 # scenario/results bar. Needs `window.__editor` (set by
                 # `_inject_maplibre_editor_into_saved_html` just above) and
@@ -5267,7 +5277,8 @@ function __statsReservedName() {{
 // following the editor's own active scenario -- the MAIN column always
 // calls `getStatsData(area)` with just one argument for exactly this reason.
 function getStatsData(area, scenario) {{
-  var base = window.__statsData[area];
+  var base = (window.__scopeData ? window.__scopeData(area) : window.__statsData[area]);
+  if (window.__scopeNoEdits && window.__scopeNoEdits(area)) return base;  // nation scope: no edit mode
   try {{
     var ed = window.__editor;
     if (!ed || !base || !base.h3_cell || !base.h3_cell.length) return base;
@@ -5317,7 +5328,7 @@ function getStatsData(area, scenario) {{
       var dp = deltaPop[ids[i]];
       var totalPop = pops ? pops[i] : null;
       if (dp && totalPop != null && isFinite(totalPop) && totalPop > 0) {{
-        var rolled = Math.max(0, Math.min(1, oldAccess[i] + dp / totalPop));
+        var rolled = Math.max(0, Math.min(100, oldAccess[i] + dp / totalPop));  // level_of_service is 0-100
         if (rolled !== oldAccess[i]) {{
           if (!newAccess) newAccess = oldAccess.slice();
           newAccess[i] = rolled;
@@ -5341,6 +5352,7 @@ function __fmt(n) {{ return n.toLocaleString(undefined, {{maximumFractionDigits:
 // (baseline) and from any real scenario name -- so it's checked separately
 // from just falsiness (`''` is a legitimate, selectable choice).
 function __secondaryScenarioValue(selId) {{
+  if (window.__scopeActive) return window.__scopeCompareOn() ? 'scope' : 'none';
   var sel = document.getElementById(selId);
   return sel ? sel.value : 'none';
 }}
@@ -5392,6 +5404,7 @@ function __comparePrefix(selId) {{
 // place's editor) -- both read the popover's own "City core / metro area"
 // sub-select when present, falling back to the main panel's current area.
 function __secondaryScenarioData(selId) {{
+  if (window.__scopeActive) return getStatsData('core');
   var prefix = __comparePrefix(selId);
   var areaSel = document.getElementById(prefix + 'CompareAreaSelect');
   var area = areaSel ? areaSel.value : window.__statsArea;
@@ -5698,6 +5711,7 @@ function __secondaryScenarioLabel(sel) {{
 // scenario) so the label always describes whichever source the number
 // actually came from.
 function __secondaryLabel(selId, sel) {{
+  if (window.__scopeActive) return window.__scopeLabel('core');
   var prefix = __comparePrefix(selId);
   var placeSel = document.getElementById(prefix + 'ComparePlaceSelect');
   if (placeSel && placeSel.value) return placeSel.options[placeSel.selectedIndex].text;
@@ -6999,6 +7013,7 @@ window.__jsWeightedMean = __weightedMean;
 // Test/automation hook -- getStatsData is otherwise local to this closure
 // (see the comment above), the same reason __jsStopScore etc. are published.
 window.__getStatsData = getStatsData;
+window.__renderActiveTab = __renderActiveTab;
 // Item 5: the hexagon/circle style functions (`_H3_OVERRIDE_LOOKUP_JS`, a
 // different injected <script>) reuse these exact H3-parent helpers to roll
 // the editor's per-cell overrides up to whatever resolution is currently on
@@ -10253,7 +10268,7 @@ window.__statsData = {stats_data_json};
           var c = lineCostEstimate(line, gradeSeparationFor(line.mode));
           if (c) totalCostMusd += c.total_musd;
         }});
-        var newAccess = base ? (base.access + impact / base.population) : null;
+        var newAccess = base ? (base.access + impact * 100 / base.population) : null;  // impact is in 0-1 points, access is 0-100
         // 2026-09-25, explicit user request: no diagnostic status text
         // ("N cells in buffer, N improved, ...") after Compute -- the real
         // before/after numbers already surface in the top-center bar
@@ -10329,10 +10344,55 @@ window.__statsData = {stats_data_json};
 """
 
 
+_LAZY_STOPS_JS = """
+  // Nationwide maps: the stops are NOT embedded (hundreds of thousands of points freeze the browser). They live in
+  // one JSON file per chunk (state); the chunks intersecting the view are fetched once zoomed in, and the oldest
+  // chunks outside the view are dropped beyond `max_loaded` so memory stays bounded.
+  (function() {
+    var LZ = __LAZY_CFG__;
+    var loaded = {}, order = [], inflight = {};
+    function rebuild() {
+      stopsData.records.length = 0; stopsFC.features.length = 0;
+      order.forEach(function(name) {
+        loaded[name].forEach(function(r) {
+          var i = stopsData.records.length; stopsData.records.push(r);
+          stopsFC.features.push({type: 'Feature', id: i, geometry: {type: 'Point', coordinates: [r.lon, r.lat]}, properties: r});
+        });
+      });
+      window.__refreshStopsData();
+    }
+    function inView(c, b) { return !(c.bbox[0] > b.getEast() || c.bbox[2] < b.getWest() || c.bbox[1] > b.getNorth() || c.bbox[3] < b.getSouth()); }
+    function update() {
+      if (map.getZoom() < LZ.min_zoom) return;
+      var b = map.getBounds(), want = LZ.chunks.filter(function(c) { return inView(c, b); }).map(function(c) { return c.name; });
+      var missing = want.filter(function(n) { return !loaded[n] && !inflight[n]; });
+      if (!missing.length) return;
+      Promise.all(missing.map(function(n) {
+        inflight[n] = true;
+        return fetch(LZ.dir + '/' + n + '.json').then(function(r) { return r.json(); }).then(function(j) {
+          loaded[n] = j.records; order.push(n);
+        }).catch(function(e) { console.warn('stops chunk failed', n, e); }).then(function() { delete inflight[n]; });
+      })).then(function() {
+        while (order.length > LZ.max_loaded) {
+          var drop = order.find(function(n) { return want.indexOf(n) < 0; });
+          if (!drop) break;
+          order.splice(order.indexOf(drop), 1); delete loaded[drop];
+        }
+        rebuild();
+      });
+    }
+    stopsData.records.length = 0; stopsFC.features.length = 0;  // drop the one-record stub the template was built from
+    map.on('moveend', update);
+    if (map.loaded()) update(); else map.once('load', update);
+  })();
+"""
+
+
 def _maplibre_stops_routes_js(
     stops_gdf: Optional[gpd.GeoDataFrame],
     routes_gdf: Optional[gpd.GeoDataFrame],
     score_domain: Tuple[float, float],
+    lazy_stops_cfg: Optional[dict] = None,
 ) -> str:
     """MapLibre-native stops + routes + labels + popups overlay (item 5 of the round-4 port).
 
@@ -10362,12 +10422,15 @@ def _maplibre_stops_routes_js(
     refinements on top of a now-present base layer, not missing content.
     """
     stops_json = _stops_json_data(stops_gdf, score_domain) if stops_gdf is not None and not stops_gdf.empty else None
+    lazy_js = _LAZY_STOPS_JS.replace("__LAZY_CFG__", json.dumps(lazy_stops_cfg)) if lazy_stops_cfg else ""
     routes_json = _routes_geojson_data(routes_gdf) if routes_gdf is not None and not routes_gdf.empty else None
     weights_json = json.dumps(_ROUTE_MODE_WEIGHT)
     mode_fallback_json = json.dumps(MODE_FALLBACK_COLOR)
 
     parts = ["(function() {"]
     parts.append("  if (!map) return;")
+    # Stops-only maps (no routes overlay) still read this in the stop mode filter / route badges.
+    parts.append("  window.__routeModeVisible = window.__routeModeVisible || {bus: true, tram: true, rail: true};")
     parts.append("  function whenReady(fn) { if (map.isStyleLoaded()) fn(); else map.once('load', fn); }")
 
     if routes_json is not None:
@@ -10563,6 +10626,7 @@ def _maplibre_stops_routes_js(
     var src = map.getSource('__stops_overlay');
     if (src) src.setData(stopsFC);
   }};
+  {lazy_js}
   whenReady(function() {{
     // Bug fix (user report): a stop-marker click must never also open the
     // hex/circle/census shape popup underneath it. `geohierarchy`'s
@@ -11291,7 +11355,26 @@ def _routes_geojson_data(routes_gdf: gpd.GeoDataFrame) -> str:
     })
 
 
-def _inject_maplibre_stops_routes_into_saved_html(path: str, stops_gdf, routes_gdf, score_domain: Tuple[float, float]) -> str:
+def _write_lazy_stops_chunks(path: str, chunks: Dict[str, gpd.GeoDataFrame], score_domain, min_zoom: int = 7,
+                             max_loaded: int = 10):
+    """One `stops_chunks/<name>.json` per chunk (same record shape as the embedded stops); returns (stub_gdf, cfg)."""
+    out = os.path.join(os.path.dirname(os.path.abspath(path)), "stops_chunks")
+    os.makedirs(out, exist_ok=True)
+    cfg_chunks, stub = [], None
+    for name, gdf in chunks.items():
+        if gdf is None or gdf.empty:
+            continue
+        with open(os.path.join(out, f"{name}.json"), "w", encoding="utf-8") as f:
+            f.write(_stops_json_data(gdf, score_domain))
+        w, so, e, n = (gdf.to_crs(4326) if gdf.crs is not None else gdf).total_bounds
+        cfg_chunks.append({"name": name, "bbox": [float(w), float(so), float(e), float(n)], "n": int(len(gdf))})
+        if stub is None:
+            stub = gdf.head(1)
+    return stub, {"dir": "stops_chunks", "min_zoom": min_zoom, "max_loaded": max_loaded, "chunks": cfg_chunks}
+
+
+def _inject_maplibre_stops_routes_into_saved_html(path: str, stops_gdf, routes_gdf, score_domain: Tuple[float, float],
+                                                  stops_chunks: Optional[Dict[str, gpd.GeoDataFrame]] = None) -> str:
     """Splice `_maplibre_stops_routes_js`'s stops/routes/labels/popups overlay into a MapLibre `map.html`.
 
     Same "share the page's own `<script>` scope" pattern as
@@ -11299,6 +11382,9 @@ def _inject_maplibre_stops_routes_into_saved_html(path: str, stops_gdf, routes_g
     trailing `</script>\\n</body>` marker so `map` (a `const` declared in
     that same script tag) is already in scope.
     """
+    lazy_cfg = None
+    if stops_chunks:
+        stops_gdf, lazy_cfg = _write_lazy_stops_chunks(path, stops_chunks, score_domain)
     if (stops_gdf is None or stops_gdf.empty) and (routes_gdf is None or routes_gdf.empty):
         return path
     with open(path, "r", encoding="utf-8") as f:
@@ -11354,7 +11440,7 @@ def _inject_maplibre_stops_routes_into_saved_html(path: str, stops_gdf, routes_g
         alt_marker = '<div id="route-toolbar"'
         if alt_marker in html:
             html = html.replace(alt_marker, overlay_controls_html + alt_marker, 1)
-    js = _maplibre_stops_routes_js(stops_gdf, routes_gdf, score_domain)
+    js = _maplibre_stops_routes_js(stops_gdf, routes_gdf, score_domain, lazy_cfg)
     marker = "</script>\n</body>"
     if marker not in html:
         raise ValueError(f"{path}: expected trailing '{marker}' from save_multi_maplibre, not found")
