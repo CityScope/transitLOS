@@ -3286,6 +3286,36 @@ var __backgroundLayers = {{}};
 var __backgroundSpecs = {json.dumps(BACKGROUND_MAPS)};
 var __activeBackground = {json.dumps(DEFAULT_BACKGROUND)};
 var __defaultBasemapSwapped = false;
+// Without WebGL / web workers (e.g. Colab's output frame) MapLibre draws no tiles: after a few seconds
+// swap it for the same OpenFreeMap tiles drawn on canvas (Leaflet.VectorGrid).
+function __watchVectorTiles(key, spec) {{
+  var gl = __backgroundLayers[key], loaded = false;
+  try {{ gl.getMaplibreMap().on('sourcedata', function(e) {{ if (e.tile) loaded = true; }}); }} catch (e) {{}}
+  setTimeout(function() {{
+    if (loaded || __backgroundLayers[key] !== gl) return;
+    var show = __leafletMap.hasLayer(gl);
+    if (show) __leafletMap.removeLayer(gl);
+    function build() {{
+      fetch('https://tiles.openfreemap.org/planet').then(function(r) {{ return r.json(); }}).then(function(tj) {{
+        var st = {{water: {{fill: true, fillColor: '#c8d6e5', fillOpacity: 1, stroke: false, weight: 0}},
+          landcover: {{fill: true, fillColor: '#dfe6d8', fillOpacity: 0.7, stroke: false, weight: 0}},
+          park: {{fill: true, fillColor: '#d5e3cf', fillOpacity: 0.8, stroke: false, weight: 0}},
+          building: {{fill: true, fillColor: '#e2e2e2', fillOpacity: 0.8, stroke: false, weight: 0}},
+          waterway: {{color: '#c8d6e5', weight: 1}}, transportation: {{color: '#ffffff', weight: 1.5, opacity: 1}},
+          boundary: {{color: '#b8b8c8', weight: 1, dashArray: '4 3'}}}};
+        var vg = L.vectorGrid.protobuf(tj.tiles[0], {{
+          vectorTileLayerStyles: new Proxy(st, {{get: function(t, k) {{ return t[k] || []; }}}}),
+          maxNativeZoom: 14, attribution: spec.attribution, pane: 'basemapPane'}});
+        __backgroundLayers[key] = vg;
+        if (show && __activeBackground === key) vg.addTo(__leafletMap);
+      }});
+    }}
+    if (window.L && L.vectorGrid) {{ build(); return; }}
+    var sc = document.createElement('script');
+    sc.src = 'https://unpkg.com/leaflet.vectorgrid@1.3.0/dist/Leaflet.VectorGrid.bundled.min.js';
+    sc.onload = build; document.head.appendChild(sc);
+  }}, 8000);
+}}
 function __setBackground(key) {{
   if (!__leafletMap) return;
   if (!__backgroundLayers[key]) {{
@@ -3293,6 +3323,7 @@ function __setBackground(key) {{
     __backgroundLayers[key] = spec.style
       ? L.maplibreGL({{style: spec.style, attribution: spec.attribution, pane: 'basemapPane'}})
       : L.tileLayer(spec.url, {{attribution: spec.attribution, maxZoom: 20, pane: 'basemapPane'}});
+    if (spec.style) {{ __watchVectorTiles(key, spec); }}
   }}
   if (__defaultBasemapSwapped && __backgroundLayers[__activeBackground]) {{
     __leafletMap.removeLayer(__backgroundLayers[__activeBackground]);
