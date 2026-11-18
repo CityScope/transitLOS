@@ -52,20 +52,33 @@ from pyGTFSHandler.feed import Feed
 _REPRESENTATIVE_DATE_HORIZON_DAYS = 60
 
 
-def pick_analysis_date(feed: Feed, route_types=None) -> date:
-    """Automatically pick the analysis weekday for `feed` (no hard-coded dates needed).
+DAY_TYPES = ("weekday", "saturday", "sunday")
+
+
+def pick_analysis_date(feed: Feed, route_types=None, day_type: str = "weekday") -> date:
+    """Automatically pick the analysis day for `feed` (no hard-coded dates needed): a working weekday, a Saturday or a Sunday.
 
     1. `feed.get_representative_date` over the part of the feed's calendar within
        `_REPRESENTATIVE_DATE_HORIZON_DAYS` of today (or the whole calendar if that
        doesn't overlap -- stale/historical feeds).
-    2. Sanity check against total scheduled trips per working day (Mon-Fri, public holidays
-       excluded) in that window: if the pick is a holiday/weekend or has under 80% of the busiest working day's trips (real case: Taipei's `tdx_bus`,
+    2. Sanity check against total scheduled trips per day of that type (for weekdays: Mon-Fri, public holidays
+       excluded) in that window: if the pick has under 80% of the busiest such day's trips (real case: Taipei's `tdx_bus`,
        a sparse baseline plus a short dense span the station-median score can't tell apart),
-       use the middle date among weekdays with >= 95% of the maximum trips.
+       use the middle date among those days with >= 95% of the maximum trips.
 
     Raises:
         ValueError: if the feed has no dates to pick from.
+
+    Args:
+        feed: A loaded pyGTFSHandler Feed.
+        route_types: Optional route type filter.
+        day_type: "weekday" (default), "saturday" or "sunday".
+
+    Returns:
+        The analysis date.
     """
+    if day_type not in DAY_TYPES:
+        raise ValueError(f"day_type must be one of {DAY_TYPES}, not {day_type!r}")
     cal_lo = getattr(feed.calendar, "min_date", None)
     cal_hi = getattr(feed.calendar, "max_date", None)
     today = date.today()
@@ -75,22 +88,25 @@ def pick_analysis_date(feed: Feed, route_types=None) -> date:
         c_hi = min(cal_hi, today + timedelta(days=_REPRESENTATIVE_DATE_HORIZON_DAYS))
         if c_lo <= c_hi:
             lo, hi = c_lo, c_hi
-    picked = feed.get_representative_date(start_date=lo, end_date=hi, date_type="weekday", route_types=route_types)
+    picked = feed.get_representative_date(start_date=lo, end_date=hi, date_type=day_type, route_types=route_types)
     if picked is None:
         lo = hi = None
-        picked = feed.get_representative_date(start_date=None, end_date=None, date_type="weekday", route_types=route_types)
+        picked = feed.get_representative_date(start_date=None, end_date=None, date_type=day_type, route_types=route_types)
     if picked is None:
         raise ValueError("feed exposes no service-intensity dates to pick an analysis day from")
     try:
         per_service = dict(feed.trips.lf.group_by("service_id").len().collect().iter_rows())
         days = feed.calendar.get_services_in_date_range(lo, hi, date_type=None)
-        try:  # public holidays (network lookup by the feed's mean stop location); falls back to weekdays only
-            xy = feed.stops.lf.select(pl.col("stop_lon").mean(), pl.col("stop_lat").mean()).collect().row(0)
-            days = feed.calendar.filter_by_date_type(days, "workday", xy[0], xy[1])
-        except Exception as exc:
-            import warnings
-            warnings.warn(f"pick_analysis_date: holiday lookup failed ({exc}); excluding weekends only")
-            days = feed.calendar.filter_by_date_type(days, "weekday", None, None)
+        if day_type != "weekday":
+            days = feed.calendar.filter_by_date_type(days, day_type, None, None)
+        else:
+            try:  # public holidays (network lookup by the feed's mean stop location); falls back to weekdays only
+                xy = feed.stops.lf.select(pl.col("stop_lon").mean(), pl.col("stop_lat").mean()).collect().row(0)
+                days = feed.calendar.filter_by_date_type(days, "workday", xy[0], xy[1])
+            except Exception as exc:
+                import warnings
+                warnings.warn(f"pick_analysis_date: holiday lookup failed ({exc}); excluding weekends only")
+                days = feed.calendar.filter_by_date_type(days, "weekday", None, None)
         counts = {str(r[0]): sum(per_service.get(sid, 0) for sid in r[1]) for r in days.select("date", "service_ids").iter_rows()}
         best = max(counts.values(), default=0)
         if best > 0 and counts.get(picked.isoformat(), 0) < 0.8 * best:
@@ -112,9 +128,17 @@ def download_and_prepare_stops(
     by: str = "route_id",
     at: str = "parent_station",
     how: str = "add",
+    scoring: str = "direction_best",
+    speed_method: str = "straight",
+    window_min: float = 15.0,
+    window_direction: str = "both",
     **kwargs,
 ) -> gpd.GeoDataFrame:
     """Load a GTFS feed and build a per-stop headway/speed table.
+
+    `scoring="direction_best"` (default) scores every parent station from the MERGED departures of all routes split in the two directions
+    of travel, searching mode tier x minimum trip speed for the best stop score (`scoring.direction_subset`); `by`/`how` then do not apply
+    and the table already carries `stop_score`. `scoring="route"` is the previous route-level headway (`by`/`how`) with the speed `max`.
 
     `feed_source` is passed straight through to `pyGTFSHandler.feed.Feed`'s
     `gtfs_dirs` constructor argument -- this function does not implement any
@@ -189,6 +213,14 @@ def download_and_prepare_stops(
             good. Verified against the same real Green Line stop: headway
             dropped from 49.68 min to 11.07 min, matching the
             user-confirmed real-world frequency far more closely.
+        speed_method: How the speed at a stop is measured: `"straight"`
+            (default) -- straight-line distance the trip gets from the stop
+            in the window, so winding lines are slower; `"shape"` --
+            distance along the shape (pyGTFSHandler
+            `Feed.get_window_distances`).
+        window_min: Minutes on each side of the stop the speed is measured
+            over (default 15).
+        window_direction: `"both"` (default), `"forward"` or `"backward"`.
         **kwargs: Extra keyword arguments forwarded to `Feed(...)`
             (e.g. `stop_group_distance`, `check_files`).
 
@@ -258,46 +290,60 @@ def download_and_prepare_stops(
         analysis_date = pick_analysis_date(feed, route_types)
         analysis_date = datetime(analysis_date.year, analysis_date.month, analysis_date.day)
 
-    headway_lf = feed.get_headway_at_stops(
-        date=analysis_date, start_time=start_time, end_time=end_time,
-        route_types=route_types, by=by, at=at, how=how,
-        # Explicit, not relying on pyGTFSHandler's own default: combine all
-        # routes serving a stop within each direction (via how="add"), then
-        # keep whichever direction has the better combined headway, rather
-        # than requiring good data in both directions -- see the `how`
-        # docstring above for why this replaced "best".
-        mix_directions=False,
-    )
-    headway_df = headway_lf.collect() if isinstance(headway_lf, pl.LazyFrame) else headway_lf
-    headway_df = headway_df.rename({"headway": "headway_minutes"})
-    headway_df = headway_df.with_columns(pl.lit(None, dtype=pl.Float64).alias("headway_cv"))
+    use_direction_best = scoring == "direction_best" and at == "parent_station"
+    if use_direction_best:
+        stops_df = _direction_best_table(feed, analysis_date, start_time, end_time, speed_method, window_min, window_direction)
+    else:
+        headway_lf = feed.get_headway_at_stops(
+            date=analysis_date, start_time=start_time, end_time=end_time,
+            route_types=route_types, by=by, at=at, how=how,
+            # Explicit, not relying on pyGTFSHandler's own default: combine all
+            # routes serving a stop within each direction (via how="add"), then
+            # keep whichever direction has the better combined headway, rather
+            # than requiring good data in both directions -- see the `how`
+            # docstring above for why this replaced "best".
+            mix_directions=False,
+        )
+        headway_df = headway_lf.collect() if isinstance(headway_lf, pl.LazyFrame) else headway_lf
+        headway_df = headway_df.rename({"headway": "headway_minutes"})
+        headway_df = headway_df.with_columns(pl.lit(None, dtype=pl.Float64).alias("headway_cv"))
 
-    # `get_speed_at_stops` only recognizes how={"max","min","mean"} -- unlike
-    # `get_headway_at_stops`, it has no "add"/"best"/"all" concept (summing
-    # or "best-of" speeds the way headway rates combine doesn't make sense).
-    # **Bug found and fixed 2026-08-12**: this used to be
-    # `"max" if how == "best" else how`, which forwarded the headway `how`
-    # value verbatim whenever it wasn't literally `"best"` -- since this
-    # function's own default `how` changed to `"add"` (see that parameter's
-    # docstring), that meant `get_speed_at_stops(how="add")` was being
-    # called, which silently falls through every branch of that function's
-    # internal `if/elif` chain, leaving its result **ungrouped** (many rows
-    # per stop instead of one) and exploding the downstream
-    # `headway_df.join(speed_df, ...)` into duplicate rows. Speed has no
-    # sensible non-"max" default, so it is now always "max" regardless of
-    # the headway `how`.
-    speed_df = feed.get_speed_at_stops(
-        date=analysis_date, start_time=start_time, end_time=end_time,
-        route_types=route_types, by=by, at=at, how="max",
-    )
-    speed_df = speed_df.rename({"speed": "avg_speed_kmh"})
+        # `get_speed_at_stops` only recognizes how={"max","min","mean"} -- unlike
+        # `get_headway_at_stops`, it has no "add"/"best"/"all" concept (summing
+        # or "best-of" speeds the way headway rates combine doesn't make sense).
+        # **Bug found and fixed 2026-08-12**: this used to be
+        # `"max" if how == "best" else how`, which forwarded the headway `how`
+        # value verbatim whenever it wasn't literally `"best"` -- since this
+        # function's own default `how` changed to `"add"` (see that parameter's
+        # docstring), that meant `get_speed_at_stops(how="add")` was being
+        # called, which silently falls through every branch of that function's
+        # internal `if/elif` chain, leaving its result **ungrouped** (many rows
+        # per stop instead of one) and exploding the downstream
+        # `headway_df.join(speed_df, ...)` into duplicate rows. Speed has no
+        # sensible non-"max" default, so it is now always "max" regardless of
+        # the headway `how`.
+        speed_df = feed.get_speed_at_stops(
+            date=analysis_date, start_time=start_time, end_time=end_time,
+            route_types=route_types, by=by, at=at, how="max",
+            window_min=window_min, distance=speed_method, direction=window_direction,
+        )
+        speed_df = speed_df.rename({"speed": "avg_speed_kmh"})
 
-    join_cols = [c for c in (at, by) if c in headway_df.columns and c in speed_df.columns]
-    stops_df = headway_df.join(
-        speed_df.select(join_cols + ["avg_speed_kmh"]), on=join_cols, how="left"
-    )
+        join_cols = [c for c in (at, by) if c in headway_df.columns and c in speed_df.columns]
+        stops_df = headway_df.join(
+            speed_df.select(join_cols + ["avg_speed_kmh"]), on=join_cols, how="left"
+        )
 
-    if by == "route_id" and "route_id" in stops_df.columns:
+    if use_direction_best and "route_id" in stops_df.columns:
+        routes_lf = feed.routes.lf if hasattr(feed.routes, "lf") else feed.routes
+        routes_df = routes_lf.collect() if isinstance(routes_lf, pl.LazyFrame) else routes_lf
+        name_cols = [c for c in ("route_short_name", "route_long_name") if c in routes_df.columns]
+        if name_cols:
+            label_expr = pl.col("route_short_name") if "route_short_name" in name_cols else pl.col("route_long_name")
+            if len(name_cols) == 2:
+                label_expr = label_expr.fill_null(pl.col("route_long_name"))
+            stops_df = stops_df.join(routes_df.select("route_id", label_expr.fill_null(pl.col("route_id")).alias("route_label")).unique(subset=["route_id"], keep="first"), on="route_id", how="left")
+    elif by == "route_id" and "route_id" in stops_df.columns:
         routes_lf = feed.routes.lf if hasattr(feed.routes, "lf") else feed.routes
         if routes_lf is not None:
             routes_df = routes_lf.collect() if isinstance(routes_lf, pl.LazyFrame) else routes_lf
@@ -592,6 +638,38 @@ def download_and_prepare_stops(
 
     geometry = gpd.points_from_xy(stops_pd["stop_lon"], stops_pd["stop_lat"])
     return gpd.GeoDataFrame(stops_pd, geometry=geometry, crs="EPSG:4326")
+
+
+def _direction_best_table(feed: Feed, analysis_date, start_time, end_time, speed_method="straight", window_min=15.0,
+                          window_direction="both") -> pl.DataFrame:
+    """Parent-station table from `scoring.direction_subset.best_stop_scores_by_direction` in the columns the rest of this function expects."""
+    from .scoring.direction_subset import best_stop_scores_by_direction
+    from .scoring.mrc import mode_category
+
+    day = analysis_date.date() if isinstance(analysis_date, datetime) else analysis_date
+    if hasattr(feed, "dedupe_trips_for_day"):
+        feed.dedupe_trips_for_day(day)
+    routes_obj = feed.routes.lf if hasattr(feed.routes, "lf") else feed.routes
+    routes = (routes_obj.collect() if isinstance(routes_obj, pl.LazyFrame) else routes_obj).select("route_id", "route_type")
+
+    def _mode(rt):
+        try:
+            return mode_category(int(rt))
+        except (TypeError, ValueError):
+            return "bus"
+
+    modes = routes.select("route_id", pl.col("route_type").map_elements(_mode, return_dtype=pl.Utf8).alias("scoring_mode"))
+    best = best_stop_scores_by_direction(feed, day, modes, start_time if isinstance(start_time, time) else start_time.time(), end_time if isinstance(end_time, time) else end_time.time(),
+                                        speed_method=speed_method, window_min=window_min, window_direction=window_direction)
+    if best.empty:
+        raise ValueError("no parent station has a valid headway/speed on the analysis date")
+    canonical = {"bus": 3, "tram": 0, "rail": 2}
+    df = pl.from_pandas(best).rename({"parent_station": "parent_station"})
+    return df.with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("headway_cv"),
+        pl.col("scoring_mode").replace_strict(canonical, default=3, return_dtype=pl.Int64).alias("route_type"),
+        pl.col("route_ids").str.split(";").list.first().alias("route_id"),
+    )
 
 
 def download_and_prepare_stops_per_feed(

@@ -1,0 +1,89 @@
+site_name: transitLOS
+site_description: Transit level-of-service scores and maps
+docs_dir: docs
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: false
+            show_root_heading: false
+            members_order: source
+            filters: ["!^_"]
+            merge_init_into_class: true
+            show_if_no_docstring: false
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.highlight
+nav:
+  - Home: index.md
+  - Flexible, recomputable scoring (`transitlos.flex`): FLEX_SCORING.md
+  - API reference:
+      - Overview: api/index.md
+      - api: api/api.md
+      - cache: api/cache.md
+      - day_check: api/day_check.md
+      - equity: api/equity.md
+      - flex:
+          - Overview: api/flex/index.md
+          - backend: api/flex/backend.md
+          - catchment: api/flex/catchment.md
+          - cells: api/flex/cells.md
+          - core: api/flex/core.md
+          - export: api/flex/export.md
+          - profiles: api/flex/profiles.md
+          - scoring: api/flex/scoring.md
+          - shapes: api/flex/shapes.md
+          - xp_scoring: api/flex/xp_scoring.md
+      - grid_rules: api/grid_rules.md
+      - h3_resample: api/h3_resample.md
+      - level_of_service: api/level_of_service.md
+      - map:
+          - Overview: api/map/index.md
+          - build: api/map/build.md
+          - buildstamp: api/map/buildstamp.md
+          - cell_popup: api/map/cell_popup.md
+          - circle_bands: api/map/circle_bands.md
+          - col_describe: api/map/col_describe.md
+          - col_info: api/map/col_info.md
+          - col_select: api/map/col_select.md
+          - metro_areas: api/map/metro_areas.md
+          - pop_chunks: api/map/pop_chunks.md
+          - pop_range: api/map/pop_range.md
+          - popup_cells: api/map/popup_cells.md
+          - presentation: api/map/presentation.md
+          - ranking_tab: api/map/ranking_tab.md
+          - routes: api/map/routes.md
+          - scope_panel: api/map/scope_panel.md
+      - neighbourhood: api/neighbourhood.md
+      - network: api/network.md
+      - population: api/population.md
+      - scoring:
+          - Overview: api/scoring/index.md
+          - accessibility_score: api/scoring/accessibility_score.md
+          - direction_subset: api/scoring/direction_subset.md
+          - distance_matrix: api/scoring/distance_matrix.md
+          - frequency: api/scoring/frequency.md
+          - mrc: api/scoring/mrc.md
+          - parameters: api/scoring/parameters.md
+          - speed: api/scoring/speed.md
+          - stop_score: api/scoring/stop_score.md
+          - walk_access: api/scoring/walk_access.md
+      - stop_scores: api/stop_scores.md
+      - stop_table: api/stop_table.md
+      - stops: api/stops.md
+      - vehicle_km: api/vehicle_km.md

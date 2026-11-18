@@ -69,7 +69,13 @@ _VALUE_DP = 4
 
 
 def chunk_key(lat: float, lon: float, deg: float = POP_CHUNK_DEG) -> str:
-    """The chunk key covering `(lat, lon)` -- mirrored exactly in the editor JS."""
+    """The chunk key covering `(lat, lon)` -- mirrored exactly in the editor JS.
+
+    Args:
+        lat: Latitude.
+        lon: Longitude.
+        deg: Chunk size (degrees).
+    """
     return f"{math.floor(lat / deg)}_{math.floor(lon / deg)}"
 
 
@@ -178,6 +184,14 @@ def build_population_chunks_from_parquet(
     Reads only the three columns needed (`h3_cell`, `population`,
     `level_of_service`) -- never the WKB geometry column, which on Boston's grid
     is ~4 GB once decoded and is entirely unnecessary here.
+
+    Args:
+        parquet_path: Path of ``h3_grid.parquet``.
+        out_dir: Output folder; ``None`` = next to the file.
+        **kwargs: Passed to ``build_population_chunks``.
+
+    Returns:
+        The chunk manifest.
     """
     import polars as pl
 

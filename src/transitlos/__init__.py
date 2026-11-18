@@ -2,10 +2,8 @@
 
 Ties street-network accessibility (`UrbanAccessAnalyzer`), transit stops
 (`pyGTFSHandler`), and population/census data (`pycensus`/`geohierarchy`)
-together into a single transit level-of-service accessibility score. See
-`report/scoring/SCORING.md` for the underlying scoring methodology
-(`transitlos.scoring`) and `transitlos.api` for the consolidated public
-surface re-exported below.
+together into a single transit level-of-service accessibility score. The scoring formulas are in
+`transitlos.scoring`; `transitlos.api` is the consolidated public surface re-exported below.
 """
 
 from .api import (

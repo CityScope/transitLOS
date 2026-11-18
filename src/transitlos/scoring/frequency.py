@@ -1,29 +1,11 @@
-"""Headway/frequency scoring: converts a service headway into a [0, 1] score.
+"""Headway score `H(headway)`: converts a service headway into a [0, 1] score.
 
-Implements `H(headway)`, scoring.md §2.2: a single, continuous closed-form
-curve whose local elasticity magnitude grows log-linearly with headway, fit
-directly to a real, tiered empirical elasticity table (TCRP Report 95 Ch.9
-Table 9-2, source Lago, Mayworm & McEnroe 1981):
+    H(headway) = 1                                                     for headway <= 5 min
+    H(headway) = (headway / 5)^(-eps5) * exp(-(q / 2) * ln^2(headway / 5))   for headway > 5 min
+        with eps(headway) = p + q * ln(headway), eps5 = eps(5)
 
-    H(headway) = 1.0                                            for headway <= 5 min
-    H(headway) = (headway/5)^(-eps5) * exp(-(q/2)*ln^2(headway/5))   for headway > 5 min
-        where eps(headway) = p + q*ln(headway), eps5 = eps(5)
-
-This is the exact closed-form solution of `d(ln H)/d(ln headway) =
--eps(headway)` when the local elasticity magnitude is log-linear in headway.
-`p`/`q` are a least-squares fit to three geometric-mean-of-band-edges
-representative points (7.07, 22.36, 70.71 min) derived from TCRP 95's three
-elasticity tiers (<10 min: -0.22; 10-50 min: -0.46; >50 min: -0.58).
-
-This is a genuinely different design from the prior version of this module
-(a flat plateau + plain negative-exponential tail, a shape-only design
-choice with no direct empirical fit) -- see scoring.md §2.2 for the full
-derivation, why log-linear elasticity growth beats a fixed exponent or a
-quadratic-in-headway growth rate, and the honesty caveats on the underlying
-1960s-80s North American bus data (small per-tier n, wide SDs).
-
-Cross-checked against `transitLOS/documentation/scoring/scripts/
-compare_methods.py`'s own `H_headway` reference implementation.
+the closed-form solution of `d(ln H) / d(ln headway) = -eps(headway)`: the elasticity of the score to the headway grows with the
+headway. Defaults: `parameters.RegionParameters` (`h_saturation_minutes`, `h_elasticity_p`, `h_elasticity_q`).
 """
 
 from __future__ import annotations
@@ -43,8 +25,7 @@ def frequency_score(
 ) -> float:
     """Compute `H(headway)`, a [0, 1] frequency score from a service headway.
 
-    Below `saturation_minutes` the score is exactly 1.0 (scoring.md §2.2
-    Anchor: 5 min). Above it, the score follows the log-linear-elasticity
+    Below `saturation_minutes` (5 min) the score is exactly 1.0. Above it, the score follows the log-linear-elasticity
     closed form described in the module docstring.
 
     Args:

@@ -1,48 +1,12 @@
-"""Walk-access decay function D(t; stop_score) used to discount stop_score by walk access.
+"""Walk-access decay `D(t; stop_score)`: discounts a stop's score by the walking time to it.
 
-**2026-09-28 restored-coupling rewrite.** Implements scoring.md §1.1/§2.1's
-final form, which reverses the prior version's "D depends on walk time
-alone" simplification back to a genuinely joint function of walk time AND
-stop quality:
-
-    D(t; stop_score) = 1.0                                           for 0 <= t <= t_plateau
-    D(t; stop_score) = (1 + (t - t_plateau) / t0(stop_score))^(-p)   for t > t_plateau
+    D(t; stop_score) = 1                                              for 0 <= t <= t_plateau
+    D(t; stop_score) = (1 + (t - t_plateau) / t0(stop_score))^(-p)    for t > t_plateau
     t0(stop_score)   = t0_base(mode) * (1 + k * stop_score)
 
-`stop_score` is not a second, independently-multiplied factor here -- it
-also sets how quickly access decays with walking time (`t0(stop_score)`), so
-`PTLOS = stop_score * D(t; stop_score)` is a single, integrated function of
-two jointly-relevant inputs, not two independently-computed numbers
-multiplied together. A rider is modeled as tolerating a longer walk to reach
-a higher-quality stop, per Rose, Mulley, Tsai & Hensher (2013)/Mulley, Ho,
-Ho, Hensher & Rose (2018)'s stated-preference finding (riders accept walking
-206-327 m further per 10-min headway reduction, held mode fixed) --
-scoring.md §2.1 is explicit that applying this coupling to the *full*
-composite `stop_score`, not headway alone, is this project's own reasoned
-extension, not something directly measured.
-
-`t0_base` varies **by mode** (scoring.md §2.1 Anchor, from El-Geneidy et al.
-2014 / Wu & El-Geneidy 2026 real walking-distance percentiles): bus ~6.6 min,
-rail/metro ~9.4 min, tram/LRT ~14.55 min -- so `walk_decay` now requires a
-`mode` argument (one of `"bus"`, `"rail"`, `"tram"`; see `mrc.mode_category`)
-in addition to `stop_score`.
-
-The near-doorstep plateau (`t_plateau`, default 200 m / ~2.56 min at
-1.3 m/s) is fixed, NOT stop_score-scaled (scoring.md §2.1 "Anchor": no
-evidence a better stop's "feels like nothing" radius is itself larger).
-
-Still an offset-power form, not plain negative-exponential: literature-
-grounded via Kanafani (1983, quoted in Iacono/Krizek/El-Geneidy 2010) and
-Chen (2015), directly corroborated by El-Geneidy et al. (2014, Montreal,
-N=16,014 trips): plain exponential fits real bus walking-distance data well
-(R^2=0.95) but fits rail/metro data poorly (R^2=0.43) -- rail/metro riders
-tolerate a flatter, slower-thinning falloff than a constant-hazard
-exponential can represent. `p=1.0` (scoring.md §2.1 Hyperparameters) is held
-fixed across modes.
-
-Cross-checked against `transitLOS/documentation/scoring/scripts/
-compare_methods.py`'s own `D_walk`/`t0_of_stop_score` reference
-implementation.
+A better stop decays more slowly (riders walk further to it), so `PTLOS = stop_score * D(t; stop_score)` is one joint function of
+walk time and stop quality. `t0_base` depends on the mode (bus, rail, tram; see `mrc.mode_category`); the plateau (200 m, ~2.56 min
+at 1.3 m/s) and `p = 1` are the same for every mode. Defaults: `parameters.RegionParameters`.
 """
 
 from __future__ import annotations

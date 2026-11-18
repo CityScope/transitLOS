@@ -72,7 +72,7 @@ def test_compute_stop_scores_adds_expected_columns():
 def test_compute_stop_scores_respects_custom_weights():
     # Custom weights only apply to the legacy flat "harmonic"/"geometric"
     # stop_score_mode -- the default "nested" mode has no weight parameter
-    # by construction (scoring.md Section 1.2, 2026-09-29 structure revision).
+    # by construction (2026-09-29 structure revision).
     df = pd.DataFrame(
         {"headway_minutes": [5.0], "headway_cv": [0.1], "avg_speed_kmh": [20.0]}
     )

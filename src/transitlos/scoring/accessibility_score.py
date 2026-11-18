@@ -1,24 +1,9 @@
-"""Top-level PTLOS combining a stop's quality score with mode/quality-coupled walk access.
-
-Implements scoring.md §1.1:
+"""PTLOS of an origin: a stop's quality score times its mode- and quality-coupled walk access.
 
     PTLOS(stop_score, t) = stop_score * D(t; stop_score)
 
-where `stop_score` comes from `stop_score.stop_score` and `D(·; ·)` is the
-walk-access decay function in `walk_access.walk_decay`.
-
-**2026-09-28 restored-coupling rewrite**: reverses the prior version's
-"plain product of two independent factors" design back to the genuinely
-joint form `D(t; stop_score)` -- `stop_score` now also feeds into how
-quickly access decays with walking time (via `walk_decay`'s `mode`-scaled
-`t0(stop_score)`), not just the multiplicative base level in front. See
-`walk_access.py`'s module docstring for the full derivation and honesty
-caveats. This function is therefore now called `accessibility_score` for
-backward-API-name compatibility, but implements what scoring.md calls
-`PTLOS` (the origin-stop composite) -- scoring.md's own scoping note (§1.1)
-is that this is a mobility/service-quality measure, not a full
-accessibility measure; the name is kept here only for continuity with this
-package's existing callers.
+`stop_score` comes from `stop_score.stop_score`, `D` from `walk_access.walk_decay`. It measures service quality from an origin,
+not full accessibility to destinations; the name `accessibility_score` is kept for existing callers.
 """
 
 from __future__ import annotations

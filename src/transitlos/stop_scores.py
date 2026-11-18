@@ -19,7 +19,7 @@ Honesty note: `headway_cv` coming out of `transitlos.stops` is currently
 always null (pyGTFSHandler's `get_headway_at_stops` only exposes a mean
 headway, not its distribution). Rather than silently treating every stop as
 perfectly regular (which would make `mrc.MR_CV(0) == 1.0` for every stop,
-erasing the real, literature-grounded mode-categorical gap), this module
+erasing the mode-categorical gap), this module
 only feeds a real, observed `headway_cv` into `mrc_score`'s optional (b)
 refinement -- rows with a null `headway_cv` fall back to the primary (a)
 mode-categorical default (`MR_mode`) instead, leaving a
@@ -60,7 +60,7 @@ def compute_stop_scores(
             `"geometric"` (the legacy flat three-way mean) -- forwarded to
             `stop_score`. Must be left `None` for the default
             `stop_score_mode="nested"` (see `scoring.stop_score`'s
-            docstring, scoring.md Section 1.2 -- the nested default has no
+            docstring -- the nested default has no
             weight parameter by construction).
         stop_score_mode: Forwarded to `scoring.stop_score` as `mode`.
             Defaults to `"nested"` (`sqrt(MRC*V)*H`, 2026-09-29 default).

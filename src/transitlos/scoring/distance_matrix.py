@@ -26,7 +26,7 @@ previous pipeline deliberately never called `walk_access.walk_decay` because
 decay. This module resolves that by building the `distance_matrix` argument
 `AccessibilityAnalyzer.run` expects *from* `transitlos.scoring`'s own
 `accessibility_score`, so the isochrone engine now runs transitLOS's
-literature-grounded decay instead of `default_distance_matrix`'s generic one.
+own decay instead of `default_distance_matrix`'s generic one.
 
 "Intelligent discretization" (the user's phrase) means two distinct things,
 both implemented here:
@@ -35,8 +35,7 @@ both implemented here:
    inside the matrix and (via `ceil_to_grid`) as a post-processing safety
    net on the final per-edge result -- is ceiling-rounded onto the fixed
    grid `{0.0, 0.1, 0.2, ..., 1.0}` (e.g. 0.91 -> 1.0, not rounded to
-   nearest). This is a deliberate design choice for output legibility, not
-   a literature-grounded number.
+   nearest), for legible output.
 2. **Input side (run-count minimization)**: rather than accept whatever
    flat `walk_distance_steps` convention the caller passes, this module
    *derives* distance thresholds by inverting `walk_decay` at the midpoint
@@ -105,7 +104,15 @@ def ceil_to_grid(value: float, step: float = OUTPUT_GRID_STEP) -> float:
 
 
 def ceil_to_grid_array(values: np.ndarray, step: float = OUTPUT_GRID_STEP) -> np.ndarray:
-    """Vectorized `ceil_to_grid`, for a final safety-net pass over a whole level_of_service column."""
+    """Vectorized `ceil_to_grid`, for a final safety-net pass over a whole level_of_service column.
+
+    Args:
+        values: Scores.
+        step: Grid step.
+
+    Returns:
+        Scores rounded up to the grid, clipped to [0, 1].
+    """
     arr = np.asarray(values, dtype=float)
     out = np.ceil(arr / step - 1e-9) * step
     return np.clip(out, 0.0, 1.0).round(6)

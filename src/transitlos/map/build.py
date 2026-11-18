@@ -28,6 +28,7 @@ import ctypes
 import gc
 import warnings
 import json
+from .pop_range import POP_RANGE_JS as _POP_RANGE_JS
 import glob
 import os
 import re
@@ -69,6 +70,7 @@ def _trim_malloc() -> None:
         pass
 import shapely
 
+from .buildstamp import write_stamped
 from .routes import MODE_FALLBACK_COLOR
 from .pop_chunks import GEOID_CHUNK_DIRNAME, POP_CHUNK_DEG, POP_CHUNK_DIRNAME
 
@@ -193,7 +195,7 @@ DEFAULT_BACKGROUND = "positron"
 # Zoom at or above which each mode's transit lines become visible. Rail is
 # the coarsest, city-shaping network so it appears first; bus is by far the
 # densest and would turn the map into spaghetti at anything but close zoom.
-ROUTE_MODE_MIN_ZOOM = {"rail": 12, "tram": 13, "bus": 14}
+ROUTE_MODE_MIN_ZOOM = {"rail": 10, "tram": 11, "bus": 12}   # 2026-11-13: one zoom level earlier (user request)
 
 # Zoom at or above which the optional per-stop text annotations ("stop names"
 # / "routes" checkboxes) render. Deliberately high: these are per-stop DOM
@@ -202,8 +204,9 @@ ROUTE_MODE_MIN_ZOOM = {"rail": 12, "tram": 13, "bus": 14}
 STOP_ANNOTATION_MIN_ZOOM = 16
 
 # Line weight per mode -- rail heaviest, bus lightest, so the network
-# hierarchy reads at a glance even when all three modes are on.
-_ROUTE_MODE_WEIGHT = {"rail": 4.0, "tram": 3.0, "bus": 2.0}
+# hierarchy reads at a glance even when all three modes are on (user 2026-11-17: bus thinner than tram, tram thinner than rail on
+# every map; 1.2 / 1.7 / 2.2 with a constant-width casing looked alike, so the steps are wider and the casing scales with the line).
+_ROUTE_MODE_WEIGHT = {"rail": 3.2, "tram": 2.0, "bus": 1.0}
 
 
 def _color_interp_js() -> str:
@@ -502,7 +505,7 @@ def _shape_popup_js() -> str:
         # axis labels), so a field reads the same human, cross-country
         # -comparable name everywhere on the page, not just in dropdowns.
         "var __SOURCE_PREFIXES = ['acs5_','acs3_','acs1_','dhc_','lodes_wac_','lodes_rac_',\n"
-        "  'inegi_','ine_cl_','ine_','cbs_','eustat_','statcan_','moi_','estadisticaad_',\n"
+        "  'inegi_','ine_cl_','ine_','cbs_','eustat_','statcan_','moi_','estadisticaad_','ushs_','usrc_',\n"
         "  'worldpop_','destatis_','ba_'];\n"
         "function __stripSourcePrefix(key) {\n"
         "  var k = String(key || '');\n"
@@ -511,11 +514,21 @@ def _shape_popup_js() -> str:
         "  }\n"
         "  return k;\n"
         "}\n"
+        "var __SOURCE_NAMES = {'acs5_':'ACS 5-year','acs3_':'ACS 3-year','acs1_':'ACS 1-year','dhc_':'Decennial census','lodes_wac_':'LODES workplace',\n"
+        "  'lodes_rac_':'LODES residence','inegi_':'INEGI','ine_cl_':'INE Chile','ine_':'INE','cbs_':'CBS','eustat_':'Eustat','statcan_':'StatCan',\n"
+        "  'moi_':'MOI','estadisticaad_':'Estadistica AD','usrc_':'US Religion Census','worldpop_':'WorldPop','destatis_':'Destatis','ba_':'BA'};\n"
+        "function __sourceLabel(key) {\n"
+        "  var k = String(key || '');\n"
+        "  for (var i = 0; i < __SOURCE_PREFIXES.length; i++) {\n"
+        "    if (k.indexOf(__SOURCE_PREFIXES[i]) === 0) return __SOURCE_NAMES[__SOURCE_PREFIXES[i]] || __SOURCE_PREFIXES[i];\n"
+        "  }\n"
+        "  return 'derived';\n"
+        "}\n"
         "function __humanizeFieldName(name) {\n"
         # Mirrors `_FIELD_LABEL_OVERRIDES` (Python side, see
         # `_humanize_field_name`'s docstring) -- see the identical fix's
         # comment on the second copy of this function, below.
-        "  var __FIELD_LABEL_OVERRIDES = {'educationMeanGrade': 'Average years of schooling'};\n"
+        "  var __FIELD_LABEL_OVERRIDES = " + _flo_js() + ";\n"
         "  if (Object.prototype.hasOwnProperty.call(__FIELD_LABEL_OVERRIDES, name)) return __FIELD_LABEL_OVERRIDES[name];\n"
         "  var words = (String(name).replace(/_/g, ' ').match(/[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\\d+/g)) || [];\n"
         "  if (!words.length) return name;\n"
@@ -527,11 +540,15 @@ def _shape_popup_js() -> str:
         "    var head = words.slice(0, -1).map(function(w) { return w.toLowerCase(); }).join(' ');\n"
         "    return head.charAt(0).toUpperCase() + head.slice(1) + ' population';\n"
         "  }\n"
+        "  if (words.length > 1 && ['mean', 'median', 'avg', 'average'].indexOf(last) >= 0) words = [words[words.length - 1]].concat(words.slice(0, -1));\n"
         "  var joined = words.map(function(w) { return w.toLowerCase(); }).join(' ');\n"
         "  return joined.charAt(0).toUpperCase() + joined.slice(1);\n"
         "}\n"
+        f"var __GLOBAL_TWINS = {json.dumps(_global_twins())};\n"
         "function __fieldLabel(key) {\n"
-        "  return __humanizeFieldName(__stripSourcePrefix(key)) + __fieldUnitSuffix(key);\n"
+        "  var base = (window.__PY_FIELD_LABELS && window.__PY_FIELD_LABELS[key]) || __humanizeFieldName(__stripSourcePrefix(key)), loc = __GLOBAL_TWINS[key];\n"
+        "  if (/^(population_(over|under)estimation_vs_census|worldpop_(over|under)estimation_share)$/.test(key)) return base;\n"
+        "  return (base + __fieldUnitSuffix(key)).replace(/\\bJobs\\b/g, 'Workplaces').replace(/\\bjobs\\b/g, 'workplaces');\n"
         "}\n"
         # 2026-09-29 real bug fix (user report: Beersheba's ANOVA plot shows
         # two identical "Population density (pop/km2)" rows/bars -- e.g. a
@@ -552,7 +569,10 @@ def _shape_popup_js() -> str:
         "  var counts = {};\n"
         "  Object.keys(labels).forEach(function(f) { var l = labels[f]; counts[l] = (counts[l] || 0) + 1; });\n"
         "  var out = {};\n"
-        "  fields.forEach(function(f) { out[f] = (counts[labels[f]] > 1) ? (labels[f] + ' (' + f + ')') : labels[f]; });\n"
+        "  fields.forEach(function(f) { out[f] = (counts[labels[f]] > 1) ? (labels[f] + ' \\u00b7 ' + __sourceLabel(f)) : labels[f]; });\n"
+        "  var again = {};\n"
+        "  Object.keys(out).forEach(function(f) { again[out[f]] = (again[out[f]] || 0) + 1; });\n"
+        "  Object.keys(out).forEach(function(f) { if (again[out[f]] > 1) out[f] += ' (' + (__GLOBAL_TWINS[f] ? 'global name' : f.replace(/_/g, ' ')) + ')'; });\n"
         "  return out;\n"
         "}\n"
         "function __shapePopupRow(label, value, strong) {\n"
@@ -758,6 +778,8 @@ def _numeric_field_candidates(gdf: gpd.GeoDataFrame, extra_exclude: Sequence[str
     for col in gdf.columns:
         if col in exclude:
             continue
+        if col in _WORLDPOP_DIFF_FIELDS and gdf[col].notna().sum() == 0:   # no real census to compare (constant): not a usable column
+            continue
         try:
             if np.issubdtype(gdf[col].dtype, np.number):
                 fields.append(col)
@@ -854,14 +876,37 @@ _RELATIVE_MARKERS = (
 )
 
 
+# Columns a caller declares intensive although their names carry no marker (e.g. `rent_m2_p25_vc_2024`, `realPriceSaleM2_2025`).
+EXTRA_RELATIVE_FIELDS: set = set()
+
+
+def register_relative_fields(names) -> None:
+    """Declare columns as relative (intensive) values: offered for colour/opacity/regression, never as a count (circle size, distribution).
+
+    Args:
+        names: Column names.
+    """
+    EXTRA_RELATIVE_FIELDS.update(str(n) for n in names)
+
+
 def is_relative_field(col: str) -> bool:
-    """True if `col`'s name marks it as a share/rate/density/median-style intensive value."""
+    """True if `col`'s name marks it as a share/rate/density/median-style intensive value.
+
+    Args:
+        col: Column name.
+    """
+    if str(col) in EXTRA_RELATIVE_FIELDS:
+        return True
     name = str(col).lower()
     return any(marker in name for marker in _RELATIVE_MARKERS)
 
 
 def relative_fields(fields: Sequence[str]) -> List[str]:
-    """`fields` filtered to relative (share/rate/density/...) columns, order preserved."""
+    """`fields` filtered to relative (share/rate/density/...) columns, order preserved.
+
+    Args:
+        fields: Column names.
+    """
     return [f for f in fields if is_relative_field(f)]
 
 
@@ -872,7 +917,11 @@ def relative_fields(fields: Sequence[str]) -> List[str]:
 # the column name decides the unit, so newly-added pipeline columns pick up
 # the right one automatically.
 def field_unit_suffix(col: str) -> str:
-    """`" (pop/km²)"`, `" (%)"`, `" (min)"`, `" (km/h)"`, or `""` -- appended to a field's display label."""
+    """`" (pop/km²)"`, `" (%)"`, `" (min)"`, `" (km/h)"`, or `""` -- appended to a field's display label.
+
+    Args:
+        col: Column name.
+    """
     name = str(col).lower()
     if "density" in name:
         return " (pop/km²)"
@@ -894,7 +943,7 @@ def field_unit_suffix(col: str) -> str:
 # ask, stripping the prefix (in display text only, never in the underlying
 # column key) surfaces the field's real *global_schema.json* name whenever
 # one exists, since this project's whole cross-country renaming effort (see
-# `pycensus/IMPLEMENTING_A_COUNTRY.md`) already made e.g. `inegi_population`/
+# `pycensus/docs/AGENT_GUIDE_NEW_CITY_OR_COUNTRY.md`) already made e.g. `inegi_population`/
 # `acs5_population`/`cbs_population` share the exact same logical name
 # (`population`) -- the prefix was the only thing making them look
 # different. A field with no canonical global_schema equivalent (e.g.
@@ -904,7 +953,7 @@ def field_unit_suffix(col: str) -> str:
 _SOURCE_PREFIXES = (
     "acs5_", "acs3_", "acs1_", "dhc_", "lodes_wac_", "lodes_rac_",
     "inegi_", "ine_cl_", "ine_", "cbs_", "eustat_", "statcan_", "moi_",
-    "estadisticaad_",
+    "estadisticaad_", "usrc_", "ushs_",
     # 2026-09-23 fix: these three were missing here even though
     # `_METADATA_SOURCE_INFO` below (a documented superset) already listed
     # them -- meant every `worldpop_`/`destatis_`/`ba_`-prefixed column
@@ -913,11 +962,38 @@ _SOURCE_PREFIXES = (
     # description lookup always missed and silently fell back to the
     # humanized column name instead of the real schema definition.
     "worldpop_", "destatis_", "ba_",
+    "cbscommute_", "inegimov_",
 )
 
 
+_SOURCE_NAMES = {
+    "acs5_": "ACS 5-year", "acs3_": "ACS 3-year", "acs1_": "ACS 1-year", "dhc_": "Decennial census",
+    "lodes_wac_": "LODES workplace", "lodes_rac_": "LODES residence", "inegi_": "INEGI", "ine_cl_": "INE Chile",
+    "ine_": "INE", "cbs_": "CBS", "eustat_": "Eustat", "statcan_": "StatCan", "moi_": "MOI",
+    "estadisticaad_": "Estadistica AD", "worldpop_": "WorldPop", "destatis_": "Destatis", "ba_": "BA",
+    "usrc_": "US Religion Census",
+    "cbscommute_": "CBS census 2022 (mode to work)", "inegimov_": "INEGI Censo 2020 (movilidad)",
+}
+
+
+def source_label(col: str) -> str:
+    """Display name of the dataset a column comes from ("derived" for pipeline-computed, unprefixed columns).
+
+    Args:
+        col: Column name.
+    """
+    for prefix in _SOURCE_PREFIXES:
+        if col.startswith(prefix):
+            return _SOURCE_NAMES.get(prefix, prefix)
+    return "derived"
+
+
 def strip_source_prefix(col: str) -> str:
-    """`col` with its known census-source prefix removed, or `col` unchanged if none matches."""
+    """`col` with its known census-source prefix removed, or `col` unchanged if none matches.
+
+    Args:
+        col: Column name.
+    """
     for prefix in _SOURCE_PREFIXES:
         if col.startswith(prefix):
             return col[len(prefix):]
@@ -949,9 +1025,12 @@ _METADATA_SOURCE_INFO: Dict[str, Tuple[str, str]] = {
     "statcan_": ("Statistics Canada", "dissemination block"),
     "moi_": ("Ministry of Interior", "locality"),
     "estadisticaad_": ("Departament d'Estadistica (Andorra)", "parish"),
+    "usrc_": ("US Religion Census 2020 (ASARB)", "county"),
     "destatis_": ("Destatis (Germany)", "municipality"),
     "ba_": ("Bundesagentur fuer Arbeit (Germany)", "municipality"),
     "worldpop_": ("WorldPop", "100m grid"),
+    "cbscommute_": ("CBS (Israel), Census 2022 public-use file: means of transport to work", "sub-quarter / locality"),
+    "inegimov_": ("INEGI (Mexico), Censo 2020 cuestionario ampliado: movilidad cotidiana", "municipality"),
 }
 
 
@@ -971,8 +1050,64 @@ def _source_prefix_for(col: str) -> str:
     return ""
 
 
+#: `{bare global column name: source prefix it was renamed from}`, filled by the study pipeline when it renames census columns to bare
+#: global-schema names (so the Metadata tab still shows the census source instead of "Derived by this study").
+BARE_COLUMN_SOURCE_PREFIX: Dict[str, str] = {}
+#: JSON file the study pipeline keeps that mapping in (so map-only rebuilds from cached grids still know the sources).
+BARE_COLUMN_SOURCE_FILE: Optional[str] = None
+
+
+#: ISO3 country -> [(pycensus country folder, schema source, column prefix)] in priority order, used to tell which census source a
+#: bare-named global-schema column came from.
+_COUNTRY_SOURCES = {
+    "USA": [("usa", "dhc", "dhc_"), ("usa", "acs5", "acs5_"), ("usa", "lodes_wac", "lodes_wac_"), ("usa", "religion", "usrc_")],
+    "MEX": [("mexico", "inegi", "inegi_")],
+    "DEU": [("germany", "destatis", "destatis_"), ("germany", "ba_pendler", "ba_pendler_")],
+    "ESP": [("euskadi", "eustat_municipal", "eustat_"), ("euskadi", "eustat", "eustat_"), ("spain", "adrh", "ine_"),
+            ("spain", "censo2021", "censo2021_"), ("spain", "ine", "ine_")],
+    "ISR": [("israel", "cbs", "cbs_"), ("israel", "cbs_commute", "cbscommute_")],
+    "CAN": [("canada", "toronto", "statcan_"), ("canada", "statcan", "statcan_")],
+    "AND": [("andorra", "estadisticaad", "estadisticaad_")],
+    "TWN": [("taiwan", "moi", "moi_")],
+    "CHL": [("chile", "ine_manzana", "ine_cl_"), ("chile", "ine", "ine_cl_")],
+}
+_SCHEMA_FEATURES_CACHE: Dict[Tuple[str, str], set] = {}
+
+
+def _infer_bare_prefix(col: str, country: Optional[str]) -> str:
+    """Prefix of the first source schema of ``country`` that defines feature ``col`` ('' if none)."""
+    try:
+        import pycensus
+    except ImportError:
+        return ""
+    for folder, source, prefix in _COUNTRY_SOURCES.get(country or "", []):
+        key = (folder, source)
+        if key not in _SCHEMA_FEATURES_CACHE:
+            path = os.path.join(os.path.dirname(pycensus.__file__), "countries", folder, "schema", f"{source}_schema.json")
+            try:
+                with open(path, encoding="utf-8") as f:
+                    _SCHEMA_FEATURES_CACHE[key] = {e["feature_name"] for e in json.load(f).get("features", [])}
+            except (OSError, ValueError):
+                _SCHEMA_FEATURES_CACHE[key] = set()
+        if col in _SCHEMA_FEATURES_CACHE[key]:
+            return prefix
+    return ""
+
+
+def _load_bare_sources() -> None:
+    if BARE_COLUMN_SOURCE_FILE and os.path.isfile(BARE_COLUMN_SOURCE_FILE):
+        try:
+            with open(BARE_COLUMN_SOURCE_FILE) as f:
+                for k, v in json.load(f).items():
+                    BARE_COLUMN_SOURCE_PREFIX.setdefault(k, v)
+        except (OSError, ValueError):
+            pass
+
+
 def _metadata_source_for(col: str) -> Tuple[str, str]:
     """`(source label, highest real resolution level)` for a real census/WorldPop column, else `("", "")`."""
+    if re.match(r"^\d{4}_(president|senate)_", col):
+        return ("MIT Election Data and Science Lab (MEDSL)", "county")
     for prefix, info in _METADATA_SOURCE_INFO.items():
         if col.startswith(prefix):
             return info
@@ -995,6 +1130,14 @@ def _metadata_source_for(col: str) -> Tuple[str, str]:
 # them as real published census fields. Keyed by the post-`strip_source_prefix`
 # logical name, same as `_global_schema_definitions`/`_per_country_schema_definitions`.
 _PIPELINE_DERIVED_DESCRIPTIONS: Dict[str, str] = {
+    "area_m2": "Area of the grid cell in square metres.",
+    "pop_density": "Residents per square kilometre of cell area (population / cell area).",
+    "pop_jobs_total": "Residents plus jobs located in the cell (the cell's total daily activity).",
+    "pop_jobs_density": "Residents plus jobs per square kilometre of cell area.",
+    "jobs_density": "Jobs located in the cell per square kilometre of cell area.",
+    "residents": "WorldPop's resident population estimate for the cell, the figure compared against the real census count to measure over- and underestimation.",
+    "census_residents": "Residents counted by the national census for the area covering the cell, disaggregated to the cell; the reference for WorldPop's over- and underestimation.",
+    "foreignBornPopulation": "Residents born abroad: the census share of foreign-born residents applied to the cell's population (derived).",
     "population_density": "WorldPop-derived population per square kilometer (population / cell area).",
     "overestimation": "How much MORE the WorldPop raster estimates for this cell than the real census count covering it (max(0, WorldPop population - census population)); zero where WorldPop is at or below the census figure.",
     "underestimation": "How much LESS the WorldPop raster estimates for this cell than the real census count covering it (max(0, census population - WorldPop population)); zero where WorldPop is at or above the census figure.",
@@ -1010,7 +1153,7 @@ def _global_schema_definitions() -> Dict[str, str]:
     """`{feature_name: definition}` from pyCensus's `global_schema.json`, memoized.
 
     Reused (not re-typed) for the Metadata tab's description column, per the
-    project's own anti-fabrication rule (`pyCensus/IMPLEMENTING_A_COUNTRY.md`):
+    project's own anti-fabrication rule (`pyCensus/docs/AGENT_GUIDE_NEW_CITY_OR_COUNTRY.md`):
     a description should come from the one real schema file that already
     documents each canonical field, not a second hand-maintained copy that
     can drift from it. Returns `{}` (never raises) if `pycensus` isn't
@@ -1032,6 +1175,34 @@ def _global_schema_definitions() -> Dict[str, str]:
 
 
 _PER_COUNTRY_SCHEMA_DEFINITIONS_CACHE: Optional[Dict[Tuple[str, str], str]] = None
+
+
+_PER_COUNTRY_SCHEMA_ORIGINALS_CACHE: Optional[Dict[Tuple[str, str], str]] = None
+
+
+def _per_country_schema_originals() -> Dict[Tuple[str, str], str]:
+    """`{(source_prefix, feature_name): original_name}` -- the source's own variable name(s) / derivation, from the pyCensus schemas."""
+    global _PER_COUNTRY_SCHEMA_ORIGINALS_CACHE
+    if _PER_COUNTRY_SCHEMA_ORIGINALS_CACHE is None:
+        result: Dict[Tuple[str, str], str] = {}
+        try:
+            import pycensus
+
+            countries_dir = os.path.join(os.path.dirname(pycensus.__file__), "countries")
+            for schema_path in glob.glob(os.path.join(countries_dir, "*", "schema", "*_schema.json")):
+                prefix = os.path.basename(schema_path)[: -len("_schema.json")] + "_"
+                try:
+                    with open(schema_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    continue
+                for feat in (data.get("features") if isinstance(data, dict) else data) or []:
+                    if feat.get("feature_name") and feat.get("original_name"):
+                        result.setdefault((prefix, feat["feature_name"]), feat["original_name"])
+        except Exception:
+            result = {}
+        _PER_COUNTRY_SCHEMA_ORIGINALS_CACHE = result
+    return _PER_COUNTRY_SCHEMA_ORIGINALS_CACHE
 
 
 def _per_country_schema_definitions() -> Dict[Tuple[str, str], str]:
@@ -1115,6 +1286,27 @@ def _resampling_methods_for(col: str) -> Tuple[str, str]:
     return "sum", "proportional split (area- or population-weighted share of the parent total)"
 
 
+from .col_info import col_info_script as _col_info_script  # noqa: E402
+from .col_describe import describe_column as _describe_column, is_weak as _description_is_weak  # noqa: E402
+from .col_select import column_select_script as _column_select_script  # noqa: E402
+from .presentation import presentation_script as _presentation_script  # noqa: E402
+
+
+def _info_only_meta(fields, metadata_rows) -> Dict[str, Dict[str, str]]:
+    """Info-button metadata for every map field that has no metadata row (shares folded into their count's row, derived rates)."""
+    have = {r.get("column") for r in metadata_rows or []}
+    out: Dict[str, Dict[str, str]] = {}
+    for col in fields:
+        if col in have:
+            continue
+        logical = strip_source_prefix(col)
+        source = _metadata_source_for(col)[0] or ("WorldPop" if col.startswith("worldpop_") else "Derived by this study")
+        label = field_label(col)
+        desc = _PIPELINE_DERIVED_DESCRIPTIONS.get(logical) or _describe_column(col, label, source, logical)
+        out[col] = {"name": label, "source": source, "level": "", "description": desc, "unit": (field_unit_suffix(col).strip(" ()")), "original": col}
+    return out
+
+
 def _column_metadata_rows(
     gdf,
     share_source_map: Optional[Dict[str, Tuple[str, str]]] = None,
@@ -1169,14 +1361,22 @@ def _column_metadata_rows(
     absolute-count counterpart on this grid, like `poverty_share`) still
     gets its own row, as before -- nothing is silently dropped.
     """
+    _load_bare_sources()
     weight_col = "population" if "population" in gdf.columns else None
     weights = gdf[weight_col].to_numpy(dtype=float) if weight_col else None
     definitions = _global_schema_definitions()
     per_country_definitions = _per_country_schema_definitions()
+    per_country_originals = _per_country_schema_originals()
     rows_by_col: Dict[str, Dict[str, object]] = {}
     order: List[str] = []
     for col in gdf.columns:
+        if col in _FIELD_EXCLUDE:   # columns kept off the map (duplicates, bookkeeping) get no metadata row either
+            continue
         source, level = _metadata_source_for(col)
+        if not source:   # a census column renamed to its bare global name keeps its real source
+            bare_prefix = BARE_COLUMN_SOURCE_PREFIX.get(col) or _infer_bare_prefix(col, country)
+            if bare_prefix:
+                source, level = _metadata_source_for(bare_prefix + col)
         if not source:
             continue
         try:
@@ -1206,6 +1406,8 @@ def _column_metadata_rows(
             or _PIPELINE_DERIVED_DESCRIPTIONS.get(logical)
             or display_field_name(col)
         )
+        if _description_is_weak(description, field_label(col)):
+            description = _describe_column(col, field_label(col), source, logical)
         # `resampled_levels` (2026-09-22, explicit user request,
         # `census_metadata.json`): which of THIS study's actual map
         # resolutions/census levels `col` survived onto -- not every source
@@ -1222,7 +1424,8 @@ def _column_metadata_rows(
         order.append(col)
         rows_by_col[col] = {
             "name": field_label(col),
-            "original_name": col,
+            "column": col,
+            "original_name": per_country_originals.get((prefix, logical)) or col,
             "source": source,
             "country": country,
             "level": level,
@@ -1237,6 +1440,91 @@ def _column_metadata_rows(
             "unit": (field_unit_suffix(col).strip(" ()")) or ("count" if not is_relative else ""),
             "weight_column": weight_col or "(unweighted)",
             "description": description,
+            "_share_avg_fraction": avg if is_relative else None,
+        }
+
+    # Derived columns (shares / rates / densities / ratios / WorldPop-derived diagnostics): no source column of their own, but every column
+    # the map shows gets a complete row -- source and country inherited from the column(s) it is computed from, plus a generated
+    # description of the derivation.
+    _non_fields = {"level_of_service", "equity_flag", "h3_cell", "geometry", "edge_id", "geo_id", "geoid", "id"}
+    try:   # global-schema twins of differently named local columns (pycensus global_equivalents) + the workplaces aliases
+        from pycensus.global_equivalents import equivalents as _equivalents
+
+        _alias_locals = {g: l for l, g in _equivalents().items() if l in gdf.columns}
+    except Exception:  # noqa: BLE001
+        _alias_locals = {}
+    for _jobs_candidate in ("lodes_wac_jobsTotal", "statcan_jobsTotal", "sii_jobsTotal", "ba_jobsTotal", "ba_pendler_pendlerJobsAtWorkplace"):
+        if _jobs_candidate in gdf.columns:
+            _alias_locals.setdefault("workplaceJobs", _jobs_candidate)
+            break
+    if "pop_jobs_total" in gdf.columns:
+        _alias_locals.setdefault("populationAndJobs", "pop_jobs_total")
+    for col in gdf.columns:
+        if col in rows_by_col or col in _non_fields or col in _FIELD_EXCLUDE or str(col).startswith("_") or _metadata_source_for(col)[0]:
+            continue
+        try:
+            if not np.issubdtype(gdf[col].dtype, np.number):
+                continue
+        except TypeError:
+            continue
+        values = gdf[col].to_numpy(dtype=float)
+        finite = np.isfinite(values)
+        if not finite.any():
+            continue
+        is_relative = is_relative_field(col)
+        if weights is not None:
+            w = np.where(finite, np.where(np.isfinite(weights), weights, 0.0), 0.0)
+            wsum = float(np.sum(w))
+            avg = float(np.sum(np.where(finite, values, 0.0) * w) / wsum) if wsum > 0 else float(np.mean(values[finite]))
+        else:
+            avg = float(np.mean(values[finite]))
+        num_den = (share_source_map or {}).get(col)
+        base_col = None
+        alias_local = _alias_locals.get(col)
+        if alias_local is not None:
+            base_col = alias_local
+        elif num_den:
+            base_col = num_den[0]
+        elif col.endswith("_density"):
+            base_col = col[: -len("_density")]
+        elif col.startswith("worldpop_") and col.endswith("_share"):
+            base_col = None
+        base_row = rows_by_col.get(base_col) if base_col else None
+        if base_row is None and col.startswith("worldpop_"):
+            source, level = _METADATA_SOURCE_INFO["worldpop_"]
+        elif base_row is not None:
+            source, level = base_row["source"], base_row["level"]
+        else:
+            source, level = "Derived by this study", ""
+        logical = strip_source_prefix(col)
+        label = field_label(col)
+        if alias_local is not None and base_row is not None:
+            description = (f"{_describe_column(col, label, source, logical)} Same values as {field_label(alias_local)}, repeated under the shared "
+                           "(global) name used on every map.")
+        elif logical in _PIPELINE_DERIVED_DESCRIPTIONS:
+            description = _PIPELINE_DERIVED_DESCRIPTIONS[logical]
+        elif num_den:
+            description = (f"Share of {field_label(num_den[0])} in {field_label(num_den[1])} (derived: {field_label(num_den[0])} / {field_label(num_den[1])}); "
+                           "recomputed from the resampled counts at every level and shown as a percentage.")
+        elif col.endswith("_density"):
+            description = f"{field_label(base_col)} per square kilometre of cell area (derived)."
+        else:   # pattern / global-schema / pipeline-family description (transitlos.map.col_describe)
+            description = _describe_column(col, label, source, logical)
+        resampled_levels: List[str] = []
+        if h3_by_resolution:
+            resampled_levels += [f"h3_res{res}" for res in sorted(h3_by_resolution) if col in h3_by_resolution[res].columns]
+        if census_by_level:
+            resampled_levels += [f"census_{lvl}" for lvl in census_by_level if col in census_by_level[lvl].columns]
+        up_method, down_method = _resampling_methods_for(col)
+        original = (base_row["original_name"] if (alias_local is not None and base_row is not None) else f"{field_label(num_den[0])} / {field_label(num_den[1])}" if num_den else (f"{field_label(base_col)} / cell area" if col.endswith("_density") and base_col else col))
+        order.append(col)
+        rows_by_col[col] = {
+            "name": label, "column": col, "original_name": original, "source": source, "country": country, "level": level,
+            "native_levels": _derived_native_levels(num_den, base_row, level, rows_by_col),
+            "resampled_levels": resampled_levels, "resampling_up_method": up_method, "resampling_down_method": down_method,
+            "total": None, "mean": avg, "share": None, "share_column": None,
+            "unit": (field_unit_suffix(col).strip(" ()")) or ("count" if not is_relative else ""),
+            "weight_column": weight_col or "(unweighted)", "description": description,
             "_share_avg_fraction": avg if is_relative else None,
         }
 
@@ -1273,11 +1561,49 @@ def _column_metadata_rows(
         row = rows_by_col[col]
         if name_counts[row["name"]] > 1:
             row["name"] = f"{row['name']} ({row['source'] or col})"
+    _twins = _global_twins()
+    _again: Dict[str, int] = {}
+    for col in order:
+        _again[rows_by_col[col]["name"]] = _again.get(rows_by_col[col]["name"], 0) + 1
+    for col in order:   # still identical after adding the source: the global-schema twin of a local column
+        if _again[rows_by_col[col]["name"]] > 1 and col in _twins:
+            rows_by_col[col]["name"] += " \u2013 global name"
 
     return [
         {k: v for k, v in rows_by_col[col].items() if not k.startswith("_")}
         for col in order
     ]
+
+
+# Acronyms / abbreviations that the generic humanizer would flatten ("Hud fmr 2 br county rent mean fy 2026").
+_LABEL_ACRONYMS = {
+    "hud": "HUD", "fmr": "FMR", "safmr": "SAFMR", "fhfa": "FHFA", "fy": "FY", "cagr": "CAGR", "br": "bedroom", "emal": "EMAL",
+    "serpavi": "SERPAVI", "usrc": "US Religion Census", "lds": "LDS", "vc": "flats", "vu": "houses", "p25": "25th percentile",
+    "p75": "75th percentile", "zip": "ZIP", "acs": "ACS", "eur": "EUR", "sqm": "m2",
+}
+
+_PARTY_ACRONYMS = {"psoe", "cdu", "afd", "fdp", "csu", "bsw", "pnv", "bnn", "ncp", "kmt", "dpp", "tpp"}
+
+_ELECTION_RE = re.compile(r"^elec_(national|state|municipal)(?:_(\d{4})([a-z]*))?_(total_votes|turnout_rate|left_share|right_share|other_share|party_(.+)_share)$")
+
+
+def _humanize_election_field(name: str) -> Optional[str]:
+    """`elec_national_2024_left_share` -> "National election 2024: left bloc vote" (None for any other name)."""
+    m = _ELECTION_RE.match(name)
+    if not m:
+        return None
+    scope, year, suffix, metric, party = m.groups()
+    kind = {"leg": "legislative", "council": "council"}.get(suffix or "", suffix or "")
+    head = f"{scope.capitalize()} election" + (f" {year}" if year else "") + (f" ({kind})" if kind else "")
+    if party:
+        what = " ".join(w.upper() if len(w) <= 3 or w in _PARTY_ACRONYMS else w.capitalize() for w in party.split("_")) + " vote"
+    else:
+        what = {"total_votes": "valid votes", "turnout_rate": "turnout", "left_share": "left bloc vote", "right_share": "right bloc vote",
+                "other_share": "other vote"}[metric]
+    return f"{head}: {what}"
+
+
+_TRAILING_STAT_WORDS = ("mean", "median", "avg", "average")
 
 
 def _humanize_field_name(name: str) -> str:
@@ -1296,14 +1622,23 @@ def _humanize_field_name(name: str) -> str:
     `inegi_unemployment_rate` (already snake_case, from `SHARE_COLUMNS`) ->
     "Unemployment rate".
     """
+    election = _humanize_election_field(name)
+    if election:
+        return election
+    name = re.sub(r"(?i)(?<![a-z])m2(?![a-z0-9])", "sqm", name.replace("_m2", "_sqm"))
     words = re.findall(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+", name.replace("_", " "))
     words = [w for w in words if w]
     if not words:
         return name
+    if any(w.lower() in _LABEL_ACRONYMS for w in words):
+        phrase = " ".join(_LABEL_ACRONYMS.get(w.lower(), w.lower()) for w in words)
+        return phrase[0].upper() + phrase[1:]
     if len(words) > 1 and words[-1].lower() == "households":
         return "Households with " + " ".join(w.lower() for w in words[:-1])
     if len(words) > 1 and words[-1].lower() == "population":
         return " ".join(w.lower() for w in words[:-1]).capitalize() + " population"
+    if len(words) > 1 and words[-1].lower() in _TRAILING_STAT_WORDS:   # "household size mean" -> "mean household size"
+        words = [words[-1]] + words[:-1]
     return " ".join(w.lower() for w in words).capitalize()
 
 
@@ -1314,9 +1649,126 @@ def _humanize_field_name(name: str) -> str:
 # school "grade"). Keyed on the DE-PREFIXED logical name (checked before
 # the generic humanizer), so it applies regardless of which country's
 # source prefix the raw column carries.
-_FIELD_LABEL_OVERRIDES = {
-    "educationMeanGrade": "Average years of schooling",
-}
+#: Display names whose humanized form reads badly (column or logical name -> label): src/transitlos/i18n/field_labels_en.json, plus what studies register.
+_FIELD_LABEL_OVERRIDES = json.loads((__import__("pathlib").Path(__file__).resolve().parents[1] / "i18n" / "field_labels_en.json").read_text(encoding="utf-8"))["labels"]
+
+
+def _flo_js() -> str:
+    """`_FIELD_LABEL_OVERRIDES` as a JavaScript object literal (the pages' own label functions read it)."""
+    return json.dumps(_FIELD_LABEL_OVERRIDES, ensure_ascii=False)
+
+
+def register_field_labels(labels: Dict[str, str]) -> None:
+    """Study-specific display names (logical column name, i.e. without its source prefix -> label), e.g. English names for columns whose raw names are
+    in Spanish. Used by every label function of the pages built afterwards in this process.
+
+    Args:
+        labels: ``{logical column: label}``.
+    """
+    _FIELD_LABEL_OVERRIDES.update({str(k): str(v) for k, v in labels.items()})
+
+
+#: Columns of the map being built; `_global_twins` only pairs a global column with a local column that really exists there (the
+#: equivalents table covers every country, so without this a Spanish map would show a US ACS name as the local name).
+_TWIN_COLUMNS: Optional[set] = None
+
+
+def _global_twins() -> Dict[str, str]:
+    """`{global column: local column}` for the global-schema columns that repeat a differently named local census column."""
+    try:
+        from pycensus.global_equivalents import equivalents
+
+        pairs = [(l, g) for l, g in equivalents().items() if _TWIN_COLUMNS is None or (l in _TWIN_COLUMNS and g in _TWIN_COLUMNS)]
+        return {g: l for l, g in pairs}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _drop_identical_fields(fields: Sequence[str], df) -> List[str]:
+    """`fields` without the columns whose values repeat an earlier one exactly (2026-11-13 user report: "National election: right bloc vote"
+    repeating "National election 2025: right bloc vote", and a runoff candidate's vote equal to their bloc's). Dated / local columns win over
+    the period-free global twins (`pycensus.latest_columns` / `global_equivalents` names), which are compared last."""
+    import hashlib
+
+    twins = set(_global_twins())
+    period_free = {c for c in fields if re.match(r"^elec_(national|state|municipal)_(left|right|other)_share$|^elec_(national|state|municipal)_(turnout_rate|total_votes)$", c)
+                   or c in ("rent_per_m2_mean", "price_per_m2_mean", "rent_per_home_mean", "price_per_home_mean", "home_size_m2_mean")}
+    keep_first = set(_WORLDPOP_DIFF_FIELDS)   # re-added to every selector by the callers: they must win their duplicate pair, or both show
+    order = ([c for c in fields if c in keep_first] + [c for c in fields if c not in twins and c not in period_free and c not in keep_first]
+             + [c for c in fields if (c in twins or c in period_free) and c not in keep_first])
+    seen, drop = {}, set()
+    tw = _global_twins()
+    for g in fields:   # a global-name copy (pycensus add_global_equivalents) of a listed local column: the same values by construction, even
+        if g in tw and tw[g] in fields and tw[g] != g:   # where the frame compared here lacks the copy
+            drop.add(g)
+    for c in order:
+        if c in drop:
+            continue
+        if c not in df.columns:
+            continue
+        try:
+            v = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+        except Exception:  # noqa: BLE001
+            continue
+        if not np.isfinite(v).any():
+            continue
+        if np.nanmin(v) == np.nanmax(v):   # the same value on every cell (e.g. an all-zero count of a source without that data): no information
+            drop.add(c)
+            continue
+        key = hashlib.sha1(np.round(np.nan_to_num(v, nan=-9.87e300), 9).tobytes()).hexdigest()
+        if key in seen:
+            drop.add(c)
+        else:
+            seen[key] = c
+    drop |= _same_where_both(order, df, drop, period_free)
+    return [c for c in fields if c not in drop]
+
+
+def _same_where_both(order: Sequence[str], df, already: set, period_free=frozenset()) -> set:
+    """Columns that repeat another one wherever both have a value but cover different cells (2026-11-14 user report: "WorldPop
+    underestimation (share)" next to the global twin "Worldpop underestimation share", "Labor force rate" next to "Labor force participation
+    rate"): of each such pair the one with fewer values goes; with equal coverage the global-schema name stays (the name every map shares, so the
+    cross-city ranking keeps it), except the period-free election names, which give way to the dated ones. Candidate pairs from a 4,000-row
+    sample, confirmed on every row (relative tolerance 1e-5, at least 50 shared non-zero values over 90 % of the smaller column's cells)."""
+    try:
+        glob_names = set(_global_schema_definitions().keys())
+    except Exception:  # noqa: BLE001
+        glob_names = set()
+    cols = [c for c in order if c in df.columns and c not in already]
+    if len(cols) < 2:
+        return set()
+    try:
+        M = np.column_stack([pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float) for c in cols])
+    except Exception:  # noqa: BLE001
+        return set()
+    n = M.shape[0]
+    rng = np.random.default_rng(0)
+    S = M[rng.choice(n, size=min(n, 4000), replace=False)] if n > 4000 else M
+    fin_s = np.isfinite(S)
+    cover = np.isfinite(M).sum(axis=0)
+    drop = set()
+    for i in range(len(cols)):
+        if cols[i] in drop or cover[i] == 0:
+            continue
+        both = fin_s[:, i:i + 1] & fin_s[:, i + 1:]
+        if not both.any():
+            continue
+        x = S[:, i:i + 1]
+        close = np.isclose(S[:, i + 1:], x, rtol=1e-5, atol=1e-9) | ~both
+        cand = np.nonzero(close.all(axis=0) & ((both & (x != 0)).sum(axis=0) >= 5))[0] + i + 1
+        for j in cand:
+            if cols[j] in drop:
+                continue
+            bb = np.isfinite(M[:, i]) & np.isfinite(M[:, j])
+            nz = bb & (M[:, i] != 0)
+            # a real twin: the same non-zero values (not two mostly-zero counts) over nearly all of the smaller column's cells
+            if nz.sum() < 50 or bb.sum() < 0.9 * min(cover[i], cover[j]) or not np.allclose(M[bb, i], M[bb, j], rtol=1e-5, atol=1e-9):
+                continue
+            rank = lambda k: (cover[k], cols[k] in _WORLDPOP_DIFF_FIELDS, cols[k] in glob_names and cols[k] not in period_free, -k)  # noqa: E731
+            drop.add(cols[j] if rank(j) < rank(i) else cols[i])
+            if cols[i] in drop:
+                break
+    return drop
 
 
 def display_field_name(col: str) -> str:
@@ -1333,19 +1785,42 @@ def display_field_name(col: str) -> str:
     WorldPop-derived one for the same logical field (e.g. `population` vs
     `worldpop_residents`) and losing the source label there would make them
     indistinguishable in the UI.
+
+    Args:
+        col: Column name.
+
+    Returns:
+        The display name.
     """
+    if col in _FIELD_LABEL_OVERRIDES:   # e.g. worldpop_overestimation_share, whose own prefix must not be stripped
+        return _FIELD_LABEL_OVERRIDES[col]
     is_worldpop = col.startswith("worldpop_")
     logical = strip_source_prefix(col)
     if logical in _FIELD_LABEL_OVERRIDES:
         name = _FIELD_LABEL_OVERRIDES[logical]
     else:
         name = _humanize_field_name(logical)
+    # A global-schema column that repeats a differently named local census column keeps its global name only (no bracketed local name).
     return f"WorldPop {name}" if is_worldpop and not name.lower().startswith("worldpop") else name
 
 
+def _workplaces_wording(label: str) -> str:
+    """"jobs" is shown as "workplaces" everywhere a label is displayed (the number counts workplaces)."""
+    return re.sub(r"\bjobs\b", "workplaces", re.sub(r"\bJobs\b", "Workplaces", label))
+
+
 def field_label(col: str) -> str:
-    """A field's dropdown/legend display label, with its unit suffix (see `field_unit_suffix`)."""
-    return f"{display_field_name(col)}{field_unit_suffix(col)}"
+    """A field's dropdown/legend display label, with its unit suffix (see `field_unit_suffix`).
+
+    Args:
+        col: Column name.
+
+    Returns:
+        The label with its unit.
+    """
+    if col in _FIELD_LABEL_OVERRIDES:
+        return display_field_name(col)
+    return _workplaces_wording(f"{display_field_name(col)}{field_unit_suffix(col)}")
 
 
 def _disambiguated_field_labels(fields: Sequence[str]) -> Dict[str, str]:
@@ -1362,11 +1837,20 @@ def _disambiguated_field_labels(fields: Sequence[str]) -> Dict[str, str]:
     counts: Dict[str, int] = {}
     for label in labels.values():
         counts[label] = counts.get(label, 0) + 1
-    return {f: (f"{label} ({f})" if counts[label] > 1 else label) for f, label in labels.items()}
+    out = {f: (f"{label} \u00b7 {source_label(f)}" if counts[label] > 1 else label) for f, label in labels.items()}
+    again: Dict[str, int] = {}
+    for label in out.values():
+        again[label] = again.get(label, 0) + 1
+    twins = _global_twins()
+    return {f: (f"{label} ({'global name' if f in twins else f.replace('_', ' ')})" if again[label] > 1 else label) for f, label in out.items()}
 
 
 def absolute_fields(fields: Sequence[str]) -> List[str]:
-    """`fields` filtered to absolute raw-count columns -- the exact complement of `relative_fields`."""
+    """`fields` filtered to absolute raw-count columns -- the exact complement of `relative_fields`.
+
+    Args:
+        fields: Column names.
+    """
     return [f for f in fields if not is_relative_field(f)]
 
 
@@ -1515,7 +1999,8 @@ def _census_geoid_override_lookup_js(id_expr: str) -> str:
 # generous at coarse resolutions, tightened at fine ones specifically to
 # stop the overlap-into-neighboring-cells effect, while keeping every tier
 # comfortably clickable.
-_CIRCLE_MAX_RADIUS_BY_RES = {5: 18, 7: 14, 9: 9, 11: 5}
+LEAN_TILE_MIN_RES = 10   # H3 resolutions from this one up carry a lean property set in their tiles (see `_popup_fields`)
+_CIRCLE_MAX_RADIUS_BY_RES = {5: 22, 7: 20, 8: 19, 9: 16, 10: 14, 11: 12}   # +~20% (2026-11-07: more contrast between small and large circles)
 
 
 def _circle_max_radius_for_res(res: Optional[int]) -> float:
@@ -1528,21 +2013,52 @@ def _circle_max_radius_for_res(res: Optional[int]) -> float:
     return _CIRCLE_MAX_RADIUS_BY_RES[nearest]
 
 
+#: Every layer of a shape (hexagons, circles, census) is visible only inside its own zoom band: no coarse "fallback" layer
+#: stays drawn under the finer ones. Set to False to restore the old gap-filling backdrop.
+STRICT_ZOOM_BANDS = True
+
+CIRCLE_RADIUS_MIN = 2.5
+
+
+#: Circle radius = CIRCLE_RADIUS_MIN + (max - CIRCLE_RADIUS_MIN) * (value / domain_max) ** CIRCLE_SIZE_EXPONENT. The share starts at 0 (not at the
+#: domain's lower percentile) and the exponent is above 0.5, so a low-population circle stays close to the minimum size at every zoom: when
+#: two small circles merge into one coarser cell the merged circle must not jump to a visibly thicker size.
+CIRCLE_SIZE_EXPONENT = 1.0   # was 0.7: radius linear in the share of the domain maximum, so low values stay small and high values stand out
+
+
 def _circle_radius_expr(field: str, domain: tuple, max_radius: float = 18) -> List[Any]:
-    """`["interpolate", ["linear"], ["get", field], d0, 2, d1, max_radius], ...]`-shaped
-    MapLibre expression matching `_circle_style_js`'s own `2 + 16 * norm`
-    Folium/Leaflet radius formula (same field/domain inputs; `max_radius`
-    -- see `_CIRCLE_MAX_RADIUS_BY_RES` -- replaces the old flat 18px cap
-    for every resolution) -- kept as a small helper so both the static
-    per-layer paint (`_score_maplibre_paint`) and any future live
-    field-switch can build the identical expression from a `(field,
-    domain)` pair.
-    """
-    d0, d1 = domain
-    d1 = d1 if d1 > d0 else d0 + 1e-9
-    # Item 8: same `coalesce` null-guard as `_score_maplibre_paint`'s color
-    # expression -- a feature missing `field` would otherwise throw.
-    return ["interpolate", ["linear"], ["coalesce", ["get", field], d0], d0, 2, d1, max_radius]
+    """Circle radius of one H3 resolution (see `CIRCLE_SIZE_EXPONENT`); `coalesce` guards a feature without the field."""
+    d1 = max(float(domain[1]), 1e-9)
+    share = ["max", 0, ["min", 1, ["/", ["coalesce", ["get", field], 0], d1]]]
+    return ["+", CIRCLE_RADIUS_MIN, ["*", max_radius - CIRCLE_RADIUS_MIN, ["^", share, CIRCLE_SIZE_EXPONENT]]]
+
+
+def _circle_legend_by_res(h3_by_resolution, circle_fields, domains_by_res) -> dict:
+    """`{res: {field: [mean_small, mean_mid, mean_large]}}`: mean value of the cells in each third of the circle-size range (per resolution)."""
+    import numpy as _np
+
+    out: dict = {}
+    for res, gdf in h3_by_resolution.items():
+        rmax = _circle_max_radius_for_res(res)
+        per_field = {}
+        for f in circle_fields:
+            dom = (domains_by_res.get(res) or {}).get(f)
+            if dom is None or f not in gdf.columns:
+                continue
+            v = _np.asarray(gdf[f], dtype=float)
+            v = v[_np.isfinite(v) & (v > 0)]
+            if not v.size:
+                continue
+            d1 = dom[1] if dom[1] > 0 else 1e-9
+            share = _np.clip(v / d1, 0, 1)
+            third = _np.minimum(2, ((share ** CIRCLE_SIZE_EXPONENT) * 3).astype(int))
+            means = []
+            for k in range(3):
+                sel = v[third == k]
+                means.append(float(sel.mean()) if sel.size else float(d1 * ((k + 0.5) / 3) ** (1 / CIRCLE_SIZE_EXPONENT)))
+            per_field[f] = [round(m, 2) for m in means]
+        out[str(res)] = per_field
+    return out
 
 
 def _score_maplibre_paint(
@@ -1602,9 +2118,9 @@ def _score_maplibre_paint(
             radius = _circle_radius_expr(
                 default_circle_field, radius_field_domains[default_circle_field], max_radius=circle_max_radius
             )
-        return {"circle-color": color_expr, "circle-radius": radius, "circle-opacity": 0.75}
+        return {"circle-color": color_expr, "circle-radius": radius, "circle-opacity": 0.5625}
     if kind == "line":
-        return {"line-color": color_expr, "line-width": 2}
+        return {"line-color": color_expr, "line-opacity": 0.6, "line-width": ["interpolate", ["linear"], ["zoom"], 10, 0.6, 13, 1.1, 16, 2, 19, 3.5]}
     # Item 6 (verbatim user request): H3 hexagon cells get NO border/outline
     # at all -- `rgba(0,0,0,0)` (fully transparent), not just a lighter
     # color, so no seam is visible between adjacent hexagons. `no_outline`
@@ -1613,7 +2129,7 @@ def _score_maplibre_paint(
     # not ask to remove and which still helps distinguish adjacent
     # geographies at that level.
     outline = "rgba(0,0,0,0)" if no_outline else "#333333"
-    return {"fill-color": color_expr, "fill-opacity": 0.75, "fill-outline-color": outline}
+    return {"fill-color": color_expr, "fill-opacity": 0.5625, "fill-outline-color": outline}
 
 
 def _polygon_style_js(
@@ -1694,7 +2210,7 @@ def _circle_style_js(
         "  if (field && radiusDomains[field] && value != null) {\n"
         "    var d = radiusDomains[field];\n"
         "    var norm = Math.max(0, Math.min(1, (value - d[0]) / Math.max(d[1] - d[0], 1e-9)));\n"
-        "    radius = 2 + 16 * norm;\n"
+        f"    radius = {CIRCLE_RADIUS_MIN} + (16 - {CIRCLE_RADIUS_MIN}) * Math.sqrt(norm);\n"
         "  }\n"
         f"  var opacityDomains = {opacity_domains_json};\n"
         "  var opacity = opacityFromField(properties, opacityDomains, 0.8);\n"
@@ -1819,6 +2335,86 @@ def _extract_base_layer_vars(html: str) -> Dict[str, str]:
     return result
 
 
+_MODE_RANK = {"rail": 0, "tram": 1, "bus": 2}
+
+
+def _merge_colocated_stops(stops_gdf: gpd.GeoDataFrame, tol_m: float = 3.0) -> gpd.GeoDataFrame:
+    """Stops less than `tol_m` apart (often the same physical stop published by two feeds or as one id per mode) become ONE stop: the
+    member with the best stop score (then the best mode: rail > tram > bus) keeps its id, position, mode symbol and scores; its routes
+    (all_routes / stop_routes / route_info) become the union of every member's, `modes_here` lists every member's mode (best first) and
+    `merged_stop_ids` every member's id. Display only: the scoring already groups stops by parent station."""
+    if stops_gdf is None or len(stops_gdf) < 2:
+        return stops_gdf
+    g = stops_gdf.to_crs(4326) if stops_gdf.crs is not None else stops_gdf
+    lon, lat = g.geometry.x.to_numpy(), g.geometry.y.to_numpy()
+    ok = np.isfinite(lon) & np.isfinite(lat)
+    if ok.sum() < 2:
+        return stops_gdf
+    lat0 = float(np.nanmean(lat[ok]))
+    x = lon * 111_320.0 * np.cos(np.radians(lat0)); y = lat * 110_574.0
+    cx, cy = np.floor(np.nan_to_num(x) / tol_m).astype("int64"), np.floor(np.nan_to_num(y) / tol_m).astype("int64")
+    parent = np.arange(len(g))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]; a = parent[a]
+        return a
+    cells: Dict[Tuple[int, int], List[int]] = {}
+    for i in np.flatnonzero(ok):
+        cells.setdefault((int(cx[i]), int(cy[i])), []).append(int(i))
+    merged_any = False
+    for (a, b), members in cells.items():
+        for da in (-1, 0, 1):
+            for db in (-1, 0, 1):
+                for j in cells.get((a + da, b + db), ()):
+                    for i in members:
+                        if i < j and (x[i] - x[j]) ** 2 + (y[i] - y[j]) ** 2 < tol_m ** 2:
+                            ri, rj = find(i), find(j)
+                            if ri != rj:
+                                parent[rj] = ri; merged_any = True
+    if not merged_any:
+        return stops_gdf
+    roots = np.array([find(i) for i in range(len(g))])
+    score = pd.to_numeric(g["stop_score"], errors="coerce").to_numpy(dtype=float) if "stop_score" in g.columns else np.zeros(len(g))
+    modes = g["mode_category"].astype(str).to_numpy() if "mode_category" in g.columns else np.full(len(g), "bus")
+    keep, extra = [], {}
+    groups: Dict[int, List[int]] = {}
+    for i, r in enumerate(roots):
+        groups.setdefault(int(r), []).append(i)
+    for r, idx in groups.items():
+        if len(idx) == 1:
+            keep.append(idx[0]); continue
+        best = min(idx, key=lambda k: (-(score[k] if np.isfinite(score[k]) else -1e9), _MODE_RANK.get(modes[k], 9)))
+        keep.append(best)
+
+        def union(col, sep):
+            if col not in g.columns:
+                return None
+            out = []
+            for k in [best] + [k for k in idx if k != best]:
+                v = g[col].iloc[k]
+                if isinstance(v, str) and v:
+                    for t in v.split(sep):
+                        if t and t not in out:
+                            out.append(t)
+            return sep.join(out) if out else None
+        ms = sorted({modes[k] for k in idx}, key=lambda m: _MODE_RANK.get(m, 9))
+        extra[best] = {"all_routes": union("all_routes", ","), "stop_routes": union("stop_routes", ","), "route_info": union("route_info", ";"),
+                       "modes_here": ",".join(ms), "merged_stop_ids": ",".join(dict.fromkeys(str(g["stop_id"].iloc[k]) for k in idx)) if "stop_id" in g.columns else None}
+    keep = sorted(keep)
+    out = stops_gdf.iloc[keep].copy()
+    for col in ("all_routes", "stop_routes", "route_info", "modes_here", "merged_stop_ids"):
+        if col not in out.columns:
+            out[col] = None
+        out[col] = out[col].astype(object)
+    pos = {k: n for n, k in enumerate(keep)}
+    for k, d in extra.items():
+        for col, v in d.items():
+            if v is not None:
+                out.iat[pos[k], out.columns.get_loc(col)] = v
+    return out
+
+
 def _stops_json_data(stops_gdf: gpd.GeoDataFrame, score_domain: Tuple[float, float]) -> str:
     """Column-oriented JSON for the stops layer: lon/lat + mode/score + popup detail fields.
 
@@ -1829,6 +2425,7 @@ def _stops_json_data(stops_gdf: gpd.GeoDataFrame, score_domain: Tuple[float, flo
     independent of that collapse) lists *every* route actually serving the physical
     stop, and is preferred here when present.
     """
+    stops_gdf = _merge_colocated_stops(stops_gdf)   # stops < 3 m apart: one stop, one symbol (best mode), every mode and route listed
     stops_wgs84 = stops_gdf.to_crs(4326) if stops_gdf.crs is not None else stops_gdf
     lon = stops_wgs84.geometry.x.to_numpy()
     lat = stops_wgs84.geometry.y.to_numpy()
@@ -1893,8 +2490,7 @@ def _stops_json_data(stops_gdf: gpd.GeoDataFrame, score_domain: Tuple[float, flo
         # station" without fabricating anything.
         stop_routes_val = row.get("stop_routes") if "stop_routes" in row else None
         all_routes_val = row.get("all_routes") if "all_routes" in row else route_val
-        # `reliability` (the optional MR_CV refinement, scoring.md Section
-        # 2.3(b)) is NOT a measured metric on this pipeline -- `headway_cv`
+        # `reliability` (the optional MR_CV refinement) is NOT a measured metric on this pipeline -- `headway_cv`
         # (headway variance/regularity) is never available from
         # pyGTFSHandler today (`transitlos.stop_scores.compute_stop_scores`),
         # so `mrc_score` always falls back to the mode-categorical default
@@ -1923,6 +2519,8 @@ def _stops_json_data(stops_gdf: gpd.GeoDataFrame, score_domain: Tuple[float, flo
             "route": str(route_val) if pd.notna(route_val) else None,
             "stop_routes": str(stop_routes_val) if pd.notna(stop_routes_val) else None,
             "all_routes": str(all_routes_val) if pd.notna(all_routes_val) else None,
+            "route_info": str(row["route_info"]) if "route_info" in row and pd.notna(row["route_info"]) else None,
+            "station_mode": str(row["scoring_mode"]) if "scoring_mode" in row and pd.notna(row["scoring_mode"]) else None,
             "headway_minutes": _num(row.get("headway_minutes")),
             "avg_speed_kmh": _num(row.get("avg_speed_kmh")),
             "mode_category": row.get("mode_category") if "mode_category" in row and pd.notna(row.get("mode_category")) else None,
@@ -1931,6 +2529,8 @@ def _stops_json_data(stops_gdf: gpd.GeoDataFrame, score_domain: Tuple[float, flo
             "frequency_score": _score01(row.get("frequency_score")),
             "stop_score": _score01(row.get("stop_score")),
             "reliability": reliability_val,
+            "modes_here": str(row["modes_here"]) if "modes_here" in row and isinstance(row["modes_here"], str) else None,
+            "merged_stop_ids": str(row["merged_stop_ids"]) if "merged_stop_ids" in row and isinstance(row["merged_stop_ids"], str) else None,
         }
         # Compact payload (a nationwide map embeds 100k+ stops): coordinates to ~0.1 m and no null-valued keys
         # (the client reads absent fields as null).
@@ -2539,6 +3139,10 @@ def _extract_map_var(html: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+#: Default "Circle size by", first available: population plus workplaces, then population, then the WorldPop population (all counts, never a density).
+_DEFAULT_CIRCLE_FIELDS = ("pop_jobs_total", "populationAndJobs", "population", "worldpop_residents")
+
+
 def _control_panel_html(circle_fields: List[str], opacity_fields: List[str], default_circle_field: Optional[str] = None) -> str:
     """Raw HTML for the ONE consolidated map-controls panel (background/shape/overlays/styling).
 
@@ -2680,7 +3284,7 @@ def _legend_html(score_domain: Tuple[float, float], show_development: bool) -> s
     dev_legend = ""
     if show_development:
         dev_legend = """
-<div id="devLegend" style="display:none;margin-top:8px;">
+<div id="devLegend" style="display:none;margin-top:5px;">
   <div style="font-weight:600;">Development opportunity</div>
   <div><span style="display:inline-block;width:12px;height:12px;border:2px solid #e91e8c;margin-right:5px;"></span>More transit viable</div>
   <div><span style="display:inline-block;width:12px;height:12px;border:2px solid #1e6fd9;margin-right:5px;"></span>More housing viable</div>
@@ -2696,40 +3300,50 @@ def _legend_html(score_domain: Tuple[float, float], show_development: bool) -> s
         f'<span style="flex:1;text-align:center;">{(score_min + (score_max - score_min) * v):.1f}</span>'
         for v in [0.0, 0.25, 0.5, 0.75, 1.0]
     )
+    area_row = ""
+    if 'official' in _ACTIVE_AREAS:   # four-area maps: the Area also selects the displayed score, the stats-panel area and the mask
+        area_row = """  <div id="legendAreaRow" style="display:flex;align-items:center;gap:5px;margin-bottom:4px;">
+    <span style="font-weight:600;">Area</span>
+    <select id="legendAreaSelect" title="Analysis area: also sets the Area of the stats panel and the score at the top" style="flex:1;min-width:0;font:11px sans-serif;padding:1px 2px;">
+      <option value="metro" selected>UN</option><option value="official">Official</option>
+    </select>
+  </div>
+"""
     return f"""
-<div id="mapLegend" style="background:white;padding:8px 14px;border-radius:6px;
-  box-shadow:0 1px 4px rgba(0,0,0,0.3);font:12px sans-serif;width:min(210px,80vw);margin-top:6px;
+<div id="mapLegend" style="background:white;padding:5px 9px;border-radius:6px;
+  box-shadow:0 1px 4px rgba(0,0,0,0.3);font:11px sans-serif;width:min(172px,80vw);margin-top:4px;
   box-sizing:border-box;">
+{area_row}
   <div style="font-weight:600;">Level of service</div>
-  <div style="height:10px;border-radius:2px;background:{gradient};margin:5px 0 3px;"></div>
-  <div style="display:flex;font-size:9.5px;">
+  <div style="height:7px;border-radius:2px;background:{gradient};margin:3px 0 2px;"></div>
+  <div style="display:flex;font-size:8.5px;">
     {score_ticks}
   </div>
-  <div style="font-weight:600;margin-top:8px;">Stop score</div>
-  <div style="height:10px;border-radius:2px;background:{stop_gradient};margin:5px 0 3px;"></div>
-  <div style="display:flex;font-size:9.5px;">
+  <div style="font-weight:600;margin-top:5px;">Stop score</div>
+  <div style="height:7px;border-radius:2px;background:{stop_gradient};margin:3px 0 2px;"></div>
+  <div style="display:flex;font-size:8.5px;">
     {stop_score_ticks}
   </div>
-  <div id="circleLegend" style="display:none;margin-top:8px;">
+  <div id="circleLegend" style="display:none;margin-top:5px;">
     <div style="font-weight:600;">Circle size (<span id="circleLegendField"></span>)</div>
-    <div style="display:flex;align-items:flex-end;gap:10px;margin-top:6px;padding-left:2px;">
+    <div style="display:flex;align-items:flex-end;gap:7px;margin-top:3px;padding-left:2px;">
       <div style="display:flex;flex-direction:column;align-items:center;width:30px;">
-        <div style="width:6px;height:6px;border-radius:50%;background:#888;"></div>
-        <span id="circleLegendMin" style="font-size:9.5px;margin-top:4px;"></span>
+        <div id="circleLegendC1" style="width:6px;height:6px;border-radius:50%;background:#888;"></div>
+        <span id="circleLegendMin" style="font-size:8.5px;margin-top:4px;"></span>
       </div>
       <div style="display:flex;flex-direction:column;align-items:center;width:30px;">
-        <div style="width:18px;height:18px;border-radius:50%;background:#888;"></div>
-        <span id="circleLegendMid" style="font-size:9.5px;margin-top:4px;"></span>
+        <div id="circleLegendC2" style="width:18px;height:18px;border-radius:50%;background:#888;"></div>
+        <span id="circleLegendMid" style="font-size:8.5px;margin-top:4px;"></span>
       </div>
       <div style="display:flex;flex-direction:column;align-items:center;width:30px;">
-        <div style="width:30px;height:30px;border-radius:50%;background:#888;"></div>
-        <span id="circleLegendMax" style="font-size:9.5px;margin-top:4px;"></span>
+        <div id="circleLegendC3" style="width:30px;height:30px;border-radius:50%;background:#888;"></div>
+        <span id="circleLegendMax" style="font-size:8.5px;margin-top:4px;"></span>
       </div>
     </div>
   </div>
-  <div id="opacityLegend" style="display:none;margin-top:8px;">
+  <div id="opacityLegend" style="display:none;margin-top:5px;">
     <div style="font-weight:600;">Opacity (<span id="opacityLegendField"></span>)</div>
-    <div style="height:10px;border-radius:2px;margin:3px 0;
+    <div style="height:7px;border-radius:2px;margin:3px 0;
       background:linear-gradient(to right, rgba(80,80,80,0.12), rgba(80,80,80,0.92));"></div>
     <div style="display:flex;justify-content:space-between;margin-top:3px;">
       <span id="opacityLegendMin"></span><span id="opacityLegendMax"></span>
@@ -2997,7 +3611,7 @@ window.__fmtLegendNum = function(v, refAbs) {{
     var scaledAbs = Math.abs(scaled);
     var dec = scaledAbs >= 100 ? 0 : (scaledAbs >= 10 ? 1 : 2);
     var s = scaled.toFixed(dec);
-    if (dec > 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
+    if (dec > 0) s = s.replace(/0+$/, '').replace(/\\.$/, '');
     return s + suffix;
   }}
   if (noDecimals) return Math.round(v).toLocaleString();
@@ -3016,7 +3630,7 @@ window.__fmtLegendNum = function(v, refAbs) {{
   // figures at any scale, then trim trailing zeros.
   var decimals = Math.min(2, Math.max(1, 2 - Math.floor(Math.log10(abs))));
   var s = v.toFixed(decimals);
-  s = s.replace(/0+$/, '').replace(/\.$/, '');
+  s = s.replace(/0+$/, '').replace(/\\.$/, '');
   return s === '' || s === '-' ? '0' : s;
 }};
 
@@ -3047,14 +3661,30 @@ function __updateCircleLegend(field) {{
     var res = __resForZoom(__zoomMapRef.getZoom());
     if (res != null && __radiusFieldDomainsByRes[res]) domains = __radiusFieldDomainsByRes[res];
   }}
-  var d = domains[field];
-  // Shared `refAbs` (the group's own max) so min/mid/max always agree on
-  // one k/M scale and one decimals-or-not policy -- see `__fmtLegendNum`'s
-  // comment on why a per-value decision looks inconsistent across a legend.
-  var refAbs = d ? Math.max(Math.abs(d[0]), Math.abs(d[1])) : null;
-  document.getElementById('circleLegendMin').textContent = d ? __fmtLegendNum(d[0], refAbs) : '';
-  document.getElementById('circleLegendMid').textContent = d ? __fmtLegendNum((d[0] + d[1]) / 2, refAbs) : '';
-  document.getElementById('circleLegendMax').textContent = d ? __fmtLegendNum(d[1], refAbs) : '';
+  // The three legend circles (radius 3 / 9 / 15 px) stand for three size classes of ONE absolute scale (radius = 2.5 + 3 * log10(value),
+  // the same at every resolution): each shows the MEAN value of the cells whose circle falls in its class (value >= 1 only).
+  var __legR = [3, 9, 15], __cuts = [6, 12];
+  var __vals = null;
+  try {{
+    var __sd = window.__getStatsData ? window.__getStatsData('metro') : (window.__statsData && window.__statsData.metro);
+    var __arr = __sd && __sd[field];
+    if (__arr && __arr.length) {{
+      var sums = [0, 0, 0], cnt = [0, 0, 0];
+      for (var i = 0; i < __arr.length; i++) {{
+        var v = __arr[i];
+        if (v == null || !isFinite(v) || v < 1) continue;
+        var r = 2.5 + 3 * Math.log10(v), k = r < __cuts[0] ? 0 : (r < __cuts[1] ? 1 : 2);
+        sums[k] += v; cnt[k]++;
+      }}
+      __vals = sums.map(function(sm, k) {{ return cnt[k] ? sm / cnt[k] : Math.pow(10, (__legR[k] - 2.5) / 3); }});
+    }}
+  }} catch (e) {{}}
+  if (!__vals) __vals = __legR.map(function(r) {{ return Math.pow(10, (r - 2.5) / 3); }});
+  __vals = __vals.map(function(v) {{ return Math.max(1, v); }});   // a circle never stands for less than 1
+  var refAbs = Math.max.apply(null, __vals);
+  document.getElementById('circleLegendMin').textContent = __fmtLegendNum(__vals[0], refAbs);
+  document.getElementById('circleLegendMid').textContent = __fmtLegendNum(__vals[1], refAbs);
+  document.getElementById('circleLegendMax').textContent = __fmtLegendNum(__vals[2], refAbs);
 }}
 
 document.getElementById('circleFieldSelect').addEventListener('change', function(e) {{
@@ -3341,6 +3971,7 @@ def build_city_map(
     stats_by_area: Optional[Dict[str, gpd.GeoDataFrame]] = None,
     is_us: bool = False,
     stops_chunks: Optional[Dict[str, gpd.GeoDataFrame]] = None,
+    routes_chunks: Optional[Dict[str, gpd.GeoDataFrame]] = None,
     stops_gdf: Optional[gpd.GeoDataFrame] = None,
     routes_gdf: Optional[gpd.GeoDataFrame] = None,
     region: str = "global",
@@ -3358,8 +3989,10 @@ def build_city_map(
     country: Optional[str] = None,
     special_levels: Optional[Dict[str, gpd.GeoDataFrame]] = None,
     special_level_labels: Optional[Dict[str, str]] = None,
+    include_streets: bool = True,
+    include_development: bool = True,
 ) -> str:
-    """Build and save one city's transit-LOS map.
+    """Build and save one city's transit-LOS map (`include_streets` / `include_development` = False: no street / development layer).
 
     Args:
         h3_by_resolution: Mapping of H3 resolution -> GeoDataFrame (h3
@@ -3502,6 +4135,8 @@ def build_city_map(
         directory temporarily switched to that same directory so on-disk
         tiles land exactly where the relative URL expects them.
     """
+    global _ACTIVE_AREAS
+    _ACTIVE_AREAS = [a for a in ("metro", "core", "official", "municipality") if stats_by_area and a in stats_by_area] or ["metro", "core"]
     from geohierarchy import Max
     from geohierarchy.core import GeoHierarchy
     from geohierarchy.maps.folium.render import HierarchyMap, MultiHierarchyMap
@@ -3514,6 +4149,8 @@ def build_city_map(
     tiles_dir_rel = os.path.relpath(tiles_dir_abs, start=out_dir)
 
     resolutions = sorted(h3_by_resolution)
+    global _TWIN_COLUMNS
+    _TWIN_COLUMNS = {c for gdf in h3_by_resolution.values() for c in gdf.columns} | {c for gdf in (census_by_level or {}).values() for c in gdf.columns}
     finest = h3_by_resolution[resolutions[-1]]
     score_domain = _finite_domain(finest[score_col])
     has_census = bool(census_by_level)
@@ -3524,7 +4161,7 @@ def build_city_map(
     # when a `development_gdf` (census-derived) is available. The old
     # census-geometry-preferred path is intentionally unused below.
     has_development_gdf = False
-    show_development = any("equity_flag" in gdf.columns for gdf in h3_by_resolution.values())
+    show_development = include_development and any("equity_flag" in gdf.columns for gdf in h3_by_resolution.values())
 
     # ONE canonical (count_fields, share_fields) split, computed once from
     # `finest` and reused verbatim by every count-type selector
@@ -3542,8 +4179,14 @@ def build_city_map(
     # its own comment below) that `regression_fields` never did. Building
     # this ONE pair up front removes the possibility of the two drifting.
     _all_candidates = _numeric_field_candidates(finest, extra_exclude=[score_col])
+    _all_candidates = _drop_identical_fields(_all_candidates, finest)
     _canonical_count_fields = absolute_fields(_all_candidates)
     _canonical_share_fields = relative_fields(_all_candidates)
+    # The WorldPop-vs-census differences (city science maps) are selectable in EVERY column selector: circle size, opacity,
+    # regression / census / distribution, place-rank weight.
+    _wp_diff = [c for c in _WORLDPOP_DIFF_FIELDS if c in finest.columns and finest[c].notna().any()]
+    _canonical_count_fields = list(_canonical_count_fields) + [c for c in _wp_diff if c not in _canonical_count_fields]
+    _canonical_share_fields = list(_canonical_share_fields) + [c for c in _wp_diff if c not in _canonical_share_fields]
     if circle_fields is None:
         # 2026-09-05, explicit user request: "circle size by only allow
         # count columns" -- a circle's AREA already encodes magnitude
@@ -3553,7 +4196,8 @@ def build_city_map(
         # `opacity_fields` below), which is what this swaps to. See
         # `is_relative_field`/`absolute_fields` for the naming-convention
         # rule this filters on.
-        circle_fields = list(_canonical_count_fields)
+        # 2026-11-10, explicit user request: share / rate columns are selectable for the circle size too (counts first, then the relative columns).
+        circle_fields = list(_canonical_count_fields) + [c for c in _canonical_share_fields if c not in _canonical_count_fields]
         if not circle_fields and "population" in finest.columns:
             circle_fields = ["population"]
     if opacity_fields is None:
@@ -3561,7 +4205,9 @@ def build_city_map(
         # relative or density columns" -- the complement of `circle_fields`
         # above, computed independently (not derived FROM circle_fields
         # anymore, since that now holds counts instead of relative fields).
-        opacity_fields = list(_canonical_share_fields)
+        # 2026-11-13, explicit user request: "opacity by should show count columns and not share columns" (each H3 resolution
+        # normalises by its own value range, geohierarchy's __shapeOpacityExpr)
+        opacity_fields = list(_canonical_count_fields)
         # 2026-08-25 -> 2026-09-07: this dropdown used to be further
         # restricted to fields present on EVERY census level's own
         # GeoDataFrame (not just the h3 grid), because `opacitySelect` is
@@ -3589,7 +4235,7 @@ def build_city_map(
     # `opacity_field_domains` below: a few extreme outliers otherwise stretch
     # the domain so far that every "typical" value maps into a narrow sliver
     # of the 3-18px radius range, killing visible size contrast between them.
-    radius_field_domains = {f: _percentile_domain(finest[f]) for f in circle_fields if f in finest.columns}
+    radius_field_domains = {f: _percentile_domain(finest[f], 5, 99.5) for f in circle_fields if f in finest.columns}   # p99.5: at p95 every dense cell sat at the largest size and cities merged into one carpet
     # Per-resolution domains (2026-09-04, user report: "the circle size
     # legend should update with zoom"). `radius_field_domains` above is
     # computed ONCE from `finest` and reused identically at every zoom level
@@ -3606,7 +4252,7 @@ def build_city_map(
     # `__updateCircleLegend`, which picks the domain matching the map's
     # current zoom via `circle_zoom_bands`).
     radius_field_domains_by_res: Dict[int, Dict[str, tuple]] = {
-        res: {f: _percentile_domain(h3_by_resolution[res][f]) for f in circle_fields if f in h3_by_resolution[res].columns}
+        res: {f: _percentile_domain(h3_by_resolution[res][f], 5, 99.5) for f in circle_fields if f in h3_by_resolution[res].columns}
         for res in resolutions
     }
     opacity_field_domains = {f: _percentile_domain(finest[f], 15, 85) for f in opacity_fields if f in finest.columns}
@@ -3614,14 +4260,14 @@ def build_city_map(
     # Folium's "Circle size by" dropdown -- computed here too so MapLibre's
     # static circle-radius paint (`_score_maplibre_paint`) can size circles
     # by the same field instead of a flat radius.
-    default_circle_field = _preferred_density_field(circle_fields) or (circle_fields[0] if circle_fields else None)
+    default_circle_field = next((f for f in _DEFAULT_CIRCLE_FIELDS if f in circle_fields), None) or _preferred_density_field(circle_fields) or (circle_fields[0] if circle_fields else None)   # a COUNT by default (relative columns joined the list on 2026-11-10)
 
     edges_wgs84 = edges_gdf.to_crs(4326) if edges_gdf.crs is not None else edges_gdf.copy()
     if "edge_id" not in edges_wgs84.columns:
         edges_wgs84 = edges_wgs84.reset_index(drop=True)
         edges_wgs84["edge_id"] = edges_wgs84.index
 
-    def _popup_fields(gdf) -> list[str]:
+    def _popup_fields(gdf, res=None) -> list[str]:
         # Every numeric column (all census variables + the access value) --
         # not just circle_fields -- so clicking any hexagon/circle/census
         # shape shows the full picture, per the "click to see all census
@@ -3645,6 +4291,17 @@ def build_city_map(
         # user report) now happens once, centrally, in
         # `_numeric_field_candidates` itself -- inherited here for free since
         # `fields` above is seeded from it, rather than re-applied per call site.
+        if res is not None and res >= LEAN_TILE_MIN_RES:
+            # The two finest H3 levels hold millions of cells and, with every census column on every feature, made up most of the tile bytes (about 2.6 KB per
+            # feature and zoom level). Like the US and Spain maps, their tiles keep only what the page needs to draw and filter them: the score, population, the
+            # simplified-census template and the equity flag. The coarser levels (and the census layers) keep every column.
+            try:
+                from .col_select import template_columns
+                tmpl = template_columns(list(gdf.columns), bool(is_us))[0]
+            except Exception:
+                tmpl = []
+            lean = {score_col, "equity_flag", "h3_cell", *tmpl, *_POPULATION_COLUMN_CANDIDATES}   # the selectors list every column, so they are not part of the lean set: a column outside it shows blank at these zoom levels
+            fields = [f for f in fields if f in lean]
         return fields
 
     # Delegates to the page-level `__shapePopupHtml` (see `_shape_popup_js`)
@@ -3683,6 +4340,12 @@ def build_city_map(
     # and development are their own layers, not baked into every shape), so
     # each one partitions the *full* [0, 25] zoom range on its own.
     zoom_bands = _level_zoom_bands(resolutions_levels)
+    # Nationwide maps (H3 res 3-5 present): a whole country is seen at zoom 3-5, where res 3 (~70 km cells) is far too coarse for the circle
+    # and hexagon views -- res 4 from zoom 4, res 5 from zoom 5 (until res 7 takes over at 8); the circle layers then get their own bands
+    # from the on-screen cell spacing (circle_bands.py).
+    if {"h3_3", "h3_4", "h3_5"} <= set(zoom_bands) and zoom_bands["h3_5"][1] < 8:
+        nxt = min((b for k, b in zoom_bands.items() if k not in ("h3_3", "h3_4", "h3_5")), key=lambda b: b[0], default=(8, 8))[0]
+        zoom_bands.update({"h3_3": (0, 3), "h3_4": (4, 4), "h3_5": (5, nxt - 1)})
 
     def _apply_zoom_bands(hmap, levels: List[str], bands: Dict[Hashable, tuple]) -> None:
         # Explicit bands for every level (not auto-assignment): `HierarchyMap`'s
@@ -3776,7 +4439,7 @@ def build_city_map(
         hex_map.configure_level(
             f"h3_{res}",
             style_js=_polygon_style_js(score_domain, opacity_field_domains, res=res),
-            popup_fields=_popup_fields(h3_by_resolution[res]),
+            popup_fields=_popup_fields(h3_by_resolution[res], res),
             popup_js=shape_popup_js,
             maplibre_paint=_score_maplibre_paint("polygon", score_col, score_domain, no_outline=True),
         )
@@ -3816,7 +4479,9 @@ def build_city_map(
     # Res 7 stays drawn (overzoomed, no extra tiling) underneath the finer
     # levels, so where res 9/11 don't exist (low-density / no-transit areas)
     # high zoom still shows res 7 instead of a gap.
-    if 7 in resolutions and any(r > 7 for r in resolutions):
+    # 2026-10 (explicit user request): strict zoom bands -- only the H3 resolution of the current zoom band is drawn. The old
+    # res-7 "backdrop" (a layer widened to zoom 24 under the finer ones) showed coarse hexagons at the same time as fine ones.
+    if STRICT_ZOOM_BANDS is False and 7 in resolutions and any(r > 7 for r in resolutions):
         circ_map.set_fallback_level("h3_7")
         hex_map.set_fallback_level("h3_7")
     for res in resolutions:
@@ -3824,7 +4489,7 @@ def build_city_map(
         circ_map.configure_level(
             f"h3_{res}",
             style_js=_circle_style_js(score_domain, _res_radius_domains, opacity_field_domains, res=res),
-            popup_fields=_popup_fields(h3_by_resolution[res]),
+            popup_fields=_popup_fields(h3_by_resolution[res], res),
             popup_js=shape_popup_js,
             # Circles render at a fixed pixel radius (up to 18px) client-side, unlike a
             # polygon's geometry -- the default 2% tile buffer can be far fewer pixels
@@ -3907,14 +4572,25 @@ def build_city_map(
                 census_zoom_bands[prev_level] = (prev_lo, earlier_lo - 1)
                 census_zoom_bands["census_grid"] = (earlier_lo, grid_hi)
 
+        # Finest census level (blocks / secciones censales) shows one zoom level earlier.
+        if len(census_level_names_real) > 1 and "census_tract" not in census_level_names_real:   # US zoom bands stay as they were
+            fin = census_level_names_real[-1]
+            prv = census_level_names_real[-2]
+            f_lo, f_hi = census_zoom_bands[fin]
+            p_lo, p_hi = census_zoom_bands[prv]
+            if f_lo - 1 > p_lo:
+                census_zoom_bands[fin] = (f_lo - 1, f_hi)
+                census_zoom_bands[prv] = (p_lo, p_hi - 1)
+
         def _level_key(census_level_name: str) -> str:
             return census_level_name[len("census_"):]
 
         gh_census = GeoHierarchy(crs=4326)
         for name in census_level_names:
             gdf = _with_id(census_by_level[_level_key(name)].to_crs(4326))
+            # `force_census_tiles` really builds these levels' tiles even on the page-only path, so they need their attribute columns.
             gh_census.add_level(
-                name, _level_frame(gdf, _id_col(gdf)), id_col=_id_col(gdf), agg=Max()
+                name, gdf if force_census_tiles else _level_frame(gdf, _id_col(gdf)), id_col=_id_col(gdf), agg=Max()
             )
         census_map = HierarchyMap(
             gh_census, levels=census_level_names, tiles_dir=str(os.path.join(tiles_dir_rel, "census")), use_pmtiles=use_pmtiles,
@@ -3953,7 +4629,7 @@ def build_city_map(
         # (Gemeinde) polygons visibly show through underneath the grid at
         # its own high-zoom band, which is the opposite of what a raster's
         # "no data" should look like.
-        if len(census_level_names_real) >= 2 and census_level_names_real[-1] != "census_grid":
+        if STRICT_ZOOM_BANDS is False and len(census_level_names_real) >= 2 and census_level_names_real[-1] != "census_grid":
             census_map.set_fallback_level(census_level_names_real[-2])
         if (not skip_tile_build) or force_census_tiles:  # the latter: rebuild only the census levels that have no external writer
             with contextlib.chdir(out_dir):
@@ -4017,43 +4693,44 @@ def build_city_map(
     # level covers the low-zoom band instead (an empty GeoDataFrame tiles to
     # nothing almost instantly), and the real edge geometry is only ever
     # tiled for the zoom band it's actually shown at.
-    gh_streets = GeoHierarchy(crs=4326)
-    # A genuinely 0-row GeoDataFrame trips a geopandas edge case where
-    # `.area`/`.length` on an empty GeoSeries come back with a `geometry`
-    # dtype instead of float (breaking `GeoHierarchy.add_level`'s polars
-    # conversion) -- a single real row sidesteps that while still being
-    # negligible to tile (at most one tile touched per low zoom).
-    edges_empty = edges_wgs84.iloc[:1].copy()
-    gh_streets.add_level("edges_hidden", edges_empty, id_col="edge_id", agg=Max())
-    gh_streets.add_level("edges", _level_frame(edges_wgs84, "edge_id"), id_col="edge_id", agg=Max())
-    streets_map = HierarchyMap(
-        gh_streets, levels=["edges_hidden", "edges"], tiles_dir=str(os.path.join(tiles_dir_rel, "streets")), use_pmtiles=use_pmtiles,
-        extract_xyz=(renderer == "folium"),
-    )
-    # `layer_type="street_overlay"` (registry kind="line") -- without it,
-    # MapLibre defaults every level to the "polygon"/fill kind, which
-    # silently renders nothing for LineString edge geometry (a "fill" GL
-    # layer only draws Polygon/MultiPolygon features).
-    streets_map.configure_level(
-        "edges_hidden", style_js=edges_style, popup_fields=[score_col],
-        layer_type="street_overlay",
-        maplibre_paint=_score_maplibre_paint("line", score_col, score_domain),
-    )
-    streets_map.configure_level(
-        "edges", style_js=edges_style, popup_fields=[score_col],
-        layer_type="street_overlay",
-        maplibre_paint=_score_maplibre_paint("line", score_col, score_domain),
-    )
-    streets_map.set_resolution("edges_hidden", min_zoom=0, max_zoom=street_min_zoom - 1)
-    streets_map.set_resolution("edges", min_zoom=street_min_zoom, max_zoom=25)
-    if not skip_tile_build:
-        with contextlib.chdir(out_dir):
-            _use_external_writers(streets_map, "streets")
-            streets_map.build(free_level_data=True)
-            _trim_malloc()
+    if include_streets:
+        gh_streets = GeoHierarchy(crs=4326)
+        # A genuinely 0-row GeoDataFrame trips a geopandas edge case where
+        # `.area`/`.length` on an empty GeoSeries come back with a `geometry`
+        # dtype instead of float (breaking `GeoHierarchy.add_level`'s polars
+        # conversion) -- a single real row sidesteps that while still being
+        # negligible to tile (at most one tile touched per low zoom).
+        edges_empty = edges_wgs84.iloc[:1].copy()
+        gh_streets.add_level("edges_hidden", edges_empty, id_col="edge_id", agg=Max())
+        gh_streets.add_level("edges", _level_frame(edges_wgs84, "edge_id"), id_col="edge_id", agg=Max())
+        streets_map = HierarchyMap(
+            gh_streets, levels=["edges_hidden", "edges"], tiles_dir=str(os.path.join(tiles_dir_rel, "streets")), use_pmtiles=use_pmtiles,
+            extract_xyz=(renderer == "folium"),
+        )
+        # `layer_type="street_overlay"` (registry kind="line") -- without it,
+        # MapLibre defaults every level to the "polygon"/fill kind, which
+        # silently renders nothing for LineString edge geometry (a "fill" GL
+        # layer only draws Polygon/MultiPolygon features).
+        streets_map.configure_level(
+            "edges_hidden", style_js=edges_style, popup_fields=[score_col],
+            layer_type="street_overlay",
+            maplibre_paint=_score_maplibre_paint("line", score_col, score_domain),
+        )
+        streets_map.configure_level(
+            "edges", style_js=edges_style, popup_fields=[score_col],
+            layer_type="street_overlay",
+            maplibre_paint=_score_maplibre_paint("line", score_col, score_domain),
+        )
+        streets_map.set_resolution("edges_hidden", min_zoom=0, max_zoom=street_min_zoom - 1)
+        streets_map.set_resolution("edges", min_zoom=street_min_zoom, max_zoom=25)
+        if not skip_tile_build:
+            with contextlib.chdir(out_dir):
+                _use_external_writers(streets_map, "streets")
+                streets_map.build(free_level_data=True)
+                _trim_malloc()
 
-    overlay_maps = {"streets": streets_map}
-    overlay_show = {"streets": True}
+    overlay_maps = {"streets": streets_map} if include_streets else {}
+    overlay_show = {"streets": True} if include_streets else {}
 
     # --- "development" overlay: independent checkbox, always covers the full [0, 25] zoom range ---
     # Fixed at a single level/resolution -- not multi-resolution like the base
@@ -4109,7 +4786,7 @@ def build_city_map(
             dev_candidates = [r for r in resolutions if "equity_flag" in h3_by_resolution[r].columns]
             if not dev_candidates:
                 dev_candidates = resolutions
-            dev_res = 7 if 7 in dev_candidates else min(dev_candidates, key=lambda r: abs(r - 7))
+            dev_res = 8 if 8 in dev_candidates else min(dev_candidates, key=lambda r: abs(r - 8))   # development view is always H3 res 8
             dev_gdf = h3_by_resolution[dev_res]
             dev_level = f"h3_{dev_res}"
             resolve_dev_tiles = (not skip_tile_build) or force_development_tiles
@@ -4198,6 +4875,11 @@ def build_city_map(
     # census-when-available/hexagons-otherwise choice below, kept only as
     # dead documentation of the prior behavior).
     default_shape = "circles"
+    # Nationwide map (user, 2026-10): it opens on the census geometry, whose coarsest level is the STATE (counties, tracts, ... take
+    # over as the user zooms in), so a zoomed-out view never loads more than 51 polygons; circles / hexagons only load their own cells
+    # when the user switches to them.
+    if stats_scope_cfg and "census" in named_maps:
+        default_shape = "census"
     multi = MultiHierarchyMap(
         named_maps, default=default_shape, tiles_dir=None,
         overlay_hierarchy_maps=overlay_maps, overlay_show=overlay_show,
@@ -4274,6 +4956,7 @@ def build_city_map(
                 routes_gdf=routes_gdf,
                 score_domain=score_domain,
                 stops_chunks=stops_chunks,
+                routes_chunks=routes_chunks,
             )
             if stats_by_area:
                 # computeAccess() port (item 2 of the session's port) --
@@ -4284,9 +4967,7 @@ def build_city_map(
                 _editor_finest = next(iter(stats_by_area.values()))
                 _editor_fields = _stats_field_candidates(_editor_finest)
                 _editor_count_fields = circle_fields if circle_fields else _stats_count_fields(_editor_fields)
-                stats_data_json = _stats_json_data(
-                    stats_by_area, list(dict.fromkeys(_editor_fields + _editor_count_fields))
-                )
+                stats_data_json = ''   # unused: the stats panel's script defines window.__statsData
                 _inject_maplibre_editor_into_saved_html(
                     os.path.basename(out_html_abs),
                     params=load_edit_params(),
@@ -4345,6 +5026,7 @@ def build_city_map(
                 os.path.basename(out_html_abs),
                 score_domain=score_domain,
                 show_development=show_development,
+                legend_by_res=_circle_legend_by_res(h3_by_resolution, circle_fields or [], radius_field_domains_by_res),
             )
             if downloads_manifest:
                 # "Download data" panel (user-requested): offers real
@@ -4360,6 +5042,10 @@ def build_city_map(
                     os.path.basename(out_html_abs),
                     downloads_manifest=downloads_manifest,
                 )
+            # Circle view: each resolution's zoom band from its on-screen cell spacing and the zooms its tiles hold (see circle_bands.py).
+            from .circle_bands import apply_to_page as _circle_bands_apply
+
+            _circle_bands_apply(out_html_abs)
         else:
             multi.save(os.path.basename(out_html_abs))
             _inject_controls_into_saved_html(
@@ -4387,8 +5073,56 @@ def build_city_map(
 
     if stats_by_area:
         write_stats_data_json(out_html_abs, stats_by_area)
+        if not stats_scope_cfg and 9 in (h3_by_resolution or {}):
+            try:
+                write_city_popup9(out_html_abs, h3_by_resolution[9], stats_by_area)
+            except Exception as exc:  # noqa: BLE001   (the popup then reads the res-8 stats data)
+                print(f"[map] res-9 popup files skipped: {exc!r}", flush=True)
 
     return out_html_abs
+
+
+def write_city_popup9(out_html_abs: str, cells9, stats_by_area: Dict[str, gpd.GeoDataFrame]) -> str:
+    """`results/popup9/` of a city map (transitlos.map.popup_cells): the populated res-9 cells with the stats panel's columns, and per
+    analysis area (urban area, metro area, municipality, city core: a res-9 cell belongs to an area when its res-8 parent does) the
+    quantile tables of the popup's percentiles. The cells also go to `results/map_inputs_checkpoint/popup9_cells.parquet` for the
+    all-cities table of the combined map (`world_quantiles9.json`).
+
+    Args:
+        out_html_abs: Absolute path of the city's ``map.html``.
+        cells9: Res-9 cells with the map's columns.
+        stats_by_area: ``{area: GeoDataFrame}`` of the stats panel.
+
+    Returns:
+        The ``popup9`` folder.
+    """
+    import h3 as _h3
+
+    from .popup_cells import write_popup_cells
+
+    finest = next(iter(stats_by_area.values()))
+    fields = list(dict.fromkeys(["level_of_service", "population"] + _stats_field_candidates(finest) + _stats_count_fields(_stats_field_candidates(finest))))
+    df = pd.DataFrame(cells9.drop(columns="geometry", errors="ignore"))
+    pop = pd.to_numeric(df["population"], errors="coerce").fillna(0) if "population" in df.columns else pd.Series(1.0, index=df.index)
+    df = df[pop > 0].reset_index(drop=True)
+    cols = [f for f in fields if f in df.columns and pd.api.types.is_numeric_dtype(df[f])]
+    ids = df["h3_cell"].astype(str).to_numpy()
+    par8 = np.array([_h3.cell_to_parent(c, 8) for c in ids])
+    scopes = {}
+    for area, g in stats_by_area.items():
+        if "h3_cell" not in g.columns:
+            continue
+        member = np.isin(par8, g["h3_cell"].astype(str).to_numpy())
+        scopes[area] = np.where(member, "all", None).astype(object)
+    results_dir = os.path.join(os.path.dirname(out_html_abs), "results")
+    import shutil
+
+    shutil.rmtree(os.path.join(results_dir, "popup9"), ignore_errors=True)
+    out = write_popup_cells(df[["h3_cell"] + cols], results_dir, scopes, wide=tuple(scopes), cols=cols)
+    ck = os.path.join(results_dir, "map_inputs_checkpoint")
+    os.makedirs(ck, exist_ok=True)
+    df[cols].astype("float32").to_parquet(os.path.join(ck, "popup9_cells.parquet"))
+    return out
 
 
 def write_stats_data_json(out_html_abs: str, stats_by_area: Dict[str, gpd.GeoDataFrame]) -> str:
@@ -4406,6 +5140,13 @@ def write_stats_data_json(out_html_abs: str, stats_by_area: Dict[str, gpd.GeoDat
     Uses the same field selection as the inlined payload
     (`_stats_field_candidates`/`_stats_count_fields` over the finest area's
     columns) so the two stay in sync.
+
+    Args:
+        out_html_abs: Absolute path of the city's ``map.html``.
+        stats_by_area: ``{area: GeoDataFrame}`` of the stats panel.
+
+    Returns:
+        Path of the written JSON.
     """
     finest = next(iter(stats_by_area.values()))
     fields = _stats_field_candidates(finest)
@@ -4425,6 +5166,10 @@ def write_stats_data_json(out_html_abs: str, stats_by_area: Dict[str, gpd.GeoDat
 def _stats_field_candidates(gdf: gpd.GeoDataFrame) -> List[str]:
     """Numeric, non-identifier, non-score columns available for regression/ANOVA."""
     return _numeric_field_candidates(gdf, extra_exclude=["level_of_service"])
+
+
+_WORLDPOP_DIFF_FIELDS = ("population_overestimation_vs_census", "population_underestimation_vs_census",
+                        "worldpop_overestimation_share", "worldpop_underestimation_share")
 
 
 def _stats_count_fields(fields: List[str]) -> List[str]:
@@ -4458,6 +5203,48 @@ def _stats_json_data(stats_by_area: Dict[str, gpd.GeoDataFrame], fields: List[st
     return json.dumps(payload)
 
 
+_AREA_LABELS_4 = {"metro": "UN metro area", "core": "UN urban core", "official": "Metro area", "municipality": "Municipality"}
+_ACTIVE_AREAS: List[str] = ["metro", "core"]   # set by build_city_map from `stats_by_area`; four analysis areas for the city-science cities
+
+
+def _dl_scope_html() -> str:
+    """Scope selector of the download panel: only for the legacy metro / core maps. Four-area maps download one file set of the whole processing area (each row
+    carries `area_un_metro`, `area_official_metro`, `area_municipality` and `area_un_core` flags), so the tile and data folders hold the area once."""
+    if len(_ACTIVE_AREAS) > 2:
+        return ""
+    return ('<label style="display:block;font-weight:600;margin-bottom:4px;">Scope</label>\n'
+            '  <select id="dlScopeSelect" style="width:100%;margin-bottom:10px;font:12px sans-serif;padding:3px;">\n'
+            f'    {_area_options_html()}\n  </select>')
+
+
+def _area_options_html(short: bool = False) -> str:
+    """<option>s of every Area / Scope selector: UN areas are labelled with a leading "UN"; the first (UN metro area) is the default."""
+    four = "official" in _ACTIVE_AREAS
+    legacy = {"metro": ("Metro area", "Metro"), "core": ("City core", "Core")}
+    order = [k for k in ("metro", "core", "official", "municipality") if k in _ACTIVE_AREAS]
+    return "\n".join(f'<option value="{k}"{" selected" if i == 0 else ""}>{_AREA_LABELS_4[k] if four else legacy[k][1 if short else 0]}</option>' for i, k in enumerate(order))
+
+
+def _main_controls_html(prefix: str) -> str:
+    """The main `Area` + `Scenario` dropdowns at the top of the Distribution / Regression / Census tabs."""
+    return f"""
+    <div style="margin-bottom:6px;display:flex;gap:6px;">
+      <div id="{prefix}AreaWrap" style="flex:1;">
+        <label>Area</label>
+        <select id="{prefix}AreaSelect" style="width:100%;">
+          {_area_options_html()}
+        </select>
+      </div>
+      <div id="{prefix}ScenarioWrap" style="flex:1;">
+        <label>Scenario</label>
+        <select id="{prefix}ScenarioSelect" style="width:100%;">
+          <option value="" selected>Original</option>
+          <option value="With edits">With edits</option>
+        </select>
+      </div>
+    </div>"""
+
+
 def _compare_with_control_html(
     prefix: str,
     secondary_scenario_options: str,
@@ -4467,46 +5254,22 @@ def _compare_with_control_html(
     enable_place_comparison: bool,
     place_options: str = "",
 ) -> str:
-    """One "Compare with" button + popover for a stats-panel tab.
+    """"Compare with" control of a stats tab: an enable checkbox (off by default) + a popover with its sub-selectors.
 
-    Redesign (user feedback, 2026-08-19): a tab used to expose its comparison
-    axes as N separate flat `<select>`s sitting side by side (e.g.
-    Distribution had "Compare with column" AND "Compare with scenario" as two
-    equally-weighted dropdowns). The user asked for these to instead read as
-    ONE "Compare with" control that opens a small panel containing whichever
-    of the (up to 4) sub-dimensions actually apply to this tab/map:
-      - column: only meaningful for Distribution's histogram overlay -- every
-        other tab already has a fixed field (level_of_service) so a column picker
-        would be redundant there.
-      - scenario: always offered when the editor's named-scenario system
-        exists (`window.__editor.state.scenarios`).
-      - area (city core / metro area): only offered when this map's
-        `stats_by_area` genuinely has more than one area (`has_multi_area`)
-        -- a single-area map has nothing to toggle.
-      - place: only offered when the map was built with
-        `enable_place_comparison=True` (multi-place rosters like
-        CS_transitLOS; off for single-place maps like boston_city).
-    All still-relevant `<select>` element ids are unchanged
-    (`{prefix}SecondaryScenarioSelect`, `{prefix}OverlaySelect`) so the
-    existing render/read functions keep working; two NEW ids are added when
-    applicable: `{prefix}CompareAreaSelect`, `{prefix}ComparePlaceSelect`.
+    Sub-selectors (all default, in JS, to the SAME values as the tab's main Area / Scenario selectors, the main
+    "Distribute by" column and the place the map is showing; the user may change any of them):
+      - Column (`{prefix}OverlaySelect`): Distribution only, any count column;
+      - Scenario (`{prefix}SecondaryScenarioSelect`): Original / With edits;
+      - Area (`{prefix}CompareAreaSelect`): Metro area / City core;
+      - Place (`{prefix}ComparePlaceSelect`): only when the map has a place roster.
+    The comparison is drawn only while `{prefix}CompareEnable` is checked.
     """
     rows = []
     if include_column:
-        # 2026-09-25 reversal (verbatim user request: "under distribution as
-        # compare with should be nothing by default I dont want to see any
-        # purple bars until I do not select anything to compare with") --
-        # supersedes the 2026-09-23 decision recorded here previously,
-        # which deliberately dropped the "None" placeholder so the browser
-        # defaulted to the first real column, turning the secondary series
-        # on by default. Restored: "None" is a real first option, selected
-        # by default, so `renderDistribution()`'s `overlayField !== 'none'`
-        # check reads false until the user actually picks a column.
         rows.append(f"""
         <div style="margin-bottom:6px;">
           <label>Column</label>
           <select id="{prefix}OverlaySelect" style="width:100%;">
-            <option value="none" selected></option>
             {overlay_options}
           </select>
         </div>""")
@@ -4517,29 +5280,13 @@ def _compare_with_control_html(
             {secondary_scenario_options}
           </select>
         </div>""")
-    if has_multi_area:
-        rows.append(f"""
+    rows.append(f"""
         <div style="margin-bottom:6px;">
-          <label>City core / metro area</label>
+          <label>Area</label>
           <select id="{prefix}CompareAreaSelect" style="width:100%;">
-            <option value="metro">Metro area</option>
-            <option value="core">City core</option>
+            {_area_options_html()}
           </select>
         </div>""")
-    # Item 4 (verbatim user request, 2026-08-19): the per-tab "Place"
-    # cross-place select was REMOVED here at the time -- that functionality
-    # was folded entirely into the stats panel's "Place rank" tab (a
-    # column-weighted median used to RANK places), not a per-tab "compare
-    # this chart against another place" control.
-    #
-    # 2026-09-02 follow-up (explicit user request, verbatim: "on global map
-    # compare with should allow to select city core/metro, scenario and
-    # place so that cities can be compared between them in regression anova
-    # distribution etc"): re-added. `enable_place_comparison` alone used to
-    # gate the tab; now also requires real `place_options` (built from
-    # `place_manifest` -- empty/`None` for a caller with no cross-place
-    # roster, e.g. a standalone per-city `map.html`) so the row never shows
-    # an empty, useless dropdown.
     if enable_place_comparison and place_options:
         rows.append(f"""
         <div style="margin-bottom:6px;">
@@ -4550,11 +5297,12 @@ def _compare_with_control_html(
           </select>
         </div>""")
     return f"""
-    <div class="compareWithWrap" style="position:relative;margin-bottom:6px;">
+    <div class="compareWithWrap" style="position:relative;margin-bottom:6px;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="{prefix}CompareEnable" title="Activate the comparison" style="margin:0;">
       <button type="button" class="compareWithBtn" data-target="{prefix}ComparePopover"
-        style="width:100%;text-align:left;padding:5px 8px;border:1px solid #d5d9de;border-radius:5px;
-        background:#f5f6f8;cursor:pointer;font:12px sans-serif;color:#333;">
-        Compare with <span style="float:right;color:#888;">&#9662;</span>
+        style="flex:1;text-align:left;padding:5px 8px;border:1px solid #d5d9de;border-radius:5px;
+        background:#f5f6f8;cursor:pointer;font:12px sans-serif;color:#333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+        <span class="cmpWith">Compare with</span><span class="cmpSel" style="color:#556;font-weight:600;"></span><span style="float:right;color:#888;">&#9662;</span>
       </button>
       <div id="{prefix}ComparePopover" class="compareWithPopover" style="display:none;position:absolute;
         top:100%;left:0;right:0;z-index:1001;background:white;border:1px solid #d5d9de;border-radius:5px;
@@ -4653,8 +5401,7 @@ def _stats_panel_html(
     # client-side once real scenarios exist, preserving whichever value was
     # already selected.
     secondary_scenario_options = (
-        '<option value="none" selected>None</option>'
-        '<option value="">Original</option>'
+        '<option value="" selected>Original</option>'
         '<option value="With edits">With edits</option>'
     )
     # Re-added "Compare with place" row's own `<option>`s -- see this
@@ -4747,12 +5494,7 @@ def _stats_panel_html(
     {other_tab_btns}
     {metadata_tab_btn}
   </div>
-  <div id="statsAreaBtnRow" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px;">
-    <div style="display:flex;gap:4px;">
-      <button class="statsAreaBtn active" data-area="metro">Metro area</button>
-      <button class="statsAreaBtn" data-area="core">City core</button>
-    </div>
-  </div>
+  <div id="statsAreaBtnRow" style="height:0;overflow:hidden;margin:0;"></div>
   <!-- The MAIN column/series of every tab below always follows whichever
        scenario is currently active in the editor panel (exactly as it did
        before the optional secondary-scenario feature existed) -- there is no
@@ -4803,12 +5545,21 @@ def _stats_panel_html(
         </select>
       </div>
     </div>
+    <div style="margin-bottom:6px;">
+      <label>Rank by</label>
+      <select id="placeRankByVarSelect" style="width:100%;">
+        <option value="score" selected>Level of service</option>
+        <option value="pop">Population</option>
+        <option value="vkm">Veh-km per day</option>
+        <option value="vkmpc">Veh-km per 1,000 pop</option>
+        <option value="transit">Transit share</option>
+      </select>
+    </div>
     <div style="margin-bottom:6px;display:flex;gap:6px;">
       <div style="flex:1;">
         <label>Area</label>
         <select id="placeRankAreaSelect" style="width:100%;">
-          <option value="metro" selected>Metro</option>
-          <option value="core">Core</option>
+          {_area_options_html(True)}
         </select>
       </div>
       <div style="flex:1;">
@@ -4831,6 +5582,7 @@ def _stats_panel_html(
          "Compare with scenario" were the main/top control for Distribution.
          The two comparison dropdowns now live in their own row below,
          clearly secondary to "Distribute by". -->
+    {_main_controls_html("dist")}
     <div style="margin-bottom:6px;display:flex;gap:6px;">
       <div style="flex:2;">
         <label>Distribute by</label>
@@ -4852,19 +5604,26 @@ def _stats_panel_html(
   </div>
 
   <div id="statsTab_regression" class="statsTabPanel" style="display:none;">
-    <div style="margin-bottom:6px;">
-      <label>Compare access with</label>
-      <select id="regFieldSelect" style="width:100%;">
-        {reg_options}
-      </select>
-    </div>
+    {_main_controls_html("reg").replace('      <div id="regScenarioWrap" style="flex:1;">', '      <div id="regScenarioWrap" style="flex:1;min-width:0;">').replace(
+        """      </div>
+    </div>""", f"""      </div>
+      <div style="flex:2;min-width:0;">
+        <label>Compare access with</label>
+        <select id="regFieldSelect" style="width:100%;">
+          {reg_options}
+        </select>
+      </div>
+    </div>""", 1)}
     <!-- No column dimension in this tab's "Compare with" popover (item 1
          correction) -- regression is always level_of_service vs. the field
          above; only Distribution's "Compare with" popover offers a column
          sub-selector. -->
     {_compare_with_control_html("reg", secondary_scenario_options, False, "", has_multi_area, enable_place_comparison, place_options)}
-    <div id="regSummary" style="font-weight:600;margin-bottom:6px;"></div>
-    <div id="regPlot"></div>
+    <div style="position:relative;">
+      <div id="regPlot"></div>
+      <div id="regSummary" style="position:absolute;top:4px;right:6px;font-weight:600;font-size:11px;line-height:1.3;text-align:right;
+           background:rgba(255,255,255,.82);border-radius:4px;padding:2px 6px;pointer-events:none;max-width:60%;"></div>
+    </div>
     <!-- Every candidate variable's R^2 against level_of_service, ANOVA-bar
          styled, so "which variable explains access best" is readable at a
          glance instead of requiring the dropdown to be walked one by one. -->
@@ -4873,6 +5632,7 @@ def _stats_panel_html(
   </div>
 
   <div id="statsTab_anova" class="statsTabPanel" style="display:none;">
+    {_main_controls_html("anova")}
     <!-- No column dimension in this tab's "Compare with" popover (item 1
          correction) -- ANOVA is always level_of_service split by each variable's
          own median. -->
@@ -5023,21 +5783,30 @@ def _metadata_tab_html(metadata_rows: List[Dict[str, str]]) -> str:
         return f"<td style='{style}'{title_attr}>{text}</td>"
 
     def _row(r: Dict) -> str:
-        native_levels = ", ".join(r.get("native_levels") or [])
-        resampled_levels = ", ".join(r.get("resampled_levels") or [])
+        def _level_name(x: str) -> str:   # h3_res8 -> "H3 res 8", census_locality -> "Census locality"
+            x = re.sub(r"^h3_res(\d+)$", r"H3 res \1", str(x))
+            return x[:1].upper() + x[1:].replace("_", " ") if not x.startswith("H3") else x
+        native_levels = ", ".join(_level_name(x) for x in (r.get("native_levels") or []))
+        resampled_levels = ", ".join(_level_name(x) for x in (r.get("resampled_levels") or []))
+        _orig = str(r.get("original_name") or "")
+        _orig = ", ".join(field_label(t) if re.match(r"^(age_structures|worldpop|acs|dhc|lodes|ba|statcan|ine|cbs|destatis|sii|pop_jobs)_", t) else t
+                          for t in (x.strip() for x in _orig.split(","))) if _orig else ""
+        _orig = "" if _orig == r.get("column") else _orig   # only a real source field name; the database name is not repeated here
+        _share_col = r.get("share_column")
+        _weight = str(r["weight_column"])
         resampling = f"{r.get('resampling_up_method') or ''} / {r.get('resampling_down_method') or ''}"
         description = str(r["description"])
         cells = [
             _td(escape(str(r["name"])), extra="font-weight:600;"),
-            _td(escape(str(r.get("original_name") or ""))),
+            _td(escape(_orig)),
             _td(escape(str(r["source"]))),
             _td(escape(str(r.get("country") or ""))),
             _td(escape(_fmt_num(r.get("total"))), extra="text-align:right;"),
             _td(escape(_fmt_num(r.get("mean"))), extra="text-align:right;"),
             _td(escape(_fmt_num(r.get("share"), "%")), extra="text-align:right;"),
-            _td(escape(str(r.get("share_column") or ""))),
+            _td(escape(field_label(_share_col) if _share_col else "")),
             _td(escape(str(r["unit"]))),
-            _td(escape(str(r["weight_column"]))),
+            _td(escape(field_label(_weight) if _weight in ("population",) or "_" in _weight else _weight)),
             _td(escape(native_levels)),
             _td(escape(resampled_levels)),
             _td(escape(resampling)),
@@ -5153,10 +5922,14 @@ def _stats_panel_js(
         default_field = "pop_jobs_density"
     elif "jobs_and_population_density" in regression_fields:
         default_field = "jobs_and_population_density"
+    elif "population_density" in regression_fields:
+        default_field = "population_density"
     elif "pop_density" in regression_fields:
         default_field = "pop_density"
+    elif "worldpop_population_density" in regression_fields:
+        default_field = "worldpop_population_density"
     else:
-        default_field = regression_fields[0] if regression_fields else "population"
+        default_field = ""   # no population / jobs / WorldPop column: the client picks the best-R2 column
     default_tab = "placerank" if enable_place_comparison else "distribution"
     enable_place_comparison_json = json.dumps(enable_place_comparison)
     has_multi_area_json = json.dumps(has_multi_area)
@@ -5164,6 +5937,8 @@ def _stats_panel_js(
 window.__enablePlaceComparison = {enable_place_comparison_json};
 window.__hasMultiArea = {has_multi_area_json};
 window.__statsArea = 'metro';
+// The place-rank-only page (combined map) does not ship the popup helper script that defines __fieldLabelsFor; fall back to raw names.
+if (typeof __fieldLabelsFor === 'undefined') {{ window.__fieldLabelsFor = function(fields) {{ var o = {{}}; fields.forEach(function(f) {{ o[f] = f; }}); return o; }}; }}
 window.__statsTab = {json.dumps(default_tab)};
 // The MAIN column always follows the editor's active scenario (i.e. plain
 // `getStatsData(area)`, no override) -- there is no independent "main
@@ -5279,6 +6054,46 @@ function __statsReservedName() {{
   return ((window.__editParams || {{}}).scenarios || {{}}).reserved_current_name || 'current';
 }}
 
+
+// ---- per-tab main controls (Area / Scenario) and the "Compare with" control (enable checkbox + Column / Scenario / Area / Place) ----
+function __ctl(prefix, name) {{ return document.getElementById(prefix + name); }}
+function __mainArea(prefix) {{ var el = __ctl(prefix, 'AreaSelect'); return (el && el.value) ? el.value : 'metro'; }}
+function __mainScenario(prefix) {{ var el = __ctl(prefix, 'ScenarioSelect'); return el ? el.value : undefined; }}
+function __mainData(prefix) {{ return getStatsData(__mainArea(prefix), __mainScenario(prefix)); }}
+function __compareOn(prefix) {{ if (window.__scopeActive && window.__scopeCompareOn) return !!window.__scopeCompareOn(); var el = __ctl(prefix, 'CompareEnable'); return !!(el && el.checked); }}
+// The place this page is showing (`<place>/map.html`), '' when it is not one of the roster's places.
+function __currentPlaceKey() {{
+  try {{
+    // combined (multi-place) page: the place currently shown in its map frame
+    if (typeof currentKey !== 'undefined' && currentKey) return currentKey;
+    var parts = window.location.pathname.split('/').filter(Boolean);
+    var keys = (typeof CS_PLACE_MANIFEST !== 'undefined' ? CS_PLACE_MANIFEST : []).map(function(c) {{ return c.key; }});
+    for (var i = parts.length - 1; i >= 0; i--) if (keys.indexOf(parts[i]) >= 0) return parts[i];
+  }} catch (e) {{}}
+  return '';
+}}
+function __hasOption(el, value) {{ return [].some.call(el.options, function(o) {{ return o.value === value; }}); }}
+// Compare selectors follow the main ones until the user changes them (re-synced whenever the comparison is switched on).
+function __syncCompareDefaults(prefix, force) {{
+  var sync = function(id, value) {{
+    var el = document.getElementById(id);
+    if (!el || value === undefined || value === null) return;
+    if ((force || !el.dataset.userSet) && __hasOption(el, value)) el.value = value;
+  }};
+  sync(prefix + 'CompareAreaSelect', __mainArea(prefix));
+  var ms = __mainScenario(prefix); sync(prefix + 'SecondaryScenarioSelect', ms === undefined ? '' : ms);
+  sync(prefix + 'ComparePlaceSelect', __currentPlaceKey());
+  if (prefix === 'dist') {{ var mf = document.getElementById('distMainSelect'); if (mf) sync('distOverlaySelect', mf.value); }}
+}}
+// The main Scenario follows the editor's active scenario (top bar) until the user picks one in the tab.
+function __followEditorScenario(prefix) {{
+  var el = __ctl(prefix, 'ScenarioSelect');
+  if (!el || el.dataset.userSet) return;
+  var ed = window.__editor, act = ed && ed.state && ed.state.activeScenario;
+  var v = (!act || act === __statsReservedName()) ? '' : act;
+  if (__hasOption(el, v)) el.value = v;
+}}
+
 // `scenario` is an explicit override, used only when resolving the stats
 // panel's OPTIONAL SECONDARY column (see `__secondaryScenarioData` below) --
 // '' or the reserved name both mean "baseline", any other string names a
@@ -5363,9 +6178,11 @@ function __fmt(n) {{ return n.toLocaleString(undefined, {{maximumFractionDigits:
 // (baseline) and from any real scenario name -- so it's checked separately
 // from just falsiness (`''` is a legitimate, selectable choice).
 function __secondaryScenarioValue(selId) {{
-  if (window.__scopeActive) return window.__scopeCompareOn() ? 'scope' : 'none';
+  var prefix = __comparePrefix(selId);
+  if (!__compareOn(prefix)) return 'none';
+  if (window.__scopeActive && !window.__scopeCompareOn()) return 'none';
   var sel = document.getElementById(selId);
-  return sel ? sel.value : 'none';
+  return sel ? sel.value : '';
 }}
 
 // Cross-place secondary-series cache: key -> fetched `results/stats_data.json`
@@ -5415,16 +6232,14 @@ function __comparePrefix(selId) {{
 // place's editor) -- both read the popover's own "City core / metro area"
 // sub-select when present, falling back to the main panel's current area.
 function __secondaryScenarioData(selId) {{
-  if (window.__scopeActive) return getStatsData('core');
   var prefix = __comparePrefix(selId);
-  var areaSel = document.getElementById(prefix + 'CompareAreaSelect');
-  var area = areaSel ? areaSel.value : window.__statsArea;
-  var placeSel = document.getElementById(prefix + 'ComparePlaceSelect');
-  var placeKey = placeSel ? placeSel.value : '';
-  if (placeKey) return __placeCompareData(placeKey, area);
-  var sel = __secondaryScenarioValue(selId);
-  if (sel === 'none') return null;
-  return getStatsData(area, sel);
+  if (!__compareOn(prefix)) return null;
+  var scenSel = document.getElementById(selId), scen = scenSel ? scenSel.value : '';
+  if (window.__scopeActive) return getStatsData('core', scen);          // nationwide map: compare scope picked in the scope bar
+  var areaSel = __ctl(prefix, 'CompareAreaSelect'), area = areaSel ? areaSel.value : __mainArea(prefix);
+  var placeSel = __ctl(prefix, 'ComparePlaceSelect'), placeKey = placeSel ? placeSel.value : '';
+  if (placeKey && placeKey !== __currentPlaceKey()) return __placeCompareData(placeKey, area);
+  return getStatsData(area, scen);
 }}
 
 // 2026-09-23 addition (verbatim user request, item 3: Distribution's own
@@ -5453,9 +6268,8 @@ function __rebuildDistColumnOptions(placeKey, area) {{
   if (!keys.length) return;
   var prev = sel.value;
   var __distLabels = __fieldLabelsFor(keys);
-  sel.innerHTML = '<option value="none"></option>' +
-    keys.map(function(k) {{ return '<option value="' + k + '">' + __distLabels[k] + '</option>'; }}).join('');
-  sel.value = (prev === 'none' || keys.indexOf(prev) !== -1) ? prev : 'none';
+  sel.innerHTML = keys.map(function(k) {{ return '<option value="' + k + '">' + __distLabels[k] + '</option>'; }}).join('');
+  sel.value = (keys.indexOf(prev) !== -1) ? prev : (keys.indexOf((document.getElementById('distMainSelect') || {{}}).value) !== -1 ? document.getElementById('distMainSelect').value : keys[0]);
 }}
 
 function renderDistribution() {{
@@ -5469,10 +6283,10 @@ function renderDistribution() {{
   // the Place-rank tab and every other cross-place "Compare with" lookup
   // already use).
   var __distPlaceSelForCols = document.getElementById('distComparePlaceSelect');
-  __rebuildDistColumnOptions(__distPlaceSelForCols ? __distPlaceSelForCols.value : '', window.__statsArea);
+  __rebuildDistColumnOptions((__distPlaceSelForCols && __distPlaceSelForCols.value !== __currentPlaceKey()) ? __distPlaceSelForCols.value : '', (__ctl('dist', 'CompareAreaSelect') || {{}}).value || __mainArea('dist'));
   // Main column: always the active scenario, exactly like every other panel
   // that reads `window.__statsData` -- no override here.
-  var data = getStatsData(window.__statsArea);
+  var data = __mainData('dist');
   var mainField = document.getElementById('distMainSelect').value;
   var overlayField = document.getElementById('distOverlaySelect').value;
   var scenSel = __secondaryScenarioValue('distSecondaryScenarioSelect');
@@ -5494,13 +6308,11 @@ function renderDistribution() {{
   // A secondary series exists iff at least one of the two pickers is set;
   // if BOTH are left at their defaults there is no secondary series at all.
   var distPlaceSel = document.getElementById('distComparePlaceSelect');
-  var distPlaceKey = distPlaceSel ? distPlaceSel.value : '';
+  var distPlaceKey = (distPlaceSel && distPlaceSel.value !== __currentPlaceKey()) ? distPlaceSel.value : '';
   var secField = overlayField !== 'none' ? overlayField : mainField;
-  var hasSecondary = (overlayField !== 'none') || (scenSel !== 'none') || !!distPlaceKey;
-  var secData = (scenSel !== 'none' || distPlaceKey) ? __secondaryScenarioData('distSecondaryScenarioSelect') : data;
-  var secLabel = __fieldLabel(secField);
-  if (distPlaceKey) secLabel += ' (' + distPlaceSel.options[distPlaceSel.selectedIndex].text + ')';
-  else if (scenSel !== 'none') secLabel += ' (' + __secondaryScenarioLabel(scenSel) + ')';
+  var hasSecondary = __compareOn('dist');
+  var secData = hasSecondary ? __secondaryScenarioData('distSecondaryScenarioSelect') : data;
+  var secLabel = __secondaryLabel('distSecondaryScenarioSelect', scenSel) + (secField !== mainField ? ' \u00b7 ' + __fieldLabel(secField) : '');
 
   var popSums = new Array(11).fill(0);
   // `secData` can be null while a cross-place fetch (`__placeCompareData`) is
@@ -5541,11 +6353,10 @@ function renderDistribution() {{
   // 2026-09-25, explicit user request: one line per value -- a line break
   // before each "...-weighted level of service" reading, not the whole
   // summary crammed onto a single " | "-separated line.
-  var summary = 'Total ' + mainLabel + ': <b>' + __fmt(totalPop) + '</b><br>' +
+  var summary = 'Total <span>' + mainLabel + '</span>: <b>' + __fmt(totalPop) + '</b><br>' +
     mainLabel + aggWord + weightedAccess.toFixed(1) + '</b>';
   if (weightedAccessSec != null) {{
-    summary += '<br>Total ' + secLabel + ': <b>' + __fmt(totalSec) + '</b><br>' +
-      secLabel + aggWord + weightedAccessSec.toFixed(1) + '</b>';
+    summary += '<br><span style="color:#8833cc;"><span>' + secLabel + '</span>: total <b>' + __fmt(totalSec) + '</b> \u00b7 weighted level of service <b>' + weightedAccessSec.toFixed(1) + '</b></span>';
   }}
 
   // Rescale check: compare the RAW value ranges of mainField (from the main
@@ -5625,8 +6436,8 @@ function renderDistribution() {{
     html += '<div style="margin-bottom:13px;">';
     html += '<div style="display:flex;justify-content:space-between;gap:8px;font-size:10.5px;color:#444;margin-bottom:2px;">' +
       '<span style="font-weight:600;">' + __binLabels[k] + '</span>' +
-      '<span style="white-space:nowrap;">' + mainLabel + ': ' + __fmt(popSums[k]) + ' (' + popPct.toFixed(1) + '%)' +
-      (secSums ? '<span style="color:#8833cc;"> &nbsp;|&nbsp; ' + secLabel + ': ' + __fmt(secSums[k]) + ' (' + secPct.toFixed(1) + '%)</span>' : '') +
+      '<span style="white-space:nowrap;">' + __fmt(popSums[k]) + ' (' + popPct.toFixed(1) + '%)' +
+      (secSums ? '<span style="color:#8833cc;"> &nbsp;|&nbsp; ' + __fmt(secSums[k]) + ' (' + secPct.toFixed(1) + '%)</span>' : '') +
       '</span></div>';
     html += '<div style="background:#eef1f4;border-radius:4px;height:11px;overflow:hidden;">' +
       '<div style="background:' + binColor + ';height:100%;border-radius:4px;width:' + popBarPct + '%;"></div></div>';
@@ -5663,8 +6474,18 @@ function __weightedLinReg(xs, ys, ws) {{
     if (x == null || y == null || !x || !y || isNaN(x) || isNaN(y) || w == null || isNaN(w) || w <= 0) continue;
     sx.push(x); sy.push(y); sw.push(w);
   }}
+  // A handful of extreme x values (a few huge-density cells) used to dominate the fit and stretch the chart: the top 1% of x is left out.
+  if (sx.length > 50) {{
+    var sorted = sx.slice().sort(function(a, b) {{ return a - b; }});
+    var cutoff = sorted[Math.floor(0.99 * (sorted.length - 1))];
+    var kx = [], ky = [], kw = [];
+    for (var q = 0; q < sx.length; q++) if (sx[q] <= cutoff) {{ kx.push(sx[q]); ky.push(sy[q]); kw.push(sw[q]); }}
+    sx = kx; sy = ky; sw = kw;
+  }}
   var n = sx.length;
-  if (n < 2) return {{slope: NaN, intercept: NaN, r2: NaN, n: n, xs: sx, ys: sy}};
+  var distinctPts = {{}}, nDistinct = 0;   // a regression needs at least 5 different points
+  for (i = 0; i < n; i++) {{ var kk = sx[i] + '|' + sy[i]; if (!distinctPts[kk]) {{ distinctPts[kk] = 1; nDistinct++; }} }}
+  if (n < 2 || nDistinct < 5) return {{slope: NaN, intercept: NaN, r2: NaN, n: n, xs: sx, ys: sy, ws: sw}};
   var W = sw.reduce(function(a, b) {{ return a + b; }}, 0);
   var xMean = 0, yMean = 0;
   for (i = 0; i < n; i++) {{ xMean += sw[i] * sx[i]; yMean += sw[i] * sy[i]; }}
@@ -5680,7 +6501,7 @@ function __weightedLinReg(xs, ys, ws) {{
     ssTot += sw[i] * Math.pow(sy[i] - yMean, 2);
   }}
   var r2 = ssTot > 0 ? 1 - ssRes / ssTot : NaN;
-  return {{slope: slope, intercept: intercept, r2: r2, n: n, xs: sx, ys: sy}};
+  return {{slope: slope, intercept: intercept, r2: r2, n: n, xs: sx, ys: sy, ws: sw}};
 }}
 
 function __niceTicks(min, max, n) {{
@@ -5722,11 +6543,19 @@ function __secondaryScenarioLabel(sel) {{
 // scenario) so the label always describes whichever source the number
 // actually came from.
 function __secondaryLabel(selId, sel) {{
-  if (window.__scopeActive) return window.__scopeLabel('core');
-  var prefix = __comparePrefix(selId);
-  var placeSel = document.getElementById(prefix + 'ComparePlaceSelect');
-  if (placeSel && placeSel.value) return placeSel.options[placeSel.selectedIndex].text;
-  return __secondaryScenarioLabel(sel);
+  // Short: only what DIFFERS from the main series (other place / other area / other scenario), e.g. "City core" or "Boston . With edits".
+  var prefix = __comparePrefix(selId), parts = [];
+  if (window.__scopeActive) {{
+    parts.push(window.__scopeLabel('core'));
+  }} else {{
+    var placeSel = __ctl(prefix, 'ComparePlaceSelect');
+    if (placeSel && placeSel.value && placeSel.value !== __currentPlaceKey()) parts.push(placeSel.options[placeSel.selectedIndex].text);
+    var areaSel = __ctl(prefix, 'CompareAreaSelect');
+    if (areaSel && areaSel.value !== __mainArea(prefix)) parts.push(areaSel.options[areaSel.selectedIndex].text);
+  }}
+  var mainScen = __mainScenario(prefix) || '';
+  if ((sel || '') !== mainScen) parts.push(sel === '' ? 'Original' : sel);
+  return parts.length ? parts.join(' \u00b7 ') : 'Compare';
 }}
 
 function renderRegression() {{
@@ -5735,7 +6564,7 @@ function renderRegression() {{
   // picker anymore (item 1 correction). The only optional extra is a whole
   // SECOND SERIES from a different scenario (same field, same level_of_service
   // target), controlled by the shared "Compare with scenario" dropdown.
-  var data = getStatsData(window.__statsArea);
+  var data = __mainData('reg');
   var field = document.getElementById('regFieldSelect').value;
   var rawX = data[field];
   var logX = rawX.map(function(v) {{ return (v != null && v > 0) ? Math.log(v) : null; }});
@@ -5746,7 +6575,8 @@ function renderRegression() {{
   var logFit = __weightedLinReg(logX, data.level_of_service, data.population);
   var useLog = isFinite(logFit.r2) && (!isFinite(rawFit.r2) || logFit.r2 > rawFit.r2);
   var fit = useLog ? logFit : rawFit;
-  var fieldLabelUnit = __fieldLabel(field);
+  var __fSel = document.getElementById('regFieldSelect');   // the dropdown's own text: the same (translated) label the user picked
+  var fieldLabelUnit = (__fSel && __fSel.selectedIndex >= 0 && __fSel.options[__fSel.selectedIndex].text) || __fieldLabel(field);
   var fieldLabel = useLog ? ('log(' + fieldLabelUnit + ')') : fieldLabelUnit;
 
   var secSel = __secondaryScenarioValue('regSecondaryScenarioSelect');
@@ -5763,13 +6593,12 @@ function renderRegression() {{
     }}
   }}
 
-  var summaryText = 'level_of_service ~ ' + fieldLabel + '   R\\u00b2=' + (isFinite(fit.r2) ? fit.r2.toFixed(2) : 'n/a') + '   n=' + fit.n +
-    (useLog ? '  (log fits better)' : '');
+  var summaryHtml = '<div style="font-size:15px;font-weight:800;color:#c0392b;line-height:1.1;">R\\u00b2 = ' + (isFinite(fit.r2) ? fit.r2.toFixed(2) : 'n/a') + '</div>';
   if (hasSecondary && secFit) {{
-    summaryText += '   |   ' + __secondaryLabel('regSecondaryScenarioSelect', secSel) + ': R\\u00b2=' +
-      (isFinite(secFit.r2) ? secFit.r2.toFixed(2) : 'n/a') + '   n=' + secFit.n;
+    summaryHtml += '<div style="font-weight:400;">' + __secondaryLabel('regSecondaryScenarioSelect', secSel) + ': R\\u00b2 = ' +
+      (isFinite(secFit.r2) ? secFit.r2.toFixed(2) : 'n/a') + '</div>';
   }}
-  document.getElementById('regSummary').textContent = summaryText;
+  document.getElementById('regSummary').innerHTML = summaryHtml;
 
   var w = 420, h = 280, padL = 55, padB = 34, padT = 12, padR = 12;
   var xs = fit.xs, ys = fit.ys;
@@ -5780,6 +6609,8 @@ function renderRegression() {{
     xMin = Math.min(xMin, __arrMin(secFit.xs)); xMax = Math.max(xMax, __arrMax(secFit.xs));
     yMin = Math.min(yMin, __arrMin(secFit.ys)); yMax = Math.max(yMax, __arrMax(secFit.ys));
   }}
+  if (!isFinite(xMin) || !isFinite(xMax)) {{ xMin = 0; xMax = 1; }}   // no finite data for this field
+  if (!isFinite(yMin) || !isFinite(yMax)) {{ yMin = 0; yMax = 1; }}
   var xr = xMax - xMin || 1, yr = yMax - yMin || 1;
   function px(x) {{ return padL + (x - xMin) / xr * (w - padL - padR); }}
   function py(y) {{ return h - padB - (y - yMin) / yr * (h - padT - padB); }}
@@ -5792,12 +6623,24 @@ function renderRegression() {{
   // clipping -- parametrize the segment and keep only the portion whose y
   // falls inside [yMin, yMax].
   function scatterAndFit(fitObj, pointColor, lineColor) {{
-    var xsL = fitObj.xs, ysL = fitObj.ys;
+    var xsL = fitObj.xs, ysL = fitObj.ys, wsL = fitObj.ws;
     var maxPoints = 1500;
     var step = Math.max(1, Math.floor(xsL.length / maxPoints));
+    var idx = [], inIdx = {{}}, i;
+    for (i = 0; i < xsL.length; i += step) {{ idx.push(i); inIdx[i] = 1; }}
+    var wMax = 0;
+    if (wsL) {{
+      for (i = 0; i < wsL.length; i++) if (wsL[i] > wMax) wMax = wsL[i];
+      // the populous cells carry the fit: always draw the 300 heaviest, even when the rest is thinned out
+      var heavy = wsL.map(function(v, k) {{ return k; }}).sort(function(a, b) {{ return wsL[b] - wsL[a]; }}).slice(0, 300);
+      heavy.forEach(function(k) {{ if (!inIdx[k]) {{ idx.push(k); inIdx[k] = 1; }} }});
+      idx.sort(function(a, b) {{ return wsL[a] - wsL[b]; }});   // light cells first, so the heavy ones stay on top
+    }}
     var out = '';
-    for (var i = 0; i < xsL.length; i += step) {{
-      out += '<circle cx="' + px(xsL[i]).toFixed(1) + '" cy="' + py(ysL[i]).toFixed(1) + '" r="2" fill="' + pointColor + '" opacity="0.35"></circle>';
+    for (var j = 0; j < idx.length; j++) {{
+      i = idx[j];
+      var rr = (wsL && wMax > 0) ? (1.5 + 8 * Math.sqrt(wsL[i] / wMax)) : 2;   // point area grows with the cell's population (the fit weight)
+      out += '<circle cx="' + px(xsL[i]).toFixed(1) + '" cy="' + py(ysL[i]).toFixed(1) + '" r="' + rr.toFixed(1) + '" fill="' + pointColor + '" opacity="0.35"></circle>';
     }}
     if (isFinite(fitObj.slope)) {{
       var lx0 = xMin, ly0 = fitObj.slope * xMin + fitObj.intercept;
@@ -5921,7 +6764,7 @@ function renderRegression() {{
     axes += '<line x1="' + padL + '" y1="' + y + '" x2="' + (w - padR) + '" y2="' + y + '" stroke="#eee"></line>';
   }});
   var labels = '<text x="' + (padL + (w - padL - padR) / 2) + '" y="' + (h - 4) + '" font-size="10" text-anchor="middle" fill="#444">' + fieldLabel + '</text>' +
-    '<text x="12" y="' + (padT + (h - padT - padB) / 2) + '" font-size="10" text-anchor="middle" fill="#444" transform="rotate(-90 12 ' + (padT + (h - padT - padB) / 2) + ')">level_of_service</text>';
+    '<text x="12" y="' + (padT + (h - padT - padB) / 2) + '" font-size="10" text-anchor="middle" fill="#444" transform="rotate(-90 12 ' + (padT + (h - padT - padB) / 2) + ')">Transit score</text>';
 
   var legend = '';
   if (haveSecPoints) {{
@@ -5959,6 +6802,21 @@ function __bestR2(data, field) {{
 // track), minus the centered zero line: R^2 is one-directional, so the bar
 // simply fills from the left. Non-positive fits are excluded outright rather
 // than drawn as empty rows.
+// R^2 order of every visible column for the active scope, recomputed whenever a column dropdown opens (so the dropdown order always
+// equals the Regression tab's bars, even before that tab was ever rendered).
+window.__refreshR2Order = function() {{
+  try {{
+    var data = __mainData('reg'), res = [];
+    __anovaFields.forEach(function(field) {{
+      if (window.__colVisible && !window.__colVisible(field)) return;
+      var hit = __bestR2(data, field);
+      if (hit && hit.r2 > 0) res.push({{field: field, r2: hit.r2}});
+    }});
+    res.sort(function(a, b) {{ return b.r2 - a.r2; }});
+    window.__r2Order = res.map(function(r) {{ return r.field; }}).concat(__anovaFields.filter(function(f) {{ return !res.some(function(r) {{ return r.field === f; }}); }}));
+  }} catch (e) {{}}
+}};
+
 function renderR2Bars(selectedField) {{
   // Main series is always "every variable vs THIS (main/active-scenario)
   // column's level_of_service". The optional second bar per variable is the
@@ -5967,7 +6825,7 @@ function renderR2Bars(selectedField) {{
   // scenario" dropdown -- reuses regSecondaryScenarioSelect since this bar
   // chart lives in the same regression tab/section as renderRegression's
   // scatter plot (see renderRegression above for the identical pattern).
-  var data = getStatsData(window.__statsArea);
+  var data = __mainData('reg');
   var secSel = __secondaryScenarioValue('regSecondaryScenarioSelect');
   var r2PlaceSel = document.getElementById('regComparePlaceSelect');
   var r2PlaceKey = r2PlaceSel ? r2PlaceSel.value : '';
@@ -5976,6 +6834,7 @@ function renderR2Bars(selectedField) {{
 
   var results = [];
   __anovaFields.forEach(function(field) {{
+    if (window.__colVisible && !window.__colVisible(field)) return;
     var hit = __bestR2(data, field);
     if (!(hit && hit.r2 > 0)) return;
     var secHit = hasSecondary && secData ? __bestR2(secData, field) : null;
@@ -5985,6 +6844,7 @@ function renderR2Bars(selectedField) {{
     }});
   }});
   results.sort(function(a, b) {{ return b.r2 - a.r2; }});
+  window.__r2Order = results.map(function(r) {{ return r.field; }}).concat(__anovaFields.filter(function(f) {{ return !results.some(function(r) {{ return r.field === f; }}); }}));
   var maxR2 = results.length ? results[0].r2 : 1;
   results.forEach(function(r) {{ if (r.secR2 != null && r.secR2 > maxR2) maxR2 = r.secR2; }});
   var __r2Labels = __fieldLabelsFor(__anovaFields);
@@ -5995,7 +6855,7 @@ function renderR2Bars(selectedField) {{
     var color = isSel ? '#3a6ea8' : '#33aa55';
     html += '<div style="margin-bottom:6px;">';
     var rFieldLabel = __r2Labels[r.field];
-    html += '<div style="font-size:10.5px;color:#444;margin-bottom:2px;">' +
+    html += '<div data-info-col="' + r.field + '" style="font-size:10.5px;color:#444;margin-bottom:2px;">' +
       (isSel ? '<b>' + rFieldLabel + '</b>' : rFieldLabel) + (r.useLog ? ' <span style="color:#888;">(log)</span>' : '') +
       '  <b>(' + r.r2.toFixed(2) + ')</b>' +
       (r.secR2 != null ? '  <span style="color:#8833cc;">' + __secondaryLabel('regSecondaryScenarioSelect', secSel) + ': ' +
@@ -6101,7 +6961,7 @@ function renderAnova() {{
   // different scenario's level_of_service, controlled by the shared "Compare
   // with scenario" dropdown -- see renderRegression above for the same
   // pattern.
-  var data = getStatsData(window.__statsArea);
+  var data = __mainData('anova');
   var secSel = __secondaryScenarioValue('anovaSecondaryScenarioSelect');
   var anovaPlaceSel = document.getElementById('anovaComparePlaceSelect');
   var anovaPlaceKey = anovaPlaceSel ? anovaPlaceSel.value : '';
@@ -6111,6 +6971,7 @@ function renderAnova() {{
   var results = [];
   var __anovaLabels = __fieldLabelsFor(__anovaFields);
   __anovaFields.forEach(function(field) {{
+    if (window.__colVisible && !window.__colVisible(field)) return;
     var diff = __anovaDiff(data, field);
     if (diff == null) return;
     var secDiff = (hasSecondary && secData) ? __anovaDiff(secData, field) : null;
@@ -6136,7 +6997,7 @@ function renderAnova() {{
   var html = '';
   results.forEach(function(r) {{
     html += '<div style="margin-bottom:6px;">';
-    html += '<div style="font-size:10.5px;color:#444;margin-bottom:2px;">' + __anovaLabels[r.field] +
+    html += '<div data-info-col="' + r.field + '" style="font-size:10.5px;color:#444;margin-bottom:2px;">' + __anovaLabels[r.field] +
       '  <b>(' + (r.diff >= 0 ? '+' : '') + r.diff.toFixed(2) + ')</b>' +
       (r.secDiff != null ? '  <span style="color:#8833cc;">' + __secondaryLabel('anovaSecondaryScenarioSelect', secSel) + ': ' +
         (r.secDiff >= 0 ? '+' : '') + r.secDiff.toFixed(2) + '</span>' : '') +
@@ -6145,8 +7006,7 @@ function renderAnova() {{
     if (r.secDiff != null) html += barRow(r.secDiff, r.secDiff < 0 ? '#aa7700' : '#8833cc');
     html += '</div>';
   }});
-  var header = '<div style="color:#666;margin-bottom:6px;">High vs. low half, split by each variable\\'s own median -- difference in mean <b>level_of_service</b>' +
-    (hasSecondary ? ' (top bar: active scenario, bottom bar: <b>' + __secondaryLabel('anovaSecondaryScenarioSelect', secSel) + '</b>)' : '') + '</div>';
+  var header = '';
   document.getElementById('anovaBars').innerHTML = header + (html || '<div>No variables available.</div>');
 }}
 
@@ -6160,7 +7020,7 @@ function renderAnova() {{
 // a second hand-copied set of numbers.
 
 function __jsSpeedScore(avgSpeedKmh) {{
-  // Mirrors speed.py's V(speed), scoring.md Section 2.4 (2026-09-29 THIRD
+  // Mirrors speed.py's V(speed) (2026-09-29 THIRD
   // SHAPE-FIX revision): a single smooth Hill-function curve
   // V(v)=M*v^n/(v^n+K^n). M=1+vCeilingBonus is the asymptote -- an explicit
   // design-judgment ceiling, NOT pinned to any second named speed (an
@@ -6178,7 +7038,7 @@ function __jsSpeedScore(avgSpeedKmh) {{
 }}
 
 function __jsFrequencyScore(headwayMinutes) {{
-  // Mirrors frequency.py's H(headway), scoring.md Section 2.2: log-linear
+  // Mirrors frequency.py's H(headway) log-linear
   // variable-elasticity closed form, eps(h) = p + q*ln(h).
   var d = window.__disc, sat = d.hSaturationMinutes, p = d.hElasticityP, q = d.hElasticityQ;
   if (headwayMinutes <= sat) return 1.0;
@@ -6189,8 +7049,8 @@ function __jsFrequencyScore(headwayMinutes) {{
 }}
 
 function __jsMrCv(headwayCv) {{
-  // Mirrors mrc.py's MR_CV(CV), scoring.md Section 2.3(b): algebraic
-  // inverse of Bowman & Turnquist's (1981) (1+CV^2) wait-inflation factor.
+  // Mirrors mrc.py's MR_CV(CV) algebraic
+  // inverse of the (1+CV^2) wait-inflation factor.
   return 1.0 / (1.0 + headwayCv * headwayCv);
 }}
 
@@ -6204,20 +7064,20 @@ var __MODE_LINE_COLOR = {{ rail: '#006400', tram: '#e0b400', bus: '#8b0000' }};
 // has no third slider here, it's just held steady so the two requested axes
 // are the only things moving. `null` (the common, load-bearing GTFS-static
 // case) uses the mode-categorical MR_mode default instead of MR_CV, per
-// scoring.md Section 2.3.
+//
 var __DISC_STOP_SCORE_DEFAULT_CV = null;
 
 // `headwayCv` is optional; `null` (the default at every existing call site)
 // uses the mode-categorical MR_mode default rather than the optional MR_CV
 // refinement, matching mrc_score()'s own "MR_CV only if headway_cv supplied"
-// behavior (scoring.md Section 2.3).
+// behavior.
 function __jsMrcScore(mode, headwayCv) {{
   var cv = headwayCv == null ? __DISC_STOP_SCORE_DEFAULT_CV : headwayCv;
   return cv == null ? window.__disc.mrMode[mode] : __jsMrCv(cv);
 }}
 
 function __jsStopScore(mode, speedKmh, headwayMinutes, headwayCv) {{
-  // 2026-09-29 aggregation-STRUCTURE revision (scoring.md Section 1.2, stop_score.py):
+  // 2026-09-29 aggregation-STRUCTURE revision (stop_score.py):
   // nested form sqrt(MRC*V)*H -- MRC and V pooled via a plain, equal, unweighted
   // 2-way geometric mean (substitutable: both describe ride quality once the
   // vehicle arrives), then gated multiplicatively by H (not substitutable: whether
@@ -6241,7 +7101,7 @@ function __jsT0OfStopScore(mode, stopScore) {{
 }}
 
 function __jsWalkDecay(walkTimeMinutes, stopScore, mode) {{
-  // Mirrors walk_access.py's D(t; stop_score), scoring.md Section 2.1:
+  // Mirrors walk_access.py's D(t; stop_score)
   // t0 is itself mode- and stop_score-scaled, restoring the joint-function
   // coupling (2026-09-28).
   var d = window.__disc;
@@ -6253,7 +7113,7 @@ function __jsWalkDecay(walkTimeMinutes, stopScore, mode) {{
 
 var __discParamDefs = {{
   speed: {{
-    xLabel: {json.dumps(field_label("avg_speed_kmh"))}, yLabel: 'speed_score',
+    xLabel: {json.dumps(field_label("avg_speed_kmh"))}, yLabel: 'Speed score',
     // 50 km/h, not 90: the curve reaches its 1.0 plateau at the third mode
     // speed breakpoint well below that, so the extra 40 km/h was a flat
     // line squeezing the informative part of the shape into the left half.
@@ -6264,12 +7124,12 @@ var __discParamDefs = {{
     fn: function(x) {{ return __jsSpeedScore(x); }},
   }},
   frequency: {{
-    xLabel: {json.dumps(field_label("headway_minutes"))}, yLabel: 'frequency_score',
+    xLabel: {json.dumps(field_label("headway_minutes"))}, yLabel: 'Frequency score',
     xMin: 0.5, xMax: 60, steps: 180,
     fn: function(x) {{ return __jsFrequencyScore(x); }},
   }},
   distance: {{
-    xLabel: {json.dumps(field_label("walk_time_minutes"))}, yLabel: 'walk_decay (D)',
+    xLabel: {json.dumps(field_label("walk_time_minutes"))}, yLabel: 'Walk decay',
     xMin: 0, xMax: 30, steps: 180,
     fn: function(x) {{ return __jsWalkDecay(x); }},
   }},
@@ -6281,7 +7141,7 @@ var __discParamDefs = {{
   // the old walk-time-only slider, which could only ever show this curve
   // from one of its two sides.
   access: {{
-    axisToggle: 'access', yLabel: 'level_of_service',
+    axisToggle: 'access', yLabel: 'Level of service',
   }},
   // One curve per mode (MR_mode fixed per curve, per window.__disc.mrMode). X is
   // whichever of speed/headway `#discStopScoreAxisSelect` picks (default
@@ -6291,7 +7151,7 @@ var __discParamDefs = {{
   // entry here uses.
   stop_score: {{
     multiCurve: true, axisToggle: 'stop_score',
-    yLabel: 'stop_score',
+    yLabel: 'Stop score',
   }},
 }};
 
@@ -6375,7 +7235,7 @@ var __discAccessAxisDefs = {{
   // stop_score = 1.20) still gives comfortable headroom past this real
   // ~1.07 ceiling without stretching the 0-1 "normal" range too thin on the
   // track -- unchanged from before, just re-derived for the new ceiling.
-  stop_score: {{ xLabel: 'stop_score', xMin: 0, xMax: 120, steps: 120,
+  stop_score: {{ xLabel: 'Stop score', xMin: 0, xMax: 120, steps: 120,
     otherLabel: 'Walk time (minutes)', otherUnit: ' min',
     // step 0.1, not 0.5: the default is a computed value (~6.4 min) and a
     // coarser step would snap the thumb away from the number the label and
@@ -6465,9 +7325,7 @@ function renderDiscretization() {{
       series.push({{mode: mode, xs: xs, ys: ys, color: __MODE_LINE_COLOR[mode]}});
     }});
     var otherLabelShort = group.axis === 'speed' ? 'headway' : 'avg_speed_kmh';
-    summaryText = yLabel + ' vs ' + xLabel + ' by mode (this map\\'s default parameters, ' +
-      otherLabelShort + ' = ' + group.other.toFixed(1) +
-      ', MRC = mode-categorical default, MR_mode)';
+    summaryText = yLabel + ' vs ' + xLabel;
   }} else if (def.axisToggle === 'access') {{
     // level_of_service = stop_score * D(walk_time): whichever of the two is on
     // x sweeps, the other stays at the slider's value.
@@ -6503,8 +7361,7 @@ function renderDiscretization() {{
     series.push({{mode: null, xs: xs, ys: ys, color: '#3a6ea8'}});
     xLabel = def.xLabel;
     xMin = def.xMin; xMax = def.xMax;
-    summaryText = yLabel + ' vs ' + xLabel + ' (this map\\'s default parameters' +
-      (def.summarySuffix ? ',' + def.summarySuffix() : '') + ')';
+    summaryText = yLabel + ' vs ' + xLabel;
   }}
 
   document.getElementById('discSummary').textContent = summaryText;
@@ -6597,28 +7454,9 @@ function renderDiscretization() {{
 function __populateSecondaryScenarioSelect(selId) {{
   var sel = document.getElementById(selId);
   if (!sel) return;
-  var ed = window.__editor;
   var prev = sel.value;
-  var reserved = __statsReservedName();
-  var options = [
-    {{value: 'none', label: 'None'}},
-    {{value: '', label: 'Original'}}
-  ];
-  if (ed && ed.state && ed.state.scenarios) {{
-    var active = ed.state.activeScenario;
-    var lc = ed.lastCompute && ed.lastCompute();
-    ed.state.scenarios.forEach(function(sc) {{
-      if (!sc || !sc.name || sc.name === reserved) return;
-      var computed = (sc.name === active && lc && lc.ok) ||
-        (ed.computeResultForScenario && ed.computeResultForScenario(sc.name));
-      if (computed) options.push({{value: sc.name, label: sc.name}});
-    }});
-  }}
-  sel.innerHTML = options.map(function(o) {{
-    return '<option value="' + o.value + '">' + o.label + '</option>';
-  }}).join('');
-  var stillValid = options.some(function(o) {{ return o.value === prev; }});
-  sel.value = stillValid ? prev : 'none';
+  sel.innerHTML = '<option value="">Original</option><option value="With edits">With edits</option>';
+  sel.value = (prev === 'With edits') ? prev : '';
 }}
 
 function __populateAllSecondaryScenarioSelects() {{
@@ -6734,9 +7572,28 @@ var CS_PLACE_MANIFEST = {place_manifest_json};
 // `metro_median_access`/`core_median_access` (verified equivalent -- see
 // this round's audit note below).
 var __placeRankFetching = {{}}; // key -> true while in flight
+// Daily vehicle-km per place (`<place>/results/vehicle_km.json`, written by the study's code/vehicle_km.py): undefined = not requested,
+// null = pending, false = unavailable.
+var __vkmCache = {{}};
+// Modal split per place and area (`<place>/results/modal_split.json`, city_science_network/code/modal_split.py): same states as __vkmCache.
+var __msCache = {{}};
 function __fetchAllPlaceRankData() {{
   if (!window.__enablePlaceComparison) return;
   CS_PLACE_MANIFEST.forEach(function(c) {{
+    if (!(c.key in __msCache)) {{
+      __msCache[c.key] = null;
+      fetch({json.dumps(place_rank_fetch_prefix)} + c.key + '/results/modal_split.json')
+        .then(function(resp) {{ return resp.ok ? resp.json() : null; }})
+        .catch(function() {{ return null; }})
+        .then(function(json) {{ __msCache[c.key] = json || false; if (window.__statsTab === 'placerank') renderPlaceRank(); }});
+    }}
+    if (!(c.key in __vkmCache)) {{
+      __vkmCache[c.key] = null;
+      fetch({json.dumps(place_rank_fetch_prefix)} + c.key + '/results/vehicle_km.json')
+        .then(function(resp) {{ return resp.ok ? resp.json() : null; }})
+        .catch(function() {{ return null; }})
+        .then(function(json) {{ __vkmCache[c.key] = json || false; if (window.__statsTab === 'placerank') renderPlaceRank(); }});
+    }}
     if (c.key in __placeCompareCache) return;
     if (__placeRankFetching[c.key]) return;
     __placeRankFetching[c.key] = true;
@@ -6750,30 +7607,72 @@ function __fetchAllPlaceRankData() {{
       }});
   }});
 }}
+{_POP_RANGE_JS}
+// "Rank by" any column that at least two places carry (2026-11-14, user): relative columns (share / rate / density / median ... by name, the
+// same rule as `is_relative_field`) take the tab's weight column and mean / median like the score; count columns are summed over the area.
+var __RANK_REL_MARKERS = {json.dumps(list(_RELATIVE_MARKERS))};
+var __RANK_REL_EXTRA = {json.dumps(sorted(EXTRA_RELATIVE_FIELDS))};
+var __RANK_SKIP = ['level_of_service', 'h3_cell', 'population'];
+function __isRelativeCol(c) {{
+  if (__RANK_REL_EXTRA.indexOf(c) >= 0) return true;
+  var n = String(c).toLowerCase();
+  return __RANK_REL_MARKERS.some(function(m) {{ return n.indexOf(m) >= 0; }});
+}}
+function __placeRankColumns(area) {{   // columns with data in at least two places, for this area
+  var n = {{}};
+  CS_PLACE_MANIFEST.forEach(function(c) {{
+    var cached = __placeCompareCache[c.key]; if (!cached) return;
+    var d = cached[area] || cached.metro; if (!d) return;
+    Object.keys(d).forEach(function(k) {{
+      if (__RANK_SKIP.indexOf(k) >= 0 || !Array.isArray(d[k])) return;
+      var a = d[k];
+      for (var i = 0; i < a.length; i++) if (a[i] != null && !isNaN(a[i])) {{ n[k] = (n[k] || 0) + 1; return; }}
+    }});
+  }});
+  return Object.keys(n).filter(function(k) {{ return n[k] >= 2; }});
+}}
+function __syncRankBySelect(area) {{
+  var sel = document.getElementById('placeRankByVarSelect'); if (!sel) return;
+  var cols = __placeRankColumns(area), sig = area + '|' + cols.join('|');
+  if (sel.__colSig === sig) return;
+  sel.__colSig = sig;
+  var cur = sel.value;
+  var og = sel.querySelector('optgroup[data-census]'); if (og) og.parentNode.removeChild(og);
+  if (cols.length) {{
+    og = document.createElement('optgroup'); og.label = 'Columns in two or more places'; og.setAttribute('data-census', '1');
+    var labels = window.__fieldLabelsFor ? window.__fieldLabelsFor(cols) : {{}};
+    cols.map(function(c) {{ return [labels[c] || c, c]; }}).sort(function(a, b) {{ return a[0].localeCompare(b[0]); }}).forEach(function(p) {{
+      var o = document.createElement('option'); o.value = 'col:' + p[1]; o.textContent = p[0]; og.appendChild(o);
+    }});
+    sel.appendChild(og);
+  }}
+  sel.value = Array.prototype.some.call(sel.options, function(o) {{ return o.value === cur; }}) ? cur : 'score';
+}}
+function __fmtRankCol(col, v) {{
+  if (v === null || v === undefined || isNaN(v)) return '--';
+  if (window.__isPercentField && window.__isPercentField(col) && Math.abs(v) <= 1.5) return (100 * v).toFixed(1) + '%';
+  var a = Math.abs(v);
+  return a >= 1e6 ? (v / 1e6).toFixed(2) + 'M' : a >= 1e4 ? (v / 1e3).toFixed(0) + 'k' : a >= 100 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : v.toFixed(2);
+}}
 function renderPlaceRank() {{
   var el = document.getElementById('placeRankList');
   if (!el) return;
   __fetchAllPlaceRankData();
-  // Three new dropdowns (2026-09-23, explicit user request), all actually
-  // driving this fetch/aggregation, not just rendering inertly:
-  //   - Area: metro vs core -- was previously tied silently to whatever tab
-  //     the global stats-panel area toggle (`window.__statsArea`) happened
-  //     to be on; now an independent control local to this tab.
-  //   - Aggregate: mean (default) vs median -- which weighted-aggregation
-  //     function ranks each place.
-  //   - Scenario: original vs with-edits -- reads a per-place `_edited`
-  //     variant of the area's data if the fetched `stats_data.json` bakes
-  //     one in (`cached[area + '_edited']`); a place whose payload has no
-  //     such baked scenario silently falls back to its original data rather
-  //     than erroring, since not every place is guaranteed to ship one.
+  // Area (metro / core / official / municipality), Aggregate (mean / median), Scenario (original / with edits, a place without a baked
+  // `_edited` variant falls back to its original data) and Weight column all drive the aggregation below.
   var areaSel = document.getElementById('placeRankAreaSelect');
-  var area = (areaSel ? areaSel.value : window.__statsArea) === 'core' ? 'core' : 'metro';
+  var area = areaSel ? areaSel.value : window.__statsArea; if (['metro', 'core', 'official', 'municipality'].indexOf(area) < 0) area = 'metro';
   var aggSel = document.getElementById('placeRankAggSelect');
   var agg = aggSel ? aggSel.value : 'mean';
   var scenarioSel = document.getElementById('placeRankScenarioSelect');
   var wantEdited = scenarioSel && scenarioSel.value === 'edited';
   var weightSel = document.getElementById('placeRankWeightSelect');
   var weightCol = weightSel ? weightSel.value : 'none';
+  __syncRankBySelect(area);
+  var rankBySel = document.getElementById('placeRankByVarSelect');
+  var rankBy = rankBySel ? rankBySel.value : 'score';
+  var rankCol = rankBy.indexOf('col:') === 0 ? rankBy.slice(4) : null;
+  var colRel = rankCol ? __isRelativeCol(rankCol) : false;
   var results = CS_PLACE_MANIFEST.map(function(c) {{
     var cached = __placeCompareCache[c.key];
     if (cached === undefined) return {{key: c.key, label: c.label, value: null, loading: true}};
@@ -6781,28 +7680,51 @@ function renderPlaceRank() {{
     var areaData = cached[area] || cached.metro;
     if (wantEdited && cached[area + '_edited']) areaData = cached[area + '_edited'];
     if (!areaData || !areaData.level_of_service) return {{key: c.key, label: c.label, value: null, loading: false}};
-    // A place lacking the selected weight column entirely is EXCLUDED from
-    // the ranking (shown as unranked "--"), not silently treated as
-    // unweighted or given a 0 -- e.g. guadalajara has no census/jobs data,
-    // so weighting by a census column would otherwise misrepresent it as
-    // tied-for-last rather than genuinely lacking that data.
+    // A place lacking the selected weight column is EXCLUDED (unranked "--"), not treated as unweighted or given a 0 (e.g. no jobs data).
     if (weightCol !== 'none' && !areaData[weightCol]) return {{key: c.key, label: c.label, value: null, loading: false}};
     var score = areaData.level_of_service;
     var weights = (weightCol !== 'none') ? areaData[weightCol] : score.map(function() {{ return 1; }});
     var value = (agg === 'median') ? __weightedMedian(score, weights) : __weightedMean(score, weights);
-    return {{key: c.key, label: c.label, value: isNaN(value) ? null : value, loading: false}};
+    var pop = null;
+    if (areaData.population) {{ pop = 0; for (var pi = 0; pi < areaData.population.length; pi++) pop += (areaData.population[pi] || 0); }}
+    var vk = __vkmCache[c.key];
+    var vkm = (vk && vk[area]) ? vk[area].vehicle_km : null;   // vehicle-km is only computed for some areas; never borrow another area's
+    var vkmpc = (vkm !== null && pop) ? vkm / pop * 1000 : null;   // vehicle-km per 1,000 residents per day
+    var ms = __msCache[c.key];   // transit share of the selected area only (never another area's value)
+    var transit = (ms && ms[area] && ms[area].transit_share != null) ? 100 * ms[area].transit_share : null;
+    var transitInfo = (ms && ms[area]) ? (ms[area].source + ' \u00b7 ' + ms[area].basis + ' \u00b7 ' + ms[area].level) : '';
+    var colv = null;
+    if (rankCol && Array.isArray(areaData[rankCol])) {{
+      var arr = areaData[rankCol];
+      if (colRel) {{ colv = (agg === 'median') ? __weightedMedian(arr, weights) : __weightedMean(arr, weights); }}
+      else {{ var any = false; colv = 0; for (var ci = 0; ci < arr.length; ci++) if (arr[ci] != null && !isNaN(arr[ci])) {{ colv += arr[ci]; any = true; }} if (!any) colv = null; }}
+      if (colv !== null && isNaN(colv)) colv = null;
+    }}
+    return {{key: c.key, label: c.label, value: isNaN(value) ? null : value, loading: false, score: isNaN(value) ? null : value,
+             pop: pop, vkm: vkm, vkmpc: vkmpc, transit: transit, transitInfo: transitInfo, col: colv}};
   }});
+  var allResults = results;   // no population min/max filter here: that control exists only in the US and Spain maps (ranking_tab.py)
+  results.forEach(function(r) {{ if (!r.loading && r.value !== null) r.value = (rankBy === 'score') ? r.score : rankCol ? r.col : r[rankBy]; }});
+  results = results.map(function(r) {{ if (!r.loading && r.value === undefined) r.value = null; return r; }});
   var ranked = results.filter(function(c) {{ return c.value !== null; }})
     .slice().sort(function(a, b) {{ return b.value - a.value; }});
   var pending = results.filter(function(c) {{ return c.value === null && c.loading; }});
   var unranked = results.filter(function(c) {{ return c.value === null && !c.loading; }});
-  var rows = '';
+  var fmtBig = function(v) {{ return v === null || v === undefined || isNaN(v) ? '--' : (v >= 1e6 ? (v / 1e6).toFixed(2) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + 'k' : v.toFixed(0)); }};
+  var cell = function(t, w, bold) {{ return '<span style="width:' + w + 'px;text-align:right;display:inline-block;' + (bold ? 'font-weight:600;' : '') + '">' + t + '</span>'; }};
+  var colHead = '';
+  if (rankCol) {{ var lb = window.__fieldLabelsFor ? window.__fieldLabelsFor([rankCol])[rankCol] : rankCol; colHead = '<span title="' + String(lb).replace(/"/g, '&quot;') + '">' + cell(String(lb).length > 14 ? String(lb).slice(0, 13) + '\u2026' : lb, 84) + '</span>'; }}
+  var rows = '<div style="display:flex;justify-content:space-between;padding:2px 0 4px;color:#666;font-size:11px;border-bottom:1px solid #ddd;margin-bottom:2px;">' +
+    '<span>Place</span><span>' + cell('Score', 46) + cell('Pop.', 54) + cell('Veh-km/day', 76) + cell('Veh-km/1000 pop', 92) + cell('Transit share', 70) + colHead + '</span></div>';
   for (var i = 0; i < ranked.length; i++) {{
     var c = ranked[i];
     rows += '<div style="display:flex;justify-content:space-between;padding:3px 0;' +
       (i % 2 === 1 ? 'background:#f7f9fc;' : '') + '">' +
       '<span><span style="color:#888;width:18px;display:inline-block;">' + (i + 1) + '</span>' + c.label + '</span>' +
-      '<span style="font-weight:600;">' + c.value.toFixed(1) + '</span></div>';
+      '<span>' + cell(c.score === null ? '--' : c.score.toFixed(1), 46, rankBy === 'score') + cell(fmtBig(c.pop), 54, rankBy === 'pop') +
+      cell(fmtBig(c.vkm), 74, rankBy === 'vkm') + cell(c.vkmpc === null ? '--' : c.vkmpc.toFixed(0), 92, rankBy === 'vkmpc') +
+      '<span title="' + (c.transitInfo || 'no modal split source for this area') + '">' + cell(c.transit === null ? '--' : c.transit.toFixed(1) + '%', 70, rankBy === 'transit') + '</span>' +
+      (rankCol ? cell(__fmtRankCol(rankCol, c.col), 84, true) : '') + '</span></div>';
   }}
   for (var p = 0; p < pending.length; p++) {{
     rows += '<div style="display:flex;justify-content:space-between;padding:3px 0;color:#aaa;">' +
@@ -6816,6 +7738,14 @@ function renderPlaceRank() {{
       '<span>--</span></div>';
   }}
   el.innerHTML = rows;
+  // What the list ranks by, per place (the overview map's circles follow it: combined_map.__recolorFromRank)
+  var lastVals = {{}}, lastText = {{}};
+  ranked.forEach(function(r) {{
+    lastVals[r.key] = r.value;
+    lastText[r.key] = rankCol ? __fmtRankCol(rankCol, r.value) : rankBy === 'transit' ? r.value.toFixed(1) + '%' : (rankBy === 'pop' || rankBy === 'vkm') ? fmtBig(r.value) : rankBy === 'score' ? r.value.toFixed(1) : r.value.toFixed(0);
+  }});
+  window.__placeRankLast = {{rankBy: rankBy, area: area, agg: agg, weight: weightCol, edited: !!wantEdited, values: lastVals, text: lastText,
+                            known: results.filter(function(r) {{ return !r.loading; }}).map(function(r) {{ return r.key; }})}};
   // Optional hook (2026-09-02, fixes a real user-reported inconsistency:
   // "the numbers and colors of the global map do not coincide with place
   // rank population weight"): `code.combined_map`'s overview-map circles
@@ -6833,10 +7763,10 @@ function renderPlaceRank() {{
   // real population weighting (`weightCol === 'population'`), since that's
   // the one fixed quantity an external caller like a world map wants --
   // an absent hook (a real per-city map.html never defines one) is a no-op.
-  if (weightCol === 'population' && window.__onPlaceRankComputed) window.__onPlaceRankComputed(results);
+  if (weightCol === 'population' && window.__onPlaceRankComputed) window.__onPlaceRankComputed(allResults.map(function(r) {{ return Object.assign({{}}, r, {{value: r.score}}); }}));
 }}
 document.addEventListener('change', function(e) {{
-  if (e.target && ['placeRankWeightSelect', 'placeRankAggSelect', 'placeRankAreaSelect', 'placeRankScenarioSelect'].indexOf(e.target.id) !== -1) renderPlaceRank();
+  if (e.target && ['placeRankWeightSelect', 'placeRankAggSelect', 'placeRankAreaSelect', 'placeRankScenarioSelect', 'placeRankByVarSelect'].indexOf(e.target.id) !== -1) renderPlaceRank();
 }});
 // Test/automation hook, same publication pattern as window.__getStatsData.
 window.__renderPlaceRank = renderPlaceRank;
@@ -6858,6 +7788,7 @@ function __renderActiveTab() {{
     return;
   }}
   __populateAllSecondaryScenarioSelects();
+  ['dist', 'reg', 'anova'].forEach(function(p) {{ __followEditorScenario(p); __syncCompareDefaults(p, false); window.__statsArea = __mainArea(p); }});
   if (window.__statsTab === 'distribution') renderDistribution();
   else if (window.__statsTab === 'regression') renderRegression();
   else if (window.__statsTab === 'discretization') renderDiscretization();
@@ -6891,11 +7822,7 @@ document.querySelectorAll('.statsTabBtn').forEach(function(btn) {{
     // the user hasn't already dragged the panel's `resize:both` handle to
     // something bigger themselves -- tracked via `__statsPanelUserResized`,
     // set the moment a resize is detected).
-    if (window.__statsTab === 'metadata' && !window.__statsPanelUserResized) {{
-      var panel = document.getElementById('statsPanel');
-      panel.style.width = 'min(1100px, 95vw)';
-      panel.style.height = 'min(600px, 95vh)';
-    }}
+    // (the metadata tab is a compact list now -- transitlos.map.buildstamp META_JS -- so the panel keeps its width)
     __renderActiveTab();
   }});
 
@@ -6955,6 +7882,87 @@ Object.keys(__discAxisGroups).forEach(function(key) {{
   }});
 }});
 
+
+// One Area for the whole map: the main Area selectors of every tab, the Place-rank area and the download scope always show the same area
+// (the "compare with" selectors keep their own); the drawn outlines follow it (see `window.__applyAreaOutlines`).
+(function() {{
+  var ids = ['distAreaSelect', 'regAreaSelect', 'anovaAreaSelect', 'placeRankAreaSelect', 'legendAreaSelect', 'dlScopeSelect'], busy = false;
+  function setAll(val, srcId) {{
+    if (busy) return; busy = true;
+    window.__currentArea = val;
+    ids.forEach(function(id) {{
+      var el = document.getElementById(id);
+      if (!el || id === srcId || el.value === val) return;
+      if (!Array.prototype.some.call(el.options, function(o) {{ return o.value === val; }})) return;
+      el.value = val; el.dispatchEvent(new Event('change', {{bubbles: true}}));
+    }});
+    if (window.__applyAreaOutlines) window.__applyAreaOutlines(val);
+    if (window.__refreshTopBar) window.__refreshTopBar();
+    var __lg = document.getElementById('legendAreaSelect');   // the legend only offers UN / Official
+    if (__lg) {{ var __g = (val === 'official' || val === 'municipality') ? 'official' : 'metro'; if (__lg.value !== __g) __lg.value = __g; }}
+    busy = false;
+  }}
+  ids.forEach(function(id) {{
+    var el = document.getElementById(id);
+    if (el) el.addEventListener('change', function() {{ setAll(el.value, id); }});
+  }});
+  window.__setArea = function(v) {{ setAll(v, null); }};
+}})();
+
+// The score at the top follows the Area and the aggregation method (mean / median) chosen in the legend and the stats panel.
+window.__areaScore = function() {{
+  try {{
+    var d = getStatsData(window.__currentArea || 'metro', '');
+    if (!d || !d.level_of_service) return null;
+    var wEl = document.getElementById('placeRankWeightSelect'), wc = wEl ? wEl.value : 'population';
+    var w = (wc && wc !== 'none' && d[wc]) ? d[wc] : (wc === 'none' ? d.level_of_service.map(function() {{ return 1; }}) : (d.population || null));
+    if (!w) return null;
+    var v = (window.__aggMethod === 'median') ? __weightedMedian(d.level_of_service, w) : __weightedMean(d.level_of_service, w);
+    return (v == null || isNaN(v)) ? null : v;
+  }} catch (e) {{ return null; }}
+}};
+(function() {{
+  var aggIds = ['distAggSelect', 'placeRankAggSelect'], busy = false;
+  window.__aggMethod = 'mean';
+  function top() {{ if (window.__refreshTopBar) window.__refreshTopBar(); }}
+  aggIds.forEach(function(id) {{
+    var el = document.getElementById(id);
+    if (el) el.addEventListener('change', function() {{
+      if (busy) return; busy = true; window.__aggMethod = el.value;
+      aggIds.forEach(function(o) {{ var e2 = document.getElementById(o); if (e2 && e2 !== el && e2.value !== el.value) {{ e2.value = el.value; e2.dispatchEvent(new Event('change', {{bubbles: true}})); }} }});
+      busy = false; top();
+    }});
+  }});
+  var n = 0, t = setInterval(function() {{ top(); if (window.__areaScore() != null || ++n > 60) clearInterval(t); }}, 1000);   // once the area data has loaded
+}})();
+
+
+// Main Area / Scenario selectors, compare selectors (a change made by the user sticks) and the compare checkbox of every tab.
+[['dist', renderDistribution], ['reg', renderRegression], ['anova', renderAnova]].forEach(function(pair) {{
+  var prefix = pair[0], render = pair[1];
+  ['AreaSelect', 'ScenarioSelect'].forEach(function(n) {{
+    var el = __ctl(prefix, n);
+    if (el) el.addEventListener('change', function(e) {{
+      if (e.isTrusted && n === 'ScenarioSelect') el.dataset.userSet = '1';
+      window.__statsArea = __mainArea(prefix); __syncCompareDefaults(prefix, false); render();
+    }});
+  }});
+  ['CompareAreaSelect', 'SecondaryScenarioSelect', 'ComparePlaceSelect', 'OverlaySelect'].forEach(function(n) {{
+    var el = __ctl(prefix, n);
+    if (el) el.addEventListener('change', function(e) {{ if (e.isTrusted) el.dataset.userSet = '1'; render(); }});
+  }});
+  var en = __ctl(prefix, 'CompareEnable');
+  if (en) en.addEventListener('change', function() {{
+    if (en.checked) {{
+      ['CompareAreaSelect', 'SecondaryScenarioSelect', 'ComparePlaceSelect', 'OverlaySelect'].forEach(function(n) {{ var el = __ctl(prefix, n); if (el) delete el.dataset.userSet; }});
+      __syncCompareDefaults(prefix, true);
+    }}
+    render();
+  }});
+}});
+var __distMainEl = document.getElementById('distMainSelect');
+if (__distMainEl) __distMainEl.addEventListener('change', function() {{ __syncCompareDefaults('dist', false); }});
+
 document.getElementById('distOverlaySelect').addEventListener('change', renderDistribution);
 document.getElementById('distMainSelect').addEventListener('change', renderDistribution);
 document.getElementById('distSecondaryScenarioSelect').addEventListener('change', renderDistribution);
@@ -6964,6 +7972,11 @@ document.getElementById('regSecondaryScenarioSelect').addEventListener('change',
 document.getElementById('anovaSecondaryScenarioSelect').addEventListener('change', renderAnova);
 
 document.getElementById('regFieldSelect').value = {json.dumps(default_field)};
+if (!{json.dumps(default_field)} && window.__refreshR2Order) {{
+  window.__refreshR2Order();
+  var __bestReg = (window.__r2Order || []).filter(function(f) {{ return Array.prototype.some.call(document.getElementById('regFieldSelect').options, function(o) {{ return o.value === f; }}); }})[0];
+  if (__bestReg) document.getElementById('regFieldSelect').value = __bestReg;
+}}
 
 // --- "Compare with" popover wiring (item 1 redesign, 2026-08-19): each tab's
 // popover button toggles ONLY its own popover (closing any other open one,
@@ -6981,6 +7994,21 @@ document.querySelectorAll('.compareWithBtn').forEach(function(btn) {{
     }});
   }});
 }});
+// The "Compare with" button shows, very briefly, what is selected in its popover: scenario \u00b7 place \u00b7 area.
+function __updateCompareButtons() {{
+  document.querySelectorAll('.compareWithBtn').forEach(function(btn) {{
+    var prefix = (btn.getAttribute('data-target') || '').replace('ComparePopover', ''), parts = [];
+    function txt(id) {{ var el = document.getElementById(id); return (el && el.selectedIndex >= 0) ? el.options[el.selectedIndex].text.trim() : ''; }}
+    var scen = txt(prefix + 'SecondaryScenarioSelect'), place = txt(prefix + 'ComparePlaceSelect'), area = txt(prefix + 'CompareAreaSelect');
+    if (scen) parts.push(scen); if (place) parts.push(place); if (area) parts.push(area);
+    var span = btn.querySelector('.cmpSel'); if (!span) return;
+    var t = parts.length ? ': ' + parts.join(' \u00b7 ') : '';
+    if (span.textContent !== t) span.textContent = t;
+  }});
+}}
+document.addEventListener('change', function() {{ setTimeout(__updateCompareButtons, 0); }});
+setInterval(__updateCompareButtons, 1000);   // the selectors are also set by code (they follow the main Area / Scenario), which fires no change event
+__updateCompareButtons();
 document.addEventListener('click', function() {{
   document.querySelectorAll('.compareWithPopover').forEach(function(p) {{ p.style.display = 'none'; }});
 }});
@@ -7139,7 +8167,7 @@ def _stats_panel_helper_js() -> str:
         # confusing "Education mean grade" here even though the
         # Python-rendered dropdowns already showed the clearer override.
         # Keyed on the already-de-prefixed name, same as the Python side.
-        "  var __FIELD_LABEL_OVERRIDES = {'educationMeanGrade': 'Average years of schooling'};\n"
+        "  var __FIELD_LABEL_OVERRIDES = " + _flo_js() + ";\n"
         "  if (Object.prototype.hasOwnProperty.call(__FIELD_LABEL_OVERRIDES, name)) return __FIELD_LABEL_OVERRIDES[name];\n"
         "  var words = (String(name).replace(/_/g, ' ').match(/[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\\d+/g)) || [];\n"
         "  if (!words.length) return name;\n"
@@ -7151,11 +8179,15 @@ def _stats_panel_helper_js() -> str:
         "    var head = words.slice(0, -1).map(function(w) { return w.toLowerCase(); }).join(' ');\n"
         "    return head.charAt(0).toUpperCase() + head.slice(1) + ' population';\n"
         "  }\n"
+        "  if (words.length > 1 && ['mean', 'median', 'avg', 'average'].indexOf(last) >= 0) words = [words[words.length - 1]].concat(words.slice(0, -1));\n"
         "  var joined = words.map(function(w) { return w.toLowerCase(); }).join(' ');\n"
         "  return joined.charAt(0).toUpperCase() + joined.slice(1);\n"
         "}\n"
+        f"var __GLOBAL_TWINS = {json.dumps(_global_twins())};\n"
         "function __fieldLabel(key) {\n"
-        "  return __humanizeFieldName(__stripSourcePrefix(key)) + __fieldUnitSuffix(key);\n"
+        "  var base = (window.__PY_FIELD_LABELS && window.__PY_FIELD_LABELS[key]) || __humanizeFieldName(__stripSourcePrefix(key)), loc = __GLOBAL_TWINS[key];\n"
+        "  if (/^(population_(over|under)estimation_vs_census|worldpop_(over|under)estimation_share)$/.test(key)) return base;\n"
+        "  return (base + __fieldUnitSuffix(key)).replace(/\\bJobs\\b/g, 'Workplaces').replace(/\\bjobs\\b/g, 'workplaces');\n"
         "}\n"
         "</script>\n"
     )
@@ -7193,6 +8225,8 @@ def _stats_panel_block(
     # `is_relative_field`. The distribution tab's overlay bar sums its
     # variable per score bin, so it takes the exact complement.
     regression_fields = list(share_fields) if share_fields is not None else relative_fields(all_fields)
+    # The WorldPop-vs-census differences are counts, but regressing them is wanted too.
+    regression_fields += [f for f in _WORLDPOP_DIFF_FIELDS if f in all_fields and f not in regression_fields]
     if not regression_fields:
         regression_fields = ["pop_density"] if "pop_density" in finest.columns else []
     # Item 1 fix: this used to be `[] ` for non-US cities, which left the
@@ -7205,7 +8239,19 @@ def _stats_panel_block(
     # that (pop_density is relative, so it's excluded here) when no ACS
     # columns are present -- so this no longer needs to be US-gated.
     count_fields = list(count_fields) if count_fields is not None else _stats_count_fields(all_fields)
-    data_json = _stats_json_data(stats_by_area, list(dict.fromkeys(regression_fields + count_fields)))
+    count_fields += [f for f in _WORLDPOP_DIFF_FIELDS if f in all_fields and f not in count_fields]
+    # 2026-11-15: the data keeps every column and every global-name copy (the cross-city ranking reads them by their shared names);
+    # only the dropdowns list each set of identical values once
+    _tw = _global_twins()
+    try:
+        _glob = set(_global_schema_definitions().keys())
+    except Exception:  # noqa: BLE001
+        _glob = set()
+    _data_fields = list(dict.fromkeys(regression_fields + count_fields + [g for g, l in _tw.items() if g in all_fields and l in all_fields]
+                                      + [f for f in all_fields if f in _glob]))
+    regression_fields = _drop_identical_fields(regression_fields, finest)
+    count_fields = _drop_identical_fields(count_fields, finest)
+    data_json = _stats_json_data(stats_by_area, _data_fields)
     # Item 1 (user feedback, 2026-08-19): the "Compare with" popover's area
     # (city core / metro) sub-dimension is only offered when this map
     # genuinely differentiates between them -- i.e. `stats_by_area` was built
@@ -7223,6 +8269,15 @@ def _stats_panel_block(
         + "<script>\nwindow.addEventListener('load', function() {\n"
         + _stats_panel_js(regression_fields, is_us, region, enable_place_comparison, has_multi_area)
         + "\n});\n</script>\n"
+        + _col_info_script(metadata_rows, _info_only_meta(list(dict.fromkeys(regression_fields + count_fields)), metadata_rows),
+                           {c: display_field_name(c) for c in dict.fromkeys(list(regression_fields) + list(count_fields) + [r.get("column") for r in metadata_rows or [] if r.get("column")])},
+                           _disambiguated_field_labels(list(dict.fromkeys(regression_fields + count_fields))))
+        + _freshness_script()
+        + _presentation_script()
+        + _column_select_script(
+            finest, list(dict.fromkeys(regression_fields + count_fields)), is_us,
+            global_logical=set(_global_schema_definitions().keys()), strip=strip_source_prefix,
+        )
     )
 
 
@@ -7256,6 +8311,14 @@ def build_place_rank_panel_block(
     `CS_transitLOS/` itself (one level up from any per-city `map.html`,
     which uses this function's implicit `"../"` default via a direct
     `build_city_map` call instead of this one).
+
+    Args:
+        place_manifest: ``[{"key", "label"}, ...]`` of the places.
+        weight_columns: Candidate weight columns.
+        fetch_prefix: Prefix of the ``results/stats_data.json`` paths.
+
+    Returns:
+        HTML and script of the panel.
     """
     weight_columns = list(weight_columns)
     return (
@@ -7330,12 +8393,20 @@ def load_edit_params(path: Optional[str] = None) -> dict:
     Looked up relative to this file (``<repo>/transitLOS/default_edit_params.json``)
     unless an explicit path is given, so a study can pass its own copy in
     without touching code.
+
+    Args:
+        path: Optional path of the JSON file.
+
+    Returns:
+        The editor parameters (the built-in fallback if the file cannot be read).
     """
     if path is None:
         here = os.path.dirname(os.path.abspath(__file__))
+        # Packaged copy first (ships in the wheel), then the repo-root copy (source checkouts).
+        packaged = os.path.join(here, EDIT_PARAMS_FILENAME)
         # build.py -> map/ -> transitlos/ -> src/ -> transitLOS/
-        candidate = os.path.join(here, "..", "..", "..", EDIT_PARAMS_FILENAME)
-        path = os.path.normpath(candidate)
+        repo_copy = os.path.normpath(os.path.join(here, "..", "..", "..", EDIT_PARAMS_FILENAME))
+        path = repo_copy if os.path.isfile(repo_copy) else packaged
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -9707,7 +10778,7 @@ def _maplibre_compute_access_js(
 window.__editParams = {json.dumps(params)};
 window.__popChunkCfg = {json.dumps(pop_chunk_cfg)};
 window.__geoidChunkCfg = {json.dumps({"dir": GEOID_CHUNK_DIRNAME, "deg": pop_chunk_cfg.get("deg", POP_CHUNK_DEG), "level": CENSUS_LIVE_RECOLOR_LEVEL})};
-window.__statsData = {stats_data_json};
+// window.__statsData is defined once by the stats panel's own script (the same data was embedded twice before)
 {consts_js}
 
 (function() {{
@@ -9722,7 +10793,7 @@ window.__statsData = {stats_data_json};
   // --- formula mirrors, copied verbatim from `_stats_panel_js` (kept in
   // sync via `window.__disc`, baked from the same Python dataclass) ---
   function __jsSpeedScore(avgSpeedKmh) {{
-    // V(speed), scoring.md Section 2.4 (2026-09-29 THIRD SHAPE-FIX
+    // V(speed) (2026-09-29 THIRD SHAPE-FIX
     // revision): smooth Hill-function curve V(v)=M*v^n/(v^n+K^n).
     // M=1+vCeilingBonus is an explicit design-judgment asymptote, not
     // pinned to any second named speed (a same-day revision tried and
@@ -9737,7 +10808,7 @@ window.__statsData = {stats_data_json};
     return m * Math.pow(avgSpeedKmh, n) / (Math.pow(avgSpeedKmh, n) + Math.pow(k, n));
   }}
   function __jsFrequencyScore(headwayMinutes) {{
-    // H(headway), scoring.md Section 2.2 (2026-09-28): log-linear
+    // H(headway) (2026-09-28): log-linear
     // variable-elasticity closed form.
     var d = window.__disc, sat = d.hSaturationMinutes, p = d.hElasticityP, q = d.hElasticityQ;
     if (headwayMinutes <= sat) return 1.0;
@@ -9752,13 +10823,11 @@ window.__statsData = {stats_data_json};
   function scoringMode(m) {{ return ((MODES[m] || {{}}).scores_as) || m; }}
   function __jsMrcScore(mode, headwayCv) {{
     // headwayCv == null uses the mode-categorical MR_mode default (the
-    // primary, load-bearing GTFS-static-only path, scoring.md Section
-    // 2.3(a)); a real CV prefers the optional MR_CV refinement (2.3(b)).
+    // primary GTFS-static-only path); a real CV prefers the optional MR_CV refinement.
     return headwayCv == null ? window.__disc.mrMode[scoringMode(mode)] : __jsMrCv(headwayCv);
   }}
   function __jsStopScore(mode, speedKmh, headwayMinutes, headwayCv) {{
-    // 2026-09-29 aggregation-STRUCTURE revision (scoring.md Section 1.2,
-    // stop_score.py): nested form sqrt(MRC*V)*H, matching the Discretization
+    // 2026-09-29 aggregation-STRUCTURE revision (// stop_score.py): nested form sqrt(MRC*V)*H, matching the Discretization
     // panel's own __jsStopScore mirror -- this copy had been left on the
     // original flat p=0 geometric mean through the intervening p=-1 harmonic-
     // mean revision (a real staleness bug, now fixed here alongside the
@@ -9783,7 +10852,7 @@ window.__statsData = {stats_data_json};
     return d.t0BaseMinutesByMode[scoringMode(mode) || 'bus'] * (1.0 + d.kQuality * (stopScore == null ? 0.0 : stopScore));
   }}
   function __jsWalkDecay(walkTimeMinutes, stopScore, mode) {{
-    // D(t; stop_score), scoring.md Section 2.1 (2026-09-28 restored
+    // D(t; stop_score) (2026-09-28 restored
     // coupling): t0 is itself mode- and stop_score-scaled.
     var d = window.__disc;
     var tPlateau = d.tPlateauDistanceM / d.walkingSpeedMps / 60.0;
@@ -10094,7 +11163,7 @@ window.__statsData = {stats_data_json};
     }});
 
     return loadChunkIndex().then(function(idx) {{
-      if (!idx) {{ status.textContent = 'population chunks not available'; return null; }}
+      if (!idx) {{ status.textContent = ''; return null; }}
       var keys = {{}};
       allStops.forEach(function(s) {{
         var dLat = ACCESS_R_M / 111320.0;
@@ -10355,6 +11424,47 @@ window.__statsData = {stats_data_json};
 """
 
 
+_LAZY_ROUTES_JS = """
+  // Nationwide maps: route lines come in one GeoJSON file per state, fetched when the state is in view at a zoom where lines
+  // are drawn; chunks far from the view are dropped beyond `max_loaded`.
+  (function() {
+    var LR = __LAZY_ROUTES_CFG__;
+    var loaded = {}, order = [], inflight = {};
+    function rebuild() {
+      routesFC.features.length = 0; var styles = {};
+      order.forEach(function(name) {
+        loaded[name].features.forEach(function(f) { routesFC.features.push(f); });
+        Object.keys(loaded[name].styles || {}).forEach(function(k) { if (!(k in styles)) styles[k] = loaded[name].styles[k]; });
+      });
+      routesFC.styles = styles; window.__routeStyles = styles;
+      var src = map.getSource('__routes_overlay'); if (src) src.setData(routesFC);
+    }
+    function inView(c, b) { return !(c.bbox[0] > b.getEast() || c.bbox[2] < b.getWest() || c.bbox[1] > b.getNorth() || c.bbox[3] < b.getSouth()); }
+    function update() {
+      if (map.getZoom() < LR.min_zoom) return;
+      var b = map.getBounds(), want = LR.chunks.filter(function(c) { return inView(c, b); }).map(function(c) { return c.name; });
+      var missing = want.filter(function(n) { return !loaded[n] && !inflight[n]; });
+      if (!missing.length) return;
+      Promise.all(missing.map(function(n) {
+        inflight[n] = true;
+        return fetch(LR.dir + '/' + n + '.json').then(function(r) { return r.json(); }).then(function(j) { loaded[n] = j; order.push(n); })
+          .catch(function(e) { console.warn('routes chunk failed', n, e); }).then(function() { delete inflight[n]; });
+      })).then(function() {
+        while (order.length > LR.max_loaded) {
+          var drop = order.find(function(n) { return want.indexOf(n) < 0; });
+          if (!drop) break;
+          order.splice(order.indexOf(drop), 1); delete loaded[drop];
+        }
+        rebuild();
+      });
+    }
+    routesFC.features.length = 0;   // drop the one-route stub the template was built from
+    map.on('moveend', update);
+    if (map.loaded()) update(); else map.once('load', update);
+  })();
+"""
+
+
 _LAZY_STOPS_JS = """
   // Nationwide maps: the stops are NOT embedded (hundreds of thousands of points freeze the browser). They live in
   // one JSON file per chunk (state); the chunks intersecting the view are fetched once zoomed in, and the oldest
@@ -10364,8 +11474,14 @@ _LAZY_STOPS_JS = """
     var loaded = {}, order = [], inflight = {};
     function rebuild() {
       stopsData.records.length = 0; stopsFC.features.length = 0;
+      var byId = {};   // a stop in two loaded chunks (border stations): shown once, the scored copy
       order.forEach(function(name) {
         loaded[name].forEach(function(r) {
+          if (r.stop_id != null) {
+            var k = byId[r.stop_id];
+            if (k !== undefined) { if (r.stop_score != null && stopsData.records[k].stop_score == null) { stopsData.records[k] = r; stopsFC.features[k].properties = r; } return; }
+            byId[r.stop_id] = stopsData.records.length;
+          }
           var i = stopsData.records.length; stopsData.records.push(r);
           stopsFC.features.push({type: 'Feature', id: i, geometry: {type: 'Point', coordinates: [r.lon, r.lat]}, properties: r});
         });
@@ -10404,6 +11520,7 @@ def _maplibre_stops_routes_js(
     routes_gdf: Optional[gpd.GeoDataFrame],
     score_domain: Tuple[float, float],
     lazy_stops_cfg: Optional[dict] = None,
+    lazy_routes_cfg: Optional[dict] = None,
 ) -> str:
     """MapLibre-native stops + routes + labels + popups overlay (item 5 of the round-4 port).
 
@@ -10434,7 +11551,12 @@ def _maplibre_stops_routes_js(
     """
     stops_json = _stops_json_data(stops_gdf, score_domain) if stops_gdf is not None and not stops_gdf.empty else None
     lazy_js = _LAZY_STOPS_JS.replace("__LAZY_CFG__", json.dumps(lazy_stops_cfg)) if lazy_stops_cfg else ""
+    stops_min_zoom_js = (
+        "__stopOverlayLayerIds.forEach(function(id) { if (map.getLayer(id)) map.setLayerZoomRange(id, Math.max(%d, id === '__stops_label' ? 16 : 0), 24); });"
+        % int(lazy_stops_cfg.get("min_zoom", 8))
+    ).replace("{", "{{").replace("}", "}}") if lazy_stops_cfg else ""
     routes_json = _routes_geojson_data(routes_gdf) if routes_gdf is not None and not routes_gdf.empty else None
+    lazy_routes_js = _LAZY_ROUTES_JS.replace("__LAZY_ROUTES_CFG__", json.dumps(lazy_routes_cfg)) if lazy_routes_cfg else ""
     weights_json = json.dumps(_ROUTE_MODE_WEIGHT)
     mode_fallback_json = json.dumps(MODE_FALLBACK_COLOR)
 
@@ -10483,8 +11605,8 @@ def _maplibre_stops_routes_js(
         layout: {{'line-cap': 'round', 'line-join': 'round'}},
         paint: {{
           'line-color': '#000000',
-          'line-width': baseWidth + 2,
-          'line-opacity': 0.85,
+          'line-width': ['interpolate', ['linear'], ['zoom'], 8, 1.35 * 0.5 * baseWidth + 0.4, 14, 1.35 * baseWidth + 0.6, 18, 1.35 * 1.8 * baseWidth + 0.8],
+          'line-opacity': 0.7,
         }},
       }});
       map.addLayer({{
@@ -10496,7 +11618,7 @@ def _maplibre_stops_routes_js(
         layout: {{'line-cap': 'round', 'line-join': 'round'}},
         paint: {{
           'line-color': ['coalesce', ['get', 'color'], modeFallback[m] || '#8b0000'],
-          'line-width': baseWidth,
+          'line-width': ['interpolate', ['linear'], ['zoom'], 8, 0.5 * baseWidth, 14, baseWidth, 18, 1.8 * baseWidth],
           'line-opacity': 0.95,
         }},
       }});
@@ -10535,7 +11657,7 @@ def _maplibre_stops_routes_js(
       id: '__routes_label',
       type: 'symbol',
       source: '__routes_overlay',
-      minzoom: 14,
+      minzoom: 16,   // route-name badges on the lines: 2 zoom levels deeper than before (14)
       layout: {{
         'symbol-placement': 'line',
         'text-field': ['get', 'route_label'],
@@ -10560,8 +11682,7 @@ def _maplibre_stops_routes_js(
         // never getting defined/called. That's why the labels never
         // rendered on ANY map. `case` has no such literal-stop restriction,
         // so it can compare against the per-feature threshold directly.
-        'text-opacity': ['case',
-          ['>=', ['zoom'], ['coalesce', ['get', 'route_label_min_zoom'], 14]], 1, 0],
+        'text-opacity': ['step', ['zoom'], 0, 16, 1],
       }},
     }});
     // Item 6 (user request, this round): route linestrings must carry NO
@@ -10597,6 +11718,7 @@ def _maplibre_stops_routes_js(
     }};
     window.__updateRouteLayers();
   }});
+  {lazy_routes_js}
 """)
 
     if stops_json is not None:
@@ -10688,7 +11810,7 @@ def _maplibre_stops_routes_js(
       }}
       return __stopClusterBands[__stopClusterBands.length - 1].radius;
     }}
-    var __stopOverlayLayerIds = ['__stops_cluster', '__stops_cluster_count', '__stops_mode_icon', '__stops_score_label', '__stops_label'];
+    var __stopOverlayLayerIds = ['__stops_cluster', '__stops_cluster_count', '__stops_mode_icon', '__stops_hl', '__stops_score_label', '__stops_label'];
     var __currentStopClusterRadius = null;
     function __teardownStopsOverlay() {{
       __stopOverlayLayerIds.forEach(function(id) {{ if (map.getLayer(id)) map.removeLayer(id); }});
@@ -10770,7 +11892,7 @@ def _maplibre_stops_routes_js(
     // face is only "ready" once something has actually requested it.
     function addModeIcons() {{
       ['rail', 'tram', 'bus'].forEach(function(m) {{
-        map.addImage('__mode_icon_' + m, drawModeIcon(m), {{sdf: true}});
+        if (!map.hasImage('__mode_icon_' + m)) map.addImage('__mode_icon_' + m, drawModeIcon(m), {{sdf: true}});
       }});
     }}
     if (document.fonts && document.fonts.load) {{
@@ -10794,15 +11916,23 @@ def _maplibre_stops_routes_js(
         'icon-size': 0.42,
         'icon-allow-overlap': true,
         'icon-ignore-placement': true,
+        'symbol-sort-key': ['match', ['get', 'mode'], 'rail', 3, 'tram', 2, 1],   // rail drawn above tram above bus
       }},
       paint: {{
         'icon-color': [
           'interpolate', ['linear'], ['coalesce', ['get', 'stop_score'], sMin],
           sMin, blueFor(0), sMax, blueFor(1),
         ],
-        'icon-halo-color': '#ffffff',
-        'icon-halo-width': 1,
+        'icon-halo-color': '#000000',   // black outline so the stop icons stand out from the background
+        'icon-halo-width': 1.6,
       }},
+    }});
+    map.addLayer({{
+      id: '__stops_hl',
+      type: 'circle',
+      source: '__stops_overlay',
+      filter: ['==', ['get', 'parent_station'], '__none__'],
+      paint: {{'circle-radius': 11, 'circle-color': 'rgba(255,214,0,0.25)', 'circle-stroke-color': '#ffb300', 'circle-stroke-width': 2.5}},
     }});
     // Round 15 (item 3): small stop-score text under each icon, using
     // MapLibre's built-in `number-format` expression so it always shows
@@ -10847,6 +11977,9 @@ def _maplibre_stops_routes_js(
       }},
       paint: {{'text-color': '#1a1a1a', 'text-halo-color': '#ffffff', 'text-halo-width': 1.2}},
     }});
+    // Nation-wide map (lazy stops): no stop group / icon / label below the zoom where stops start loading -- at state-level zooms only the
+    // state geometry is shown.
+    {stops_min_zoom_js}
     }} // end __buildStopsOverlay
     __currentStopClusterRadius = __stopClusterRadiusForZoom(map.getZoom());
     __buildStopsOverlay(__currentStopClusterRadius);
@@ -10884,11 +12017,26 @@ def _maplibre_stops_routes_js(
       if (!routeStr) return [];
       return String(routeStr).split(',').map(function(s) {{ return s.trim(); }}).filter(function(s) {{ return s.length > 0; }});
     }}
-    function routeBadgeHtml(name, fallbackMode, fontPx) {{
+    // `route_info` of a stop record = "label~#color~#text~mode;..." (the colours of the route lines themselves); older data: labels only.
+    function parseRouteInfo(str, fallbackNames, fallbackMode) {{
+      var out = [];
+      if (str) {{
+        String(str).split(';').forEach(function(it) {{
+          var a = it.split('~'); if (!a[0]) return;
+          out.push({{label: a[0], color: a[1] || '', text: a[2] || '', mode: a[3] || fallbackMode || 'bus', kept: a[4] !== '0'}});
+        }});
+      }} else {{
+        splitRoutes(fallbackNames).forEach(function(n) {{ out.push({{label: n, color: '', text: '', mode: fallbackMode || 'bus'}}); }});
+      }}
+      return out;
+    }}
+    function routeBadgeHtml(name, fallbackMode, fontPx, color, textColor, kept) {{
       var st = routeStyleFor(name, fallbackMode);
+      var faded = kept === false;   // a route of the station that its best-scoring subset leaves out: smaller and lighter
+      if (color) st = {{color: color, text: textColor || st.text, mode: st.mode}};
       var display = String(name).replace(/_/g, ' ');
       return '<span style="display:inline-block;background:' + st.color + ';color:' + st.text + ';' +
-        'font:700 ' + (fontPx || 10) + 'px sans-serif;line-height:1.35;padding:1px 5px;border-radius:7px;' +
+        'font:700 ' + (faded ? Math.max(7, (fontPx || 10) - 2) : (fontPx || 10)) + 'px sans-serif;line-height:1.35;padding:1px 5px;border-radius:7px;' + (faded ? 'opacity:0.35;' : '') +
         'margin:1px 3px 1px 0;white-space:nowrap;box-shadow:0 0 0 1px rgba(0,0,0,0.18);">' + display + '</span>';
     }}
     window.__routeBadgeHtml = routeBadgeHtml;
@@ -10906,9 +12054,10 @@ def _maplibre_stops_routes_js(
     // THIS stop_id, which is very likely why they looked "broken/missing"
     // for busy stops. `stop_routes` is the real per-stop_id field (falls
     // back to `r.route` only for a record from a build that predates it).
-    function visibleRouteNames(r) {{
-      return splitRoutes(r.stop_routes || r.route).filter(function(n) {{ return modeVisible(routeStyleFor(n, r.mode).mode); }});
+    function visibleRouteInfos(r) {{
+      return parseRouteInfo(r.route_info, r.stop_routes || r.route || '', r.mode).filter(function(it) {{ return modeVisible(it.mode); }});
     }}
+    function visibleRouteNames(r) {{ return visibleRouteInfos(r).map(function(it) {{ return it.label; }}); }}
     function prettyName(s) {{ return s ? String(s).replace(/_/g, ' ') : s; }}
 
     var ROUTES_PER_PAGE = 4, MAX_ANNOTATED = 400;
@@ -10921,8 +12070,8 @@ def _maplibre_stops_routes_js(
       if (!names.length) return null;
       var pages = Math.ceil(names.length / ROUTES_PER_PAGE);
       var page = Math.min(routePage[idx] || 0, pages - 1);
-      var slice = names.slice(page * ROUTES_PER_PAGE, (page + 1) * ROUTES_PER_PAGE);
-      var inner = slice.map(function(n) {{ return routeBadgeHtml(n, r.mode, 9); }}).join('');
+      var slice = visibleRouteInfos(r).slice(page * ROUTES_PER_PAGE, (page + 1) * ROUTES_PER_PAGE);
+      var inner = slice.map(function(it) {{ return routeBadgeHtml(it.label, it.mode, 9, it.color, it.text); }}).join('');
       var pager = '';
       if (pages > 1) {{
         pager = '<span style="display:inline-block;white-space:nowrap;font:600 9px sans-serif;color:#333;">' +
@@ -10961,8 +12110,10 @@ def _maplibre_stops_routes_js(
     // cluster this frame. Each rendered feature's `id` is the `stopsData`
     // index (set 1:1 when `stopsFC` was built above), so no extra lookup.
     var __lastBadgeIdxKey = null;
+    var ROUTE_BADGE_MIN_ZOOM = 17.5;   // route badges only appear 1.5 zoom levels deeper than the stop names (16), so they do not clutter
     window.__updateStopRouteBadges = function() {{
-      if (!window.__stopRouteBadgesOn) {{
+      // Route badges, like the stop names, only exist from zoom 16: at lower zooms they would cover the map.
+      if (!window.__stopRouteBadgesOn || map.getZoom() < ROUTE_BADGE_MIN_ZOOM) {{
         Object.keys(badgeMarkers).forEach(function(k) {{ badgeMarkers[k].remove(); delete badgeMarkers[k]; }});
         __lastBadgeIdxKey = null;
         return;
@@ -11072,141 +12223,75 @@ def _maplibre_stops_routes_js(
       // not the DOM event Leaflet listens for.
       if (e.originalEvent && e.originalEvent.stopPropagation) {{ e.originalEvent.stopPropagation(); }}
       var p = e.features[0].properties;
+      if (map.getLayer('__stops_hl')) map.setFilter('__stops_hl', p.parent_station ? ['==', ['get', 'parent_station'], p.parent_station] : ['==', ['get', 'stop_id'], p.stop_id == null ? '__none__' : p.stop_id]);
       var t = (p.stop_score != null) ? (p.stop_score - sMin) / Math.max(sMax - sMin, 1e-9) : 0;
-
-      // "Routes at this stop": prefer the real per-stop_id `stop_routes`
-      // field; fall back to the older station-level `route`/`all_routes`
-      // field for any record that predates it (e.g. a cached build).
-      var ownRouteStr = p.stop_routes || p.route || '';
-      var ownRouteNames = splitRoutes(ownRouteStr).filter(function(n) {{ return modeVisible(routeStyleFor(n, p.mode).mode); }});
-      var routeCell = ownRouteNames.length
-        ? ownRouteNames.map(function(n) {{ return routeBadgeHtml(n, p.mode, 10); }}).join('')
-        : '-';
-
-      // "Connections via parent station": every route in the station-wide
-      // `all_routes` set that ISN'T already shown as a route at this exact
-      // stop_id -- only meaningful (and only rendered) when this stop's
-      // `parent_station` genuinely groups more than this one stop_id.
+      var MODES = ['rail', 'tram', 'bus'];
+      function badge(r) {{ return routeBadgeHtml(r.label, r.mode, 10, r.color, r.text, r.kept); }}
+      function row(label, html, top) {{
+        return '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;vertical-align:top;white-space:nowrap;' + (top ? 'border-top:1px solid #eee;padding-top:5px;' : '') + '">' +
+          label + '</td><td style="padding:2px 0;' + (top ? 'border-top:1px solid #eee;padding-top:5px;' : '') + '">' + html + '</td></tr>';
+      }}
+      // 2026-11-13 popup revision (user requests): one stop name per line; every route once (same name and mode = one badge, whatever
+      // its colour or route id); every mode at the stop and at its parent station, the one used for the score highlighted; the score
+      // panel always shown (with "not scored" and the reason when the stop has none).
+      var MODE_COL = {{rail: '#006400', tram: '#b38f00', bus: '#8b0000'}};
+      function modeChip(m, on) {{
+        var c = MODE_COL[m] || '#555';
+        return '<span style="display:inline-block;margin:0 4px 2px 0;padding:0 6px;border-radius:9px;font-size:10.5px;line-height:16px;' +
+          (on ? 'background:' + c + ';color:#fff;font-weight:700;' : 'background:#fff;color:' + c + ';border:1px solid ' + c + ';') + '"' +
+          (on ? ' title="mode used for the stop score"' : '') + '>' + m + (on ? ' ✓' : '') + '</span>';
+      }}
+      function uniqRoutes(list) {{
+        var seenR = {{}}, out = [];
+        list.forEach(function(r) {{ var k = r.mode + '|' + String(r.label).trim().toLowerCase(); if (!seenR[k]) {{ seenR[k] = 1; out.push(r); }} }});
+        return out;
+      }}
+      function box(hh) {{ return '<div style="max-height:96px;overflow-y:auto;padding-right:4px;">' + hh + '</div>'; }}
+      function sec(title) {{ return '<tr><td colspan="2" style="padding:7px 0 2px;font-weight:700;color:#2b3a4a;font-size:11px;text-transform:uppercase;letter-spacing:.03em;border-top:1px solid #e6e9ee;">' + title + '</td></tr>'; }}
+      var own = uniqRoutes(parseRouteInfo(p.route_info, p.stop_routes || p.route || '', p.mode).filter(function(r) {{ return modeVisible(r.mode); }}));
       var siblings = stationSiblings(p.parent_station);
-      var stationAllRoutesStr = p.all_routes || ownRouteStr;
-      var stationRouteNames = splitRoutes(stationAllRoutesStr);
-      var ownSet = {{}};
-      ownRouteNames.forEach(function(n) {{ ownSet[normRouteName(n)] = true; }});
-      var connectionNames = stationRouteNames.filter(function(n) {{ return !ownSet[normRouteName(n)]; }});
-      var hasRealStation = p.parent_station && (siblings.length > 1 || connectionNames.length > 0);
-
-      // Station label for the "connecting routes via ..." header: NOT
-      // `prettyName(p.parent_station)` (real bug -- when no GTFS agency
-      // supplies a real parent-station id, `parent_station` falls back to a
-      // synthetic id built by joining the grouped stop_ids together, e.g.
-      // "26738_25025_22532_5426_28440"; `prettyName` only swaps underscores
-      // for spaces, so that rendered as a run of unrelated-looking numbers
-      // instead of a place name). Use this stop's own real `stop_name`
-      // instead -- always human-readable, and every stop already carries
-      // one (the popup's title falls back to 'Stop' only if it's blank; if
-      // that fallback ever triggers here too, the label just reads "near
-      // Stop", not wrong, only generic).
-      var stationLabel = prettyName(p.stop_name || 'this stop');
-      // Real parent-station name, when the GTFS agency's `parent_station`
-      // points at a genuine `stops.txt` row of its own (see `stops.py`'s
-      // `parent_station_name` -- null on the `stop_group_distance`
-      // proximity-fallback path, which has no such row). Falls back to
-      // `stationLabel` (this platform's own name) so the "parent station
-      // data" section header always reads sensibly even without a real
-      // station-level name.
-      var parentStationLabel = prettyName(p.parent_station_name || stationLabel);
-
-      // Bug fix (user report, "El Arenal" station, 2026-08-29): the "stop
-      // group"/"parent station data" section used to just repeat `p.mode`
-      // (THIS platform's own mode) under a "mode" label that implied it was
-      // the STATION's aggregated mode -- misleading whenever a station mixes
-      // modes with very different service levels (e.g. rail + connecting
-      // buses), since the headway/speed/score numbers in that same section
-      // are genuinely computed at the parent-station level while the mode
-      // label silently claimed to be this one platform's mode instead of
-      // reflecting what that station-level data is actually FOR (e.g. a
-      // station shown as "mode: rail" whose headway is really bus-dominated).
-      // `p.station_modes` (see `stops.py`) is the real, cheaply-computed set
-      // of mode classes actually present at this station (e.g. "bus + rail"
-      // for a mixed station, just "rail" for a real single-mode one) --
-      // showing that instead of a single (possibly wrong) mode name is
-      // honest about what the combined headway/speed number below actually
-      // covers, without requiring a separate, expensive mode-restricted
-      // headway recomputation on the backend (attempted and reverted --
-      // OOM'd a real GTFS feed even at 22 GB, see `stops.py`'s comment).
-      var stationMode = (hasRealStation && p.station_modes) ? p.station_modes : p.mode;
-      // Item (verbatim user request): "connecting routes via [station] here
-      // I would like each single stop id with its routes of the parent
-      // station. So stop id name, routes, stop id name, routes etc" --
-      // replaces the old single flattened/deduplicated route-badge list
-      // (which lost which specific platform each route actually serves)
-      // with one row per sibling stop_id sharing this parent station, each
-      // showing its own name and its own routes -- the same per-platform
-      // breakdown a previous, since-dropped "connecting stops" section
-      // used to show, now merged into this section instead of living
-      // alongside a separate flattened one.
-      var connectionsHtml = '';
-      if (hasRealStation && siblings.length) {{
-        var siblingRowsHtml = siblings.map(function(s) {{
-          var sRouteNames = splitRoutes(s.stop_routes || s.route || '').filter(function(n) {{
-            return modeVisible(routeStyleFor(n, s.mode).mode);
-          }});
-          var sBadges = sRouteNames.length
-            ? sRouteNames.map(function(n) {{ return routeBadgeHtml(n, s.mode, 10); }}).join('')
-            : '<span style="color:#888;">no routes</span>';
-          return '<div style="margin-top:4px;"><div style="font-size:11px;">' + prettyName(s.stop_name || 'Stop') +
-            '</div><div style="margin-top:2px;">' + sBadges + '</div></div>';
-        }}).join('');
-        connectionsHtml += '<div style="margin-top:6px;"><div style="font-weight:600;color:#555;font-size:11px;">stops at ' +
-          stationLabel + '</div>' + siblingRowsHtml + '</div>';
-      }}
-      // No `hasRealStation`: this stop_id has no real grouping (its own
-      // `parent_station` fallback IS its own `stop_id`, single-member
-      // "station") -- gracefully omit the section entirely rather than show
-      // an empty/fake one.
-
+      if (!siblings.length) siblings = [p];
+      var seenS = {{}};
+      siblings = siblings.filter(function(r) {{ var k = r.stop_id || (r.lon + ',' + r.lat); if (seenS[k]) return false; seenS[k] = 1; return true; }});
+      var names = [];
+      siblings.forEach(function(r) {{ var n = prettyName(r.stop_name || ''); if (n && names.indexOf(n) < 0) names.push(n); }});
+      var byMode = {{rail: [], tram: [], bus: []}};
+      siblings.forEach(function(r) {{
+        parseRouteInfo(r.route_info, r.stop_routes || r.route || '', r.mode).forEach(function(it) {{ if (modeVisible(it.mode)) (byMode[it.mode] || (byMode[it.mode] = [])).push(it); }});
+      }});
+      var tier = p.station_mode || p.scoring_mode || p.mode;
+      var stopModes = (p.modes_here ? String(p.modes_here).split(',') : [p.mode]).filter(Boolean);
+      var stModes = [];
+      siblings.forEach(function(r) {{ (r.modes_here ? String(r.modes_here).split(',') : [r.mode]).forEach(function(m) {{ if (m && stModes.indexOf(m) < 0) stModes.push(m); }}); }});
+      String(p.station_modes || '').split(/[+,]/).map(function(x) {{ return x.trim(); }}).forEach(function(m) {{ if (m && stModes.indexOf(m) < 0) stModes.push(m); }});
+      stModes.sort(function(x, y) {{ return MODES.indexOf(x) - MODES.indexOf(y); }});
       var rows = '';
-      rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;vertical-align:top;">routes here</td><td style="padding:2px 0;">' + routeCell + '</td></tr>';
-      rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;">mode (this stop)</td><td>' + p.mode + '</td></tr>';
-      // Item 7: the "reliability" row is omitted ENTIRELY (not shown as
-      // "N/A") when reliability was not measured for ANY stop in this
-      // dataset -- see `__reliabilityMeasuredAnywhere` above.
-      if (__reliabilityMeasuredAnywhere) {{
-        rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;">reliability (this stop)</td><td>' + fmtReliability(p) + '</td></tr>';
+      rows += row('modes here', stopModes.map(function(m) {{ return modeChip(m, m === tier); }}).join(''), false);
+      rows += row('routes here', own.length ? box(own.map(badge).join('')) : '<span style="color:#999;">none listed</span>', false);
+      if (siblings.length > 1 || p.parent_station_name) {{
+        rows += sec('station' + (p.parent_station_name ? ': ' + prettyName(p.parent_station_name) : '') + (siblings.length > 1 ? ' <span style="font-weight:400;color:#888;text-transform:none;">(' + siblings.length + ' stops)</span>' : ''));
+        rows += row('modes', stModes.map(function(m) {{ return modeChip(m, m === tier); }}).join(''), false);
+        rows += row('stops', names.length ? box(names.map(function(n) {{ return '<div>' + n + '</div>'; }}).join('')) : '-', false);
+        MODES.filter(function(m) {{ return byMode[m] && byMode[m].length; }}).forEach(function(m) {{
+          rows += row(m + ' routes', box(uniqRoutes(byMode[m]).map(badge).join('')), false);
+        }});
       }}
-      // Renamed from "stop group data" to "parent station data" (verbatim
-      // user request -- "stop group" was confusing users) and now also
-      // shows the real parent station NAME (previously missing entirely)
-      // and its genuine dominant-mode-based `mode` (`stationMode`, see
-      // above -- previously this row just repeated `p.mode`, this
-      // platform's own mode, which is the exact bug the user reported).
-      rows += '<tr><td colspan="2" style="padding-top:4px;border-top:1px solid #eee;font-weight:600;color:#555;font-size:11px;">' +
-        (hasRealStation ? ('parent station data (' + parentStationLabel + ')') : 'parent station data') + '</td></tr>';
-      rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;">mode</td><td>' + stationMode +
-        (p.stop_score != null ? ' <span style="color:#888;">(score ' + fmt2(p.stop_score) + ')</span>' : '') + '</td></tr>';
-      if (p.headway_minutes != null) {{
-        rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;">headway</td><td>' + fmt2(p.headway_minutes) + ' min' +
-          (p.frequency_score != null ? ' <span style="color:#888;">(score ' + fmt2(p.frequency_score) + ')</span>' : '') + '</td></tr>';
+      rows += sec('stop score');
+      if (p.stop_score != null) {{
+        rows += row('scored as', modeChip(tier, true) + (p.mrc_score != null ? ' <span style="color:#888;">mode score ' + fmt2(p.mrc_score) + '</span>' : ''), false);
+        if (p.headway_minutes != null) rows += row('headway', fmt2(p.headway_minutes) + ' min' + (p.frequency_score != null ? ' <span style="color:#888;">score ' + fmt2(p.frequency_score) + '</span>' : ''), false);
+        if (p.avg_speed_kmh != null) rows += row('speed', fmt2(p.avg_speed_kmh) + ' km/h' + (p.speed_score != null ? ' <span style="color:#888;">score ' + fmt2(p.speed_score) + '</span>' : ''), false);
+        rows += '<tr><td style="font-weight:700;padding:5px 8px 0 0;">score</td><td style="padding-top:5px;"><span style="display:inline-block;padding:1px 8px;border-radius:4px;font-weight:800;color:#fff;background:' + blueFor(t) + ';">' + fmt2(p.stop_score) + '</span></td></tr>';
+      }} else {{
+        rows += '<tr><td colspan="2" style="color:#8a6d00;padding:3px 0;">not scored: no departures of this stop on the analysis day (or it lies outside the scored area)</td></tr>';
       }}
-      if (p.avg_speed_kmh != null) {{
-        rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;">speed</td><td>' + fmt2(p.avg_speed_kmh) + ' km/h' +
-          (p.speed_score != null ? ' <span style="color:#888;">(score ' + fmt2(p.speed_score) + ')</span>' : '') + '</td></tr>';
-      }}
-      if (__reliabilityMeasuredAnywhere) {{
-        // No separate "(score X)" here -- `reliability` IS already a 0-1
-        // score (see `_stops_json_data`'s docstring), unlike headway/speed
-        // which are raw physical units alongside their own score field.
-        rows += '<tr><td style="font-weight:600;color:#555;padding:2px 8px 2px 0;">reliability</td><td>' + fmtReliability(p) + '</td></tr>';
-      }}
-      rows += '<tr><td style="font-weight:700;padding:4px 8px 0 0;border-top:1px solid #eee;">stop score</td><td style="font-weight:700;border-top:1px solid #eee;color:' + blueFor(t) + ';">' + (p.stop_score != null ? fmt2(p.stop_score) : '-') + '</td></tr>';
-      // Widened from 260px -> 340px (user report: too narrow for the
-      // parent-station-data section's new station-name header + longer
-      // route-badge rows).
-      var html = '<div style="font:12px sans-serif;max-width:340px;"><div style="font-weight:700;margin-bottom:4px;">' +
-        prettyName(p.stop_name || 'Stop') + ' (' + p.mode + ')</div><table style="border-collapse:collapse;width:100%;">' + rows + '</table>' +
-        connectionsHtml + '</div>';
+      var html = '<div style="font:12px/1.35 system-ui,-apple-system,Segoe UI,sans-serif;max-width:340px;color:#1d2733;">' +
+        '<div style="display:flex;align-items:center;gap:6px;margin:0 18px 6px 0;"><span style="width:10px;height:10px;border-radius:50%;flex:none;background:' + (MODE_COL[p.mode] || '#555') + ';"></span>' +
+        '<span style="font-weight:700;font-size:13.5px;">' + prettyName(p.stop_name || 'Stop') + '</span></div>' +
+        '<table style="border-collapse:collapse;width:100%;">' + rows + '</table></div>';
       stopPopup.setLngLat(e.lngLat).setHTML(html).addTo(map);
     }});
+    stopPopup.on('close', function() {{ if (map.getLayer('__stops_hl')) map.setFilter('__stops_hl', ['==', ['get', 'parent_station'], '__none__']); }});
     map.on('click', '__stops_cluster', function(e) {{
       // Same fix as `__stops_mode_icon` above: a cluster click must not
       // also open the shape layer underneath it.
@@ -11366,12 +12451,43 @@ def _routes_geojson_data(routes_gdf: gpd.GeoDataFrame) -> str:
     })
 
 
-def _write_lazy_stops_chunks(path: str, chunks: Dict[str, gpd.GeoDataFrame], score_domain, min_zoom: int = 7,
+def _write_lazy_stops_chunks(path: str, chunks: Dict[str, gpd.GeoDataFrame], score_domain, min_zoom: int = 9,
                              max_loaded: int = 10):
     """One `stops_chunks/<name>.json` per chunk (same record shape as the embedded stops); returns (stub_gdf, cfg)."""
     out = os.path.join(os.path.dirname(os.path.abspath(path)), "stops_chunks")
     os.makedirs(out, exist_ok=True)
     cfg_chunks, stub = [], None
+    # a stop listed in several chunks (a station near a regional border, a long-distance stop seen by every region its trains cross) is
+    # scored only in the chunk of the region that scored it: every copy gets the scored values, so no copy shows "no score"
+    score_cols = ["scoring_mode", "headway_minutes", "avg_speed_kmh", "mrc_score", "speed_score", "frequency_score", "stop_score", "min_speed_cutoff_kmh"]
+    best: Dict[str, Dict] = {}
+    for gdf in chunks.values():
+        if gdf is None or gdf.empty or "stop_id" not in gdf.columns or "stop_score" not in gdf.columns:
+            continue
+        sc = pd.to_numeric(gdf["stop_score"], errors="coerce")
+        sub = gdf[sc.notna()]
+        for sid, v, rec in zip(sub["stop_id"].astype(str), sc[sc.notna()], sub[[c for c in score_cols if c in gdf.columns]].to_dict("records")):
+            if sid not in best or v > best[sid]["stop_score"]:
+                best[sid] = rec
+    if best:
+        filled = {}
+        for name, gdf in chunks.items():
+            if gdf is None or gdf.empty or "stop_id" not in gdf.columns:
+                filled[name] = gdf
+                continue
+            gdf = gdf.copy()
+            have = pd.to_numeric(gdf["stop_score"], errors="coerce").notna() if "stop_score" in gdf.columns else pd.Series(False, index=gdf.index)
+            ids = gdf["stop_id"].astype(str)
+            miss = np.flatnonzero((~have & ids.isin(best)).to_numpy())
+            for c in score_cols:
+                if c not in gdf.columns:
+                    gdf[c] = None
+                gdf[c] = gdf[c].astype(object)
+            for i in miss:
+                for c, v in best[ids.iloc[i]].items():
+                    gdf.iat[i, gdf.columns.get_loc(c)] = v
+            filled[name] = gdf
+        chunks = filled
     for name, gdf in chunks.items():
         if gdf is None or gdf.empty:
             continue
@@ -11384,8 +12500,26 @@ def _write_lazy_stops_chunks(path: str, chunks: Dict[str, gpd.GeoDataFrame], sco
     return stub, {"dir": "stops_chunks", "min_zoom": min_zoom, "max_loaded": max_loaded, "chunks": cfg_chunks}
 
 
+def _write_lazy_routes_chunks(path: str, chunks: Dict[str, gpd.GeoDataFrame], min_zoom: int = min(ROUTE_MODE_MIN_ZOOM.values()) - 1, max_loaded: int = 6):
+    """One `routes_chunks/<name>.json` (GeoJSON features + styles) per chunk; returns (stub_gdf, cfg) like the stops chunks."""
+    out = os.path.join(os.path.dirname(os.path.abspath(path)), "routes_chunks")
+    os.makedirs(out, exist_ok=True)
+    cfg_chunks, stub = [], None
+    for name, gdf in chunks.items():
+        if gdf is None or gdf.empty:
+            continue
+        with open(os.path.join(out, f"{name}.json"), "w", encoding="utf-8") as f:
+            f.write(_routes_geojson_data(gdf))
+        w, so, e, n = (gdf.to_crs(4326) if gdf.crs is not None else gdf).total_bounds
+        cfg_chunks.append({"name": name, "bbox": [float(w), float(so), float(e), float(n)], "n": int(len(gdf))})
+        if stub is None:
+            stub = gdf.head(1)
+    return stub, {"dir": "routes_chunks", "min_zoom": min_zoom, "max_loaded": max_loaded, "chunks": cfg_chunks}
+
+
 def _inject_maplibre_stops_routes_into_saved_html(path: str, stops_gdf, routes_gdf, score_domain: Tuple[float, float],
-                                                  stops_chunks: Optional[Dict[str, gpd.GeoDataFrame]] = None) -> str:
+                                                  stops_chunks: Optional[Dict[str, gpd.GeoDataFrame]] = None,
+                                                  routes_chunks: Optional[Dict[str, gpd.GeoDataFrame]] = None) -> str:
     """Splice `_maplibre_stops_routes_js`'s stops/routes/labels/popups overlay into a MapLibre `map.html`.
 
     Same "share the page's own `<script>` scope" pattern as
@@ -11394,8 +12528,11 @@ def _inject_maplibre_stops_routes_into_saved_html(path: str, stops_gdf, routes_g
     that same script tag) is already in scope.
     """
     lazy_cfg = None
+    lazy_routes_cfg = None
     if stops_chunks:
         stops_gdf, lazy_cfg = _write_lazy_stops_chunks(path, stops_chunks, score_domain)
+    if routes_chunks:
+        routes_gdf, lazy_routes_cfg = _write_lazy_routes_chunks(path, routes_chunks)
     if (stops_gdf is None or stops_gdf.empty) and (routes_gdf is None or routes_gdf.empty):
         return path
     with open(path, "r", encoding="utf-8") as f:
@@ -11451,13 +12588,12 @@ def _inject_maplibre_stops_routes_into_saved_html(path: str, stops_gdf, routes_g
         alt_marker = '<div id="route-toolbar"'
         if alt_marker in html:
             html = html.replace(alt_marker, overlay_controls_html + alt_marker, 1)
-    js = _maplibre_stops_routes_js(stops_gdf, routes_gdf, score_domain, lazy_cfg)
+    js = _maplibre_stops_routes_js(stops_gdf, routes_gdf, score_domain, lazy_cfg, lazy_routes_cfg)
     marker = "</script>\n</body>"
     if marker not in html:
         raise ValueError(f"{path}: expected trailing '{marker}' from save_multi_maplibre, not found")
     html = html.replace(marker, js + "\n" + marker, 1)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+    write_stamped(path, html)
     return path
 
 
@@ -11513,12 +12649,18 @@ def _inject_maplibre_topbar_into_saved_html(path: str, enable_place_comparison: 
 <div id="top-center-bar" style="position:absolute; top:10px; left:50%; transform:translateX(-50%);
   z-index:6; background:white; border-radius:20px; box-shadow:0 1px 6px rgba(0,0,0,0.25);
   font:12px sans-serif; padding:6px 14px; display:flex; align-items:center; gap:0;
-  max-width:92vw; white-space:nowrap;">
+  width:max-content; max-width:min(92vw,980px); box-sizing:border-box; flex-wrap:wrap; row-gap:4px; justify-content:center;">
   {place_select_html}
   <select id="topBarScenarioSelect" style="border:none;background:transparent;font:600 12px sans-serif;
     color:#1a1a1a;padding:2px 4px; cursor:pointer;"></select>
   <span style="width:1px;background:#ddd;align-self:stretch;margin:0 10px;"></span>
-  <span id="topBarResults" style="color:#333; overflow-x:auto;"></span>
+  <span id="topBarResults" style="color:#333; min-width:0; flex:0 1 auto;"></span>
+  <span style="width:1px;background:#ddd;align-self:stretch;margin:0 10px;"></span>
+  <form id="topBarAddressForm" autocomplete="off" style="display:flex;align-items:center;gap:4px;margin:0;flex:1 1 170px;min-width:150px;max-width:260px;">
+    <input id="topBarAddressInput" type="search" placeholder="Search any address..." style="border:none;outline:none;flex:1 1 auto;min-width:0;width:100%;font:12px sans-serif;padding:3px 6px;background:#f3f3f3;border-radius:12px;">
+    <button type="submit" style="border:none;background:#2b6cb0;color:#fff;border-radius:12px;padding:3px 9px;cursor:pointer;font:12px sans-serif;">Go</button>
+    <span id="topBarAddressMsg" style="color:#b00;font-size:11px;"></span>
+  </form>
 </div>
 """
     marker = "<div id=\"map\"></div>"
@@ -11568,7 +12710,10 @@ def _inject_maplibre_topbar_into_saved_html(path: str, enable_place_comparison: 
       var base = ed.baselineStats ? ed.baselineStats() : null;
       // Item 3 (verbatim user request): "instead of access xx I would like
       // to have just the number xxx" -- bare value, no "access" label.
-      if (base && base.access != null) fields.push('<b>' + fmtNum(base.access, 2) + '</b>');
+      var sv = window.__scopeScore ? window.__scopeScore() : null;   // scope maps: the score follows the map centre
+      if (sv != null) fields.push('<b>' + fmtNum(sv, 2) + '</b>');
+      else if (window.__areaScore && window.__areaScore() != null) fields.push('<b>' + fmtNum(window.__areaScore(), 2) + '</b>');
+      else if (base && base.access != null) fields.push('<b>' + fmtNum(base.access, 2) + '</b>');
       // cost/impact are never applicable to the baseline (no edits) -- omitted, not "-".
     } else {
       var lc = ed.lastCompute ? ed.lastCompute() : null;
@@ -11603,6 +12748,7 @@ def _inject_maplibre_topbar_into_saved_html(path: str, enable_place_comparison: 
     var html = fields.length ? fields.join(' &nbsp;|&nbsp; ') : '<span style="color:#888;">not computed yet</span>';
     out.innerHTML = html;
   }
+  window.__refreshTopBar = refreshTopBar;
   document.addEventListener('change', function(e) {
     if (e.target && e.target.id === 'topBarScenarioSelect') {
       var ed = window.__editor;
@@ -11610,6 +12756,19 @@ def _inject_maplibre_topbar_into_saved_html(path: str, enable_place_comparison: 
       refreshTopBar();
     }
   });
+  // "Draw a new line" only exists once zoomed into the place (a few zoom levels around the view the map opens on).
+  (function() {
+    var minZ = null;
+    function apply() {
+      var m = window.__mainMap, btn = document.getElementById('routeEditToggleBtn'), tb = document.getElementById('route-toolbar');
+      if (!m || !btn || window.__scopeActive) return;   // the US map decides this in its scope script
+      if (minZ === null) minZ = m.getZoom() - 2;
+      var ok = m.getZoom() >= minZ;
+      if (!ok && tb && tb.classList.contains('rt-open')) btn.click();
+      btn.style.display = ok ? '' : 'none'; if (tb) tb.style.display = ok ? '' : 'none';
+    }
+    var t = setInterval(function() { if (window.__mainMap && document.getElementById('routeEditToggleBtn')) { clearInterval(t); window.__mainMap.on('zoom', apply); apply(); } }, 300);
+  })();
   setInterval(refreshTopBar, 800);
   if (document.readyState === 'complete' || document.readyState === 'interactive') {
     refreshTopBar();
@@ -11622,13 +12781,17 @@ def _inject_maplibre_topbar_into_saved_html(path: str, enable_place_comparison: 
     marker2 = "</script>\n</body>"
     if marker2 not in html:
         raise ValueError(f"{path}: expected trailing '{marker2}' from save_multi_maplibre, not found")
+    from .scope_panel import address_js
+    from .cell_popup import H3_JS_CDN, cell_popup_script, CITY_PROVIDER_JS
+    js = (js + "\n</script>\n<script src=\"" + H3_JS_CDN + "\"></script>\n<script>\n" + cell_popup_script(_POPUP_ABS_TO_REL) + "\n" + CITY_PROVIDER_JS +
+          "\n" + address_js(15, "topBarAddressForm", "topBarAddressInput", "topBarAddressMsg", "") + "\n")
     html = html.replace(marker2, js + "\n" + marker2, 1)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+    write_stamped(path, html)
     return path
 
 
-def _inject_maplibre_legend_into_saved_html(path: str, score_domain: Tuple[float, float], show_development: bool) -> str:
+def _inject_maplibre_legend_into_saved_html(path: str, score_domain: Tuple[float, float], show_development: bool,
+                                            legend_by_res: Optional[dict] = None) -> str:
     """Splice `_legend_html`'s access-score/stop-score/circle/opacity legend into a MapLibre `map.html`.
 
     Round-8-followup fix for a real reported gap: the MapLibre page had NO
@@ -11650,6 +12813,9 @@ def _inject_maplibre_legend_into_saved_html(path: str, score_domain: Tuple[float
     with open(path, "r", encoding="utf-8") as f:
         html = f.read()
     legend_div = _legend_html(score_domain, show_development)
+    if legend_by_res:   # per-resolution circle-legend values + the per-resolution maximum radius (same scale as the circles themselves)
+        legend_div += (f"<script>window.__legendByRes = {json.dumps(legend_by_res)}; "
+                       f"window.__circleMaxByRes = {json.dumps({str(k): v for k, v in _CIRCLE_MAX_RADIUS_BY_RES.items()})};</script>")
     placeholder = "<!--LEGEND_PLACEHOLDER-->"
     if placeholder in html:
         # Round-13: merged into the single #layer-switcher box (`save_multi_maplibre`
@@ -11696,8 +12862,7 @@ def _inject_maplibre_legend_into_saved_html(path: str, score_domain: Tuple[float
         html = html.replace(
             marker, f"<script>\n{_shape_popup_js()}\n</script>\n" + marker, 1
         )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+    write_stamped(path, html)
     return path
 
 
@@ -11721,6 +12886,14 @@ def build_download_panel_block(manifest_json: str, base_path: str = "results", p
     place value -> that same per-place object (`window.__downloadManifests`),
     since different cities can have different resolutions/levels/census
     availability.
+
+    Args:
+        manifest_json: JSON of what can be downloaded (see above).
+        base_path: Relative path of the results folder.
+        place_options: Optional ``[{value, label, base_path}]`` for a page with several places.
+
+    Returns:
+        HTML and script of the panel.
     """
     place_select_html = ""
     if place_options:
@@ -11765,11 +12938,7 @@ def build_download_panel_block(manifest_json: str, base_path: str = "results", p
   width:280px;border-radius:6px;box-shadow:0 1px 6px rgba(0,0,0,0.35);font:12px sans-serif;padding:12px;">
   <div style="font-weight:700;margin-bottom:8px;">Download data</div>
   {place_select_html}
-  <label style="display:block;font-weight:600;margin-bottom:4px;">Scope</label>
-  <select id="dlScopeSelect" style="width:100%;margin-bottom:10px;font:12px sans-serif;padding:3px;">
-    <option value="metro">Metro</option>
-    <option value="core">City core</option>
-  </select>
+  {_dl_scope_html()}
   <div style="margin-bottom:6px;">
     <label style="display:flex;align-items:center;gap:6px;">
       <input type="checkbox" id="dlH3Check" checked> H3 grid
@@ -11781,7 +12950,7 @@ def build_download_panel_block(manifest_json: str, base_path: str = "results", p
          `<select>` picking exactly one resolution. Populated in JS
          (`populateSelects`) from the manifest, same as the old `<select>`
          was. -->
-    <div id="dlH3ResList" style="margin-top:3px;max-height:90px;overflow-y:auto;border:1px solid #ddd;border-radius:3px;padding:3px 6px;"></div>
+    <div id="dlH3ResList" style="margin-top:3px;max-height:124px;overflow-y:auto;border:1px solid #ddd;border-radius:3px;padding:3px 6px;"></div>
   </div>
   <div id="dlCensusRow" style="margin-bottom:6px;">
     <label style="display:flex;align-items:center;gap:6px;">
@@ -11939,17 +13108,20 @@ def build_download_panel_block(manifest_json: str, base_path: str = "results", p
   if (placeSel) placeSel.addEventListener('change', populateSelects);
 
   document.getElementById('dlGoButton').addEventListener('click', function() {{
-    var scope = document.getElementById('dlScopeSelect').value;
+    var scopeSel = document.getElementById('dlScopeSelect');
+    var single = !scopeSel;   // four-area maps ship one file set for the whole processing area; each row has area_* membership columns
+    var scope = single ? '' : scopeSel.value;
     var base = currentBasePath();
+    var dir = single ? '/downloads/' : '/' + scope + '/downloads/';
     var urls = [];
     if (document.getElementById('dlH3Check').checked) {{
       checkedValues(document.getElementById('dlH3ResList')).forEach(function(res) {{
-        urls.push(base + '/' + scope + '/downloads/h3_res' + res + '.parquet');
+        urls.push(base + dir + 'h3_res' + res + '.parquet');
       }});
     }}
     if (document.getElementById('dlCensusCheck').checked) {{
       checkedValues(document.getElementById('dlCensusLevelList')).forEach(function(level) {{
-        urls.push(base + '/' + scope + '/downloads/census_' + level + '.parquet');
+        urls.push(base + dir + 'census_' + level + '.parquet');
       }});
     }}
     if (document.getElementById('dlStopsCheck').checked) {{
@@ -11999,8 +13171,7 @@ def _inject_maplibre_download_panel_into_saved_html(path: str, downloads_manifes
     if marker not in html:
         raise ValueError(f"{path}: expected trailing '{marker}' from save_multi_maplibre, not found")
     html = html.replace(marker, block + marker, 1)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+    write_stamped(path, html)
     return path
 
 
@@ -12028,8 +13199,7 @@ def _inject_maplibre_editor_into_saved_html(
     if marker not in html:
         raise ValueError(f"{path}: expected trailing '{marker}' from save_multi_maplibre, not found")
     html = html.replace(marker, js + "\n" + marker, 1)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+    write_stamped(path, html)
     return path
 
 
@@ -12067,8 +13237,7 @@ def _inject_maplibre_stats_panel_into_saved_html(
     if marker not in html:
         raise ValueError(f"{path}: expected trailing '{marker}' from save_multi_maplibre, not found")
     html = html.replace(marker, block + marker, 1)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+    write_stamped(path, html)
     return path
 
 
@@ -12110,7 +13279,7 @@ def _inject_controls_into_saved_html(
     # "Circle size by" defaults to pop_density when it's an available field
     # (the single most broadly-useful default for this dropdown), falling
     # back to the first available field otherwise.
-    default_circle_field = _preferred_density_field(circle_fields) or (circle_fields[0] if circle_fields else None)
+    default_circle_field = next((f for f in _DEFAULT_CIRCLE_FIELDS if f in circle_fields), None) or _preferred_density_field(circle_fields) or (circle_fields[0] if circle_fields else None)   # a COUNT by default (relative columns joined the list on 2026-11-10)
 
     base_layer_vars = _extract_base_layer_vars(html)
     # Hoisted here (previously only extracted inside the `stops_gdf` branch
@@ -12286,8 +13455,7 @@ def _inject_controls_into_saved_html(
     else:
         html += injected
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+    write_stamped(path, html)
 
 
 def _level_zoom_bands(levels: List[Hashable], total_zoom_levels: int = 26) -> Dict[Hashable, tuple[int, int]]:
@@ -12359,8 +13527,8 @@ def _level_zoom_bands(levels: List[Hashable], total_zoom_levels: int = 26) -> Di
     # points (block >=15, municipal ~10) -- the strict anchors made finer
     # geometry (and, worse, absolutely-coarse admin tiers like
     # municipality) activate later than felt natural in practice.
-    FINEST_MIN_ZOOM = 13
-    COARSEST_MAX_ZOOM = 6
+    FINEST_MIN_ZOOM = 12   # was 13 (2026-11-07 user request: the high-resolution layers stay visible one zoom level further out)
+    COARSEST_MAX_ZOOM = 5  # was 6
 
     if total < FINEST_MIN_ZOOM + 1:
         # Not enough room for the fixed anchors -- even split fallback,
@@ -12423,3 +13591,49 @@ def _finite_domain(series) -> tuple[float, float]:
     if values.size == 0:
         return (0.0, 1.0)
     return (float(values.min()), float(values.max()))
+
+
+# Geography coarseness for the "native level" of derived columns (lowest rank = coarsest = lowest resolution). The first pattern that
+# matches a native-level name decides its rank; unknown names rank as the finest so they never hide a known coarser level.
+_LEVEL_COARSENESS = (
+    (r"nation|country|national", 0), (r"state|region|autonom|canton|prefecture", 1), (r"metro|cbsa|urban area|conurb", 2),
+    (r"province|county|department|kreis|governorate", 3), (r"municipal|place|city|comuna|locality|parish|town|borough|stadtteil|ortsteil|delegaci", 4),
+    (r"district|distrito|neighbo|ward|zone|zona|sub-area", 5), (r"tract|section|secci|statistical area|ageb|block group|bezirk|census area", 6),
+    (r"block|manzana|grid|cell|h3|hex|raster", 7),
+)
+
+
+def _level_coarseness(level: str) -> int:
+    text = str(level or "").lower()
+    for pattern, rank in _LEVEL_COARSENESS:
+        if re.search(pattern, text):
+            return rank
+    return len(_LEVEL_COARSENESS)
+
+
+def _derived_native_levels(num_den, base_row, level, rows_by_col) -> List[str]:
+    """Native level of a derived column: the coarsest (lowest-resolution) native level among the census columns it is computed from."""
+    parents = [rows_by_col.get(c) for c in (num_den or ())] or [base_row]
+    levels = [lv for r in parents if r for lv in (r.get("native_levels") or ([r.get("level")] if r.get("level") else []))]
+    if not levels:
+        levels = list(base_row["native_levels"]) if base_row else ([level] if level else [])
+    levels = [str(x) for x in levels if x]
+    return [min(levels, key=_level_coarseness)] if levels else []
+
+
+def _freshness_script() -> str:
+    """Reload the page when the server holds a newer upload than the (possibly cached) copy being viewed.
+
+    A cheap conditional HEAD request compares the server's Last-Modified with `document.lastModified`; if the
+    server is newer the page reloads once with a `__fresh` cache-busting parameter (stripped from the address).
+    """
+    return (
+        "<script>(function(){try{var q=location.search;"
+        "if(/[?&]__fresh=/.test(q)){var c=q.replace(/([?&])__fresh=[^&]*&?/,'$1').replace(/[?&]$/,'');"
+        "history.replaceState(null,'',location.pathname+c+location.hash);return;}"
+        "if(!/^https?:/.test(location.protocol))return;"
+        "fetch(location.pathname+q,{method:'HEAD',cache:'no-cache'}).then(function(r){"
+        "var lm=Date.parse(r.headers.get('Last-Modified')||''),have=Date.parse(document.lastModified);"
+        "if(lm&&have&&lm>have+2000)location.replace(location.pathname+q+(q?'&':'?')+'__fresh='+lm+location.hash);"
+        "}).catch(function(){});}catch(e){}})();</script>\n"
+    )

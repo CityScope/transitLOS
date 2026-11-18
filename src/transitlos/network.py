@@ -62,10 +62,13 @@ def prepare_street_network(
         return StreetNetwork.load(cache_dir)
 
     if pbf_path is None:
-        raise ValueError(
-            "pbf_path is required to build a street network when no cached "
-            "network is found at cache_dir."
-        )
+        # No local extract given: fetch the smallest covering Geofabrik extract into the shared
+        # OSM cache folder (explicit TRANSITLOS_CACHE_DIR/osm, else the temp folder).
+        from UrbanAccessAnalyzer import osm_io
+
+        from .cache import get_osm_dir
+
+        pbf_path = osm_io.download_geofabrik(aoi.gdf, output_folder=str(get_osm_dir()))
 
     network = StreetNetwork.from_pbf(pbf_path, aoi=aoi, network_type=network_type, ignore_oneway=ignore_oneway)
     network = network.simplify(cluster_distance)

@@ -1,0 +1,215 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Flexible transit scoring</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+ :root{--bg:#fff;--fg:#222;--mut:#666;--line:#ddd;--card:#f7f7f7;--acc:#2a6fdb}
+ @media (prefers-color-scheme:dark){:root{--bg:#171717;--fg:#e6e6e6;--mut:#999;--line:#333;--card:#1f1f1f;--acc:#6aa0ff}}
+ *{box-sizing:border-box} body{margin:0;font:13px system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;height:100vh;overflow:hidden}
+ #panel{width:330px;min-width:330px;overflow-y:auto;border-right:1px solid var(--line);padding:10px 12px}
+ #main{flex:1;position:relative;min-width:0} #cv{position:absolute;inset:0;width:100%;height:100%;display:block}
+ h1{font-size:15px;margin:0 0 6px} h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:14px 0 6px}
+ select,input[type=number],textarea,button{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:4px;padding:3px 5px} select{width:100%;margin:2px 0}
+ button{cursor:pointer;padding:4px 9px} button:hover{border-color:var(--acc)} input[type=range]{width:100%;margin:0 0 4px}
+ .ed{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:7px 8px;margin:8px 0} .edt{font-weight:600;margin-bottom:3px}
+ .sr{display:block;color:var(--mut);margin:3px 0 0;font-size:12px} .hint{color:var(--mut);font-size:11px;margin-top:4px}
+ .srow{display:flex;align-items:center;justify-content:space-between;gap:6px} .sname{flex:1} .snum{width:64px;font:inherit;font-size:12px;padding:1px 3px}
+ .extab{border-collapse:collapse;width:100%;font-size:11.5px;margin-top:2px} .extab td,.extab th{padding:2px 4px;text-align:right;border-bottom:1px solid var(--line)} .extab td:first-child,.extab th:first-child{text-align:left}
+ .plot{display:block;margin-top:4px} .pbg{fill:var(--bg);stroke:var(--line)} .grid{stroke:var(--line);stroke-dasharray:2 3} .tick{fill:var(--mut);font-size:9px}
+ .curve{stroke:var(--acc);stroke-width:2} .refcurve{stroke:var(--mut);stroke-width:1;stroke-dasharray:3 3;opacity:.7} .pt{fill:var(--acc);stroke:var(--bg);stroke-width:1.5;cursor:grab}
+ #bar{position:absolute;top:8px;left:8px;right:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;pointer-events:none}
+ #bar>*{pointer-events:auto;background:color-mix(in srgb,var(--bg) 88%,transparent);border:1px solid var(--line);border-radius:6px;padding:4px 8px}
+ #bar select{width:auto;margin:0} #legend{position:absolute;left:8px;bottom:8px;background:color-mix(in srgb,var(--bg) 90%,transparent);border:1px solid var(--line);border-radius:6px;padding:7px 9px;font-size:11px;max-width:260px}
+ #ramp{height:10px;width:180px;border-radius:2px;margin:3px 0} #sizes{display:flex;align-items:flex-end;gap:10px;margin-top:6px}
+ #sizes div{text-align:center} #sizes i{display:block;border:1.5px solid #222;border-radius:50%;background:#fff;margin:0 auto 2px}
+ #pop{position:absolute;display:none;max-width:330px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;box-shadow:0 4px 14px #0004;font-size:12px;z-index:5}
+ #pop table{border-collapse:collapse;margin-top:4px} #pop td,#pop th{padding:1px 6px 1px 0;text-align:left;font-weight:normal} #pop th{color:var(--mut)} #pop b{font-weight:600}
+ #stats{font-size:12px;line-height:1.55} #json{width:100%;height:80px;font:11px ui-monospace,monospace} .row{display:flex;gap:6px;margin:4px 0}
+</style></head><body>
+<div id="panel">
+ <h1>Flexible transit scoring</h1>
+ <div class="hint">Everything below is recomputed in your browser, instantly: change a shape or a number and the map, the stop sizes and the statistics follow.</div>
+ <h2>Statistics (this state)</h2><div id="stats">loading…</div>
+ <div class="row">within <input id="within" type="number" value="500" min="50" step="50" style="width:70px"> m of any stop</div>
+ <h2>Presets</h2><select id="preset"></select><div id="fitStats" class="hint"></div>
+ <h2>Scoring</h2><div id="editors"></div>
+ <h2>Save / load the scoring</h2>
+ <textarea id="json" spellcheck="false"></textarea>
+ <div class="row"><button id="reset">Reset to default</button><button id="copy">Copy</button><button id="apply">Apply text</button><button id="dl">Download</button></div>
+</div>
+<div id="main"><canvas id="cv"></canvas>
+ <div id="bar"><span><b id="title">…</b></span><label>State <select id="state"></select></label><label>Show <select id="level"><option value="cell">cells (H3 res 10)</option><option value="bg">block groups</option><option value="tract">tracts</option></select></label><label>Colour <select id="colour"><option value="score">score</option><option value="diff">change vs default scoring</option></select></label>
+  <label>Stop size by <select id="sizeby"></select></label><label><input id="showStops" type="checkbox" checked> stops</label><span id="timing"></span></div>
+ <div id="legend"></div><div id="pop"></div></div>
+<script src="score.js"></script><script src="fit.js"></script><script src="editor.js"></script><script src="glmap.js"></script>
+<script>
+const $ = (id) => document.getElementById(id), BASE = new URLSearchParams(location.search).get('data') || '.';
+let gamma = 1, presets = null, lastFit = null, fitTimer = 0, viewTimer = 0, D0 = null, D = null, params = null, defaults = null, map = null, selStop = -1, cur = {}, rafPending = false;
+const fmt = (x) => x >= 1e6 ? (x / 1e6).toFixed(2) + ' M' : x >= 1e3 ? (x / 1e3).toFixed(1) + ' k' : Math.round(x).toString();
+const MODE = ['bus', 'tram', 'rail'];
+let DV = '';   // data version (index.json): in the URL of every state file, so changed data never comes from an older cache
+const vq = (p) => p + (DV ? '?v=' + DV : '');
+async function bin(path, T) { const r = await fetch(vq(path)); if (!r.ok) throw new Error(path + ' ' + r.status); return new T(await r.arrayBuffer()); }
+
+async function loadState(path) {
+  const meta = await (await fetch(vq(path + 'meta.json'))).json();
+  const [mode, hh, vv, np, lonlat, cst, cdist, geom] = await Promise.all([bin(path + 'stop_mode.bin', Int8Array), bin(path + 'stop_h.bin', Float32Array), bin(path + 'stop_v.bin', Float32Array),
+    bin(path + 'stop_np.bin', Int32Array), bin(path + 'stop_lonlat.bin', Float32Array), bin(path + 'cell_station.bin', Int32Array), bin(path + 'cell_dist.bin', Uint16Array), bin(path + 'cell_geom.bin', Float32Array)]);
+  if (meta.points) { D0 = { pt: await bin(path + 'pt_lonlat.bin', Float32Array), ptg: await bin(path + 'pt_station.bin', Int32Array), names: await (await fetch(vq(path + 'pt_names.json'))).json() }; } else D0 = null;
+  let counts = new Float32Array(0); const ncol = meta.count_columns.length;
+  if (ncol) counts = await bin(path + 'cell_counts.bin', Float32Array);
+  D = { pts: D0, meta, mode, hh, vv, np, lonlat, cst, cdist, geom, counts, ncol, S: meta.S, P: meta.P, K: meta.K, nc: meta.nc };
+  if (meta.bg_ids) {   // census units under the cells: block-group / tract views = census-population-weighted mean of the cell scores
+    const [cbg, ctr, bpop, tpop] = await Promise.all([bin(path + 'cell_bg.bin', Int32Array), bin(path + 'cell_tract.bin', Int32Array), bin(path + 'bg_pop.bin', Float32Array), bin(path + 'tract_pop.bin', Float32Array)]);
+    D.units = { bg: { cell: cbg, pop: bpop, ids: meta.bg_ids, name: 'Block group' }, tract: { cell: ctr, pop: tpop, ids: meta.tract_ids, name: 'Tract' } };
+  }
+  D.ss = new Float32Array(D.S * D.P);   // float32 like the C core (identical rounding -> identical winners on exact ties)
+   D.los = new Float32Array(D.nc); D.slot = new Int8Array(D.nc); D.defLos = new Float32Array(D.nc);
+  D.tot = new Float64Array(D.S * Math.max(ncol, 1)); D.won = new Int32Array(D.S); D.near = new Float32Array(D.nc);
+  for (let c = 0; c < D.nc; c++) { let m = 65535; for (let k = 0; k < D.K; k++) if (D.cst[c * D.K + k] >= 0 && D.cdist[c * D.K + k] < m) m = D.cdist[c * D.K + k]; D.near[c] = m; }
+  map.setCells(geom, D.nc); if (D.pts) { map.setStops(D.pts.pt, D.pts.ptg.length, D.pts.ptg); D.firstPt = new Int32Array(D.S).fill(-1); for (let i = D.pts.ptg.length - 1; i >= 0; i--) D.firstPt[D.pts.ptg[i]] = i; } else map.setStops(lonlat, D.S); map.fit(meta.bbox);
+  defaults = meta.params; if (!params) params = JSON.parse(JSON.stringify(defaults));
+  const hid = new Set(meta.hidden_columns || []); D.hid = hid; D.means = meta.mean_columns || [];
+  const sb = $('sizeby'); sb.innerHTML = '<option value="-1">none</option>' + meta.count_labels.map((l, i) => hid.has(i) ? '' : `<option value="${i}">${l}</option>`).join(''); sb.value = ncol ? '0' : '-1';
+  $('title').textContent = meta.name || 'dataset';
+  // default scores (for the 'change' colouring)
+  const Sd = FlexScore.prepare(defaults), ssd = new Float32Array(D.S * D.P); FlexScore.stopScores(Sd, D.mode, D.hh, D.vv, D.S * D.P, ssd);
+  FlexScore.cellScores(Sd, D.cst, D.cdist, D.nc, D.K, D.P, D.np, D.mode, ssd, D.defLos, null);
+  recompute();
+}
+
+function recompute() {
+  if (!D) return; const t0 = performance.now(), Sx = FlexScore.prepare(params);
+  FlexScore.stopScores(Sx, D.mode, D.hh, D.vv, D.S * D.P, D.ss);
+  FlexScore.cellScores(Sx, D.cst, D.cdist, D.nc, D.K, D.P, D.np, D.mode, D.ss, D.los, D.slot);
+  if (D.ncol) FlexScore.catchment(D.cst, D.slot, D.nc, D.K, D.counts, D.ncol, D.S, D.tot, D.won);
+  const t1 = performance.now();
+  const diff = $('colour').value === 'diff', v = new Float32Array(D.nc), lv = $('level').value;
+  unitScores();
+  if (lv !== 'cell' && D.units) {   // every cell shows the value of its block group / tract
+    const U = D.units[lv];
+    for (let c = 0; c < D.nc; c++) { const g = U.cell[c]; v[c] = g < 0 ? -1e4 : (diff ? U.val[g] - U.def[g] : U.val[g]); }
+  } else for (let c = 0; c < D.nc; c++) v[c] = D.slot[c] < 0 ? -1e4 : (diff ? D.los[c] - D.defLos[c] : D.los[c]);
+  map.setValues(v, diff ? 'diff' : 'score'); updateSizes(); stats(); legend();
+  $('timing').textContent = `recomputed ${D.nc.toLocaleString()} cells + ${D.S.toLocaleString()} stops in ${(t1 - t0).toFixed(0)} ms`;
+}
+/* block group / tract score: sum over its cells of (cell population x cell score) / the unit's census population (cells out of reach count 0) */
+function unitScores() {
+  if (!D.units) return;
+  const pc = D.meta.count_columns.indexOf('population');
+  for (const key of ['bg', 'tract']) {
+    const U = D.units[key], n = U.pop.length, num = new Float64Array(n), dnum = new Float64Array(n), wsum = new Float64Array(n);
+    for (let c = 0; c < D.nc; c++) { const g = U.cell[c]; if (g < 0) continue; const w = pc >= 0 ? D.counts[c * D.ncol + pc] : 1; num[g] += w * D.los[c]; dnum[g] += w * D.defLos[c]; wsum[g] += w; }
+    U.val = new Float32Array(n); U.def = new Float32Array(n);
+    // denominator: the unit's census population (its people beyond walking reach have no stored cell and count 0), or the population of its cells when that
+    // is larger (a cell centre can fall in a small neighbouring unit)
+    for (let g = 0; g < n; g++) { const P = Math.max(U.pop[g], wsum[g]) || 1; U.val[g] = num[g] / P; U.def[g] = dnum[g] / P; }
+  }
+}
+function updateSizes() {
+  const j = +$('sizeby').value, sizes = new Float32Array(D.S); cur.sizeMax = 1;
+  if (j >= 0 && D.ncol) { let mx = 0; for (let s = 0; s < D.S; s++) mx = Math.max(mx, D.tot[s * D.ncol + j]); cur.sizeMax = mx || 1;
+    for (let s = 0; s < D.S; s++) sizes[s] = D.won[s] === 0 ? 3 : 5 + 36 * Math.sqrt(D.tot[s * D.ncol + j] / cur.sizeMax); }
+  else sizes.fill(7);
+  if (D.pts) { const g = D.pts.ptg, e = new Float32Array(g.length); for (let i = 0; i < g.length; i++) e[i] = sizes[g[i]]; cur.sizes = e; } else cur.sizes = sizes; map.showStops = $('showStops').checked; map.setStopSizes(cur.sizes, selStop);
+}
+function stats() {
+  const within = +$('within').value, pc = D.meta.count_columns.indexOf('population'); let served = 0, popTot = 0, popNear = 0, popGood = 0, sum = 0, cells = 0;
+  for (let c = 0; c < D.nc; c++) { if (D.slot[c] < 0) continue; cells++; const pop = pc >= 0 ? D.counts[c * D.ncol + pc] : 1; popTot += pop; sum += pop * D.los[c]; if (D.near[c] <= within) popNear += pop; if (D.los[c] >= 50) popGood += pop; }
+  const lab = pc >= 0 ? 'people' : 'cells';
+  $('stats').innerHTML = `${D.S.toLocaleString()} stations · ${D.nc.toLocaleString()} cells<br>${lab} in cells a stop reaches: <b>${fmt(popTot)}</b><br>mean score of ${lab}: <b>${popTot ? (sum / popTot).toFixed(1) : '–'}</b><br>${lab} within ${within} m of a stop: <b>${fmt(popNear)}</b><br>${lab} with a score ≥ 50: <b>${fmt(popGood)}</b>`;
+}
+function legend() {
+  const diff = $('colour').value === 'diff', j = +$('sizeby').value;
+  let h = `<b>${diff ? 'Score change vs default scoring' : 'Level of service (0–100)'}</b><div id="ramp" style="background:linear-gradient(90deg,${diff ? '#2b61c2,#f7f7f7,#cc2626' : '#d63027,#fdad61,#ffffbf,#a6d96a,#1a9850'})"></div><div style="display:flex;justify-content:space-between;width:180px"><span>${diff ? '−50' : '0'}</span><span>${diff ? '0' : '50'}</span><span>${diff ? '+50' : '100'}</span></div>`;
+  if (j >= 0 && D.ncol) { h += `<div style="margin-top:6px"><b>Stop size = ${D.meta.count_labels[j]}</b> won by the stop<br><span style="color:var(--mut)">sum over the cells where this stop gives the level of service</span></div><div id="sizes">`;
+    for (const f of [1, 0.25, 0.05]) { const d = 5 + 36 * Math.sqrt(f); h += `<div><i style="width:${d}px;height:${d}px"></i>${fmt(cur.sizeMax * f)}</div>`; } h += '</div>'; }
+  $('legend').innerHTML = h;
+}
+function popup(html, px, py) { const p = $('pop'), r = $('main').getBoundingClientRect(), d = map.cv.width / map.cv.getBoundingClientRect().width; p.innerHTML = html; p.style.display = 'block';
+  p.style.left = Math.min(px / d + 12, r.width - 345) + 'px'; p.style.top = Math.min(py / d + 12, r.height - p.offsetHeight - 8) + 'px'; }
+function stopHtml(s, p) {
+  const ss = D.ss, P = D.P; let rows = '', best = -1, bv = -1;
+  for (let j = 0; j < D.np[s]; j++) { const q = ss[s * P + j]; if (q > bv) { bv = q; best = j; } rows += `<tr><td>${MODE[D.mode[s * P + j]]}</td><td>${D.hh[s * P + j].toFixed(1)} min</td><td>${D.vv[s * P + j].toFixed(1)} km/h</td><td>${q.toFixed(3)}</td></tr>`; }
+  let c = ''; for (let j = 0; j < D.ncol; j++) if (!D.hid.has(j)) c += `<tr><th>${D.meta.count_labels[j]}</th><td><b>${Math.round(D.tot[s * D.ncol + j]).toLocaleString()}</b></td></tr>`;
+  c += meanRows(D.tot, s * D.ncol);
+  return `${p >= 0 && D.pts ? `<b>${D.pts.names[p]}</b> (one of the stops of station #${s})<br>` : ''}<b>Station #${s}</b> <span style="color:var(--mut)">${D.lonlat[s * 2 + 1].toFixed(5)}, ${D.lonlat[s * 2].toFixed(5)}</span><br>wins <b>${D.won[s]}</b> cells${D.ncol ? '; counts in those cells:' : ''}<table>${c}</table><div style="margin-top:5px;color:var(--mut)">service patterns of this stop</div><table><tr><th>mode</th><th>headway</th><th>speed</th><th>stop score</th></tr>${rows}</table>`;
+}
+function meanRows(arr, o) {   // weighted means: sum of the numerator / sum of the denominator (cell, or a stop's catchment)
+  let t = ''; for (const m of D.means) { const den = arr[o + m.den]; t += `<tr><th>${m.label}</th><td>${den > 0 ? ((m.scale || 1) * arr[o + m.num] / den).toFixed(1) : '–'}</td></tr>`; } return t;
+}
+function cellHtml(c) {
+  const sl = D.slot[c], s = sl >= 0 ? D.cst[c * D.K + sl] : -1; let t = `<b>Cell ${c}</b><br>level of service <b>${sl >= 0 ? D.los[c].toFixed(1) : 'none'}</b> (default scoring ${D.defLos[c].toFixed(1)})<br>nearest stop ${D.near[c] < 65535 ? D.near[c] + ' m' : '–'}${s >= 0 ? `; won by stop #${s}` : ''}`;
+  if (D.units) for (const key of ['bg', 'tract']) { const U = D.units[key], g = U.cell[c]; if (g >= 0 && U.val) t += `<br>${U.name} ${U.ids[g]}: <b>${U.val[g].toFixed(1)}</b> <span style="color:var(--mut)">(population-weighted, ${fmt(U.pop[g])} people)</span>`; }
+  t += '<table>';
+  for (let j = 0; j < D.ncol; j++) if (!D.hid.has(j)) t += `<tr><th>${D.meta.count_labels[j]}</th><td>${Math.round(D.counts[c * D.ncol + j]).toLocaleString()}</td></tr>`;
+  t += meanRows(D.counts, c * D.ncol);
+  t += '</table><div style="margin-top:4px;color:var(--mut)">stations of this cell</div><table>';
+  for (let k = 0; k < D.K; k++) { const st = D.cst[c * D.K + k]; if (st >= 0) t += `<tr><td>#${st}</td><td>${D.cdist[c * D.K + k]} m</td></tr>`; }
+  return t + '</table>';
+}
+function onClick(px, py) {
+  const p = map.pickStop(px, py), s = p >= 0 && D.pts ? D.pts.ptg[p] : p;
+  if (s >= 0) { selStop = s; map.setStopSizes(cur.sizes, selStop); popup(stopHtml(s, p), px, py); cur.popup = 'stop:' + s; return; }
+  selStop = -1; map.setStopSizes(cur.sizes, -1); const c = map.pickCell(px, py);
+  if (c >= 0) { popup(cellHtml(c), px, py); cur.popup = 'cell:' + c; } else { $('pop').style.display = 'none'; cur.popup = ''; }
+}
+
+/* ---- presets and the fit of the scoring (R2, loss) on the sample ---- */
+const shortName = (n) => { const [c, st] = n.split(', '); return c.split('-')[0] + (st ? ', ' + st.split('-')[0] : ''); };
+function viewMetro() {   // the metro area that covers a meaningful part of the map (else -1)
+  if (!FlexFit.ready || !map) return -1; const W = map.cv.width, H = map.cv.height; let best = -1, bf = 0.12;
+  FlexFit.meta.sets.forEach((s, i) => { if (!i) return; const a = map.project(s.bbox[0], s.bbox[1]), b = map.project(s.bbox[2], s.bbox[3]);
+    const x0 = Math.max(0, Math.min(a[0], b[0])), x1 = Math.min(W, Math.max(a[0], b[0])), y0 = Math.max(0, Math.min(a[1], b[1])), y1 = Math.min(H, Math.max(a[1], b[1]));
+    const f = Math.max(0, x1 - x0) * Math.max(0, y1 - y0) / (W * H); if (f > bf) { bf = f; best = i; } });
+  return best;
+}
+function renderFit() {
+  if (!lastFit || !presets) return; const e = lastFit, sel = $('preset'), cur = sel.value, vm = viewMetro();
+  const own = presets.find((p) => 'p:' + presets.indexOf(p) === cur), shown = vm >= 0 ? vm : (own && own.metro ? own.metro : -1);
+  let t = `United States: R² <b>${e[0].r2.toFixed(2)}</b> · loss ${e[0].loss.toFixed(4)}`;
+  if (shown > 0) t += `<br>${shortName(FlexFit.meta.sets[shown].name)}: R² <b>${e[shown].r2.toFixed(2)}</b> · loss ${e[shown].loss.toFixed(4)}`;
+  $('fitStats').innerHTML = t;
+  if (sel.dataset.sig !== vm + '|' + e.map((x) => x.r2.toFixed(2)).join()) {   // metro presets: the one in view first, then by R²
+    const keep = sel.value, order = presets.map((p, i) => i).filter((i) => presets[i].metro).sort((a, b) => (presets[a].metro === vm ? -1e9 : -e[presets[a].metro].r2) - (presets[b].metro === vm ? -1e9 : -e[presets[b].metro].r2));
+    sel.innerHTML = '<option value="custom" hidden>Custom</option>' + presets.map((p, i) => i).filter((i) => !presets[i].metro).map((i) => `<option value="p:${i}">${i === 0 ? 'Literature' : i === 1 ? 'US fitted' : presets[i].name}</option>`).join('') + '<optgroup label="Metro fits">' +
+      order.map((i) => `<option value="p:${i}">${shortName(presets[i].name)} · ${e[presets[i].metro].r2.toFixed(2)}</option>`).join('') + '</optgroup>';
+    sel.value = keep; sel.dataset.sig = vm + '|' + e.map((x) => x.r2.toFixed(2)).join();
+  }
+}
+function fitUpdate() { if (!FlexFit.ready || !presets) return; lastFit = FlexFit.evaluate(params, gamma); renderFit(); }
+function scheduleFit() { clearTimeout(fitTimer); fitTimer = setTimeout(fitUpdate, 90); }
+function applyPreset(i) { const p = presets[i]; params = JSON.parse(JSON.stringify(p.params)); gamma = p.gamma; buildEditors(); recompute(); scheduleFit(); }
+function markCustom() { const sel = $('preset'); if (sel.value !== 'custom') { sel.value = 'custom'; } }
+async function initFit() {
+  try {
+    const base = [BASE + '/sample/', '../sample/'];
+    for (const b of base) { try { await FlexFit.load(b); presets = await (await fetch(b + 'presets.json?v=' + encodeURIComponent(FlexFit.version))).json(); break; } catch (e) { FlexFit.ready = false; } }
+    if (!presets) return;
+    const sel = $('preset'); sel.onchange = () => { if (sel.value.startsWith('p:')) applyPreset(+sel.value.slice(2)); };
+    map.onView = () => { clearTimeout(viewTimer); viewTimer = setTimeout(renderFit, 120); };
+    sel.innerHTML = '<option value="p:0">Literature</option>'; sel.value = 'p:0'; fitUpdate();
+  } catch (e) { console.warn('fit sample not available', e); }
+}
+function schedule() { if (rafPending) return; rafPending = true; requestAnimationFrame(() => { rafPending = false; recompute(); $('json').value = JSON.stringify(params); }); }
+function buildEditors() { FlexEditor.build($('editors'), params, () => { markCustom(); schedule(); scheduleFit(); }); $('json').value = JSON.stringify(params); }
+
+async function init() {
+  map = new FlexMap($('cv')); map.onClick = onClick; addEventListener('resize', () => map.resize()); map.resize();
+  let idx = null; try { const r = await fetch(BASE + '/index.json?v=t' + Date.now(), { cache: 'no-store' }); if (r.ok) { idx = await r.json(); DV = idx.version || ''; } } catch (e) {}
+  const sel = $('state');
+  if (idx) { sel.innerHTML = idx.states.map((s, i) => `<option value="${i}">${s.name}</option>`).join(''); sel.onchange = () => { selStop = -1; $('pop').style.display = 'none'; loadState(BASE + '/' + idx.states[+sel.value].path).then(() => { buildEditors(); }); };
+    const first = new URLSearchParams(location.search).get('state'); const k = first ? Math.max(0, idx.states.findIndex((s) => s.name === first)) : 0; sel.value = String(k); await loadState(BASE + '/' + idx.states[k].path); }
+  else { sel.parentElement.style.display = 'none'; await loadState(BASE + '/'); }
+  buildEditors();
+  $('colour').onchange = recompute; $('level').onchange = recompute; $('sizeby').onchange = () => { updateSizes(); legend(); }; $('showStops').onchange = updateSizes; $('within').onchange = stats;
+  $('reset').onclick = () => { params = JSON.parse(JSON.stringify(defaults)); gamma = 1; buildEditors(); recompute(); if (presets) { $('preset').value = 'p:0'; scheduleFit(); } };
+  $('copy').onclick = () => navigator.clipboard && navigator.clipboard.writeText($('json').value);
+  $('apply').onclick = () => { try { params = JSON.parse($('json').value); buildEditors(); recompute(); markCustom(); scheduleFit(); } catch (e) { alert('Not valid scoring JSON: ' + e.message); } };
+  $('dl').onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(params, null, 1)], { type: 'application/json' })); a.download = 'scoring.json'; a.click(); };
+}
+window.__ready = init().then(() => initFit());
+/* hooks for automated tests */
+window.__api = { setParams: (p) => { params = p; recompute(); }, getParams: () => params, los: () => Array.from(D.los), slot: () => Array.from(D.slot), tot: () => Array.from(D.tot), won: () => Array.from(D.won),
+  stopXY: (s) => D.pts ? map.project(D.pts.pt[D.firstPt[s] * 2], D.pts.pt[D.firstPt[s] * 2 + 1]) : map.project(D.lonlat[s * 2], D.lonlat[s * 2 + 1]), cellXY: (c) => map.project(D.geom[c * 14], D.geom[c * 14 + 1]), click: (px, py) => onClick(px, py), popup: () => $('pop').innerText, popupKind: () => cur.popup,
+  meta: () => D.meta, state: () => ({S: D.S, nc: D.nc, K: D.K, P: D.P, ncol: D.ncol}), setSize: (j) => { $('sizeby').value = String(j); updateSizes(); legend(); }, legend: () => $('legend').innerText, stats: () => $('stats').innerText,
+  zoom: (lon, lat, km) => { const m = map.project(lon, lat); const c = map.unproject(m[0], m[1]); map.cx = c[0]; map.cy = c[1]; map.scale = Math.min(map.cv.width, map.cv.height) / km; map.draw(); }, editor: () => FlexEditor, schedule: () => { recompute(); }, buildEditors };
+</script></body></html>

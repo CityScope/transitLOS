@@ -42,7 +42,7 @@ class _FakeFeed:
         # `route_id` for the group.
         return pl.DataFrame({"parent_station": ["PARENT1"], "route_id": ["ROUTE_RAIL"], "headway": [5.0]})
 
-    def get_speed_at_stops(self, date, start_time, end_time, route_types, by, at, how):
+    def get_speed_at_stops(self, date, start_time, end_time, route_types, by, at, how, **window):
         return pl.DataFrame({"parent_station": ["PARENT1"], "route_id": ["ROUTE_RAIL"], "speed": [40.0]})
 
     def add_stop_coords(self, df):
@@ -105,6 +105,7 @@ def test_per_stop_route_type_is_genuinely_per_stop_id(monkeypatch):
     result = stops_mod.download_and_prepare_stops(
         "fake-gtfs-dir",
         date_range=(datetime(2026, 1, 5), datetime(2026, 1, 5)),
+        scoring="route",   # the fake feed only implements the route-level headway/speed calls
     )
 
     by_stop = {

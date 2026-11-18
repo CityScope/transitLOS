@@ -16,7 +16,7 @@ resolved the other way: `transitlos.scoring.distance_matrix
 .build_intelligent_distance_matrix` builds the `distance_matrix` argument
 `AccessibilityAnalyzer.run` expects *from* `transitlos.scoring`'s own
 offset-power `D(t; stop_score)` decay (see `walk_access.py`), so the
-isochrone engine now runs transitLOS's literature-grounded decay directly --
+isochrone engine now runs transitLOS's own decay directly --
 there is no longer a second, independent falloff to double-count against.
 
 This also implements "intelligent discretization" (see

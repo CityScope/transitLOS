@@ -1,38 +1,14 @@
-"""MRC(mode/reliability/comfort): the combined mode/reliability/comfort axis.
+"""MRC: the combined mode / reliability / comfort axis.
 
-Implements scoring.md §2.3: mode, reliability, and comfort are modeled as
-**one combined axis**, not three separately-weighted terms -- there is no
-clean literature-backed "mode premium" independent of realized reliability
-(protected right-of-way reduces bunching/signal delay/headway variance,
-which *is* the mode-correlated quality gap), and comfort/crowding is the
-same kind of refinement on the mode label, available only with richer
-real-time data. Replaces the previous version's separate `mode.py`
-(`mode_score`, a `MR`-flavored but unrelated categorical scheme) and
-`reliability.py` (`reliability_score`, an `exp(-CV/scale)` design-choice
-falloff with no direct literature source) with this single module.
+Mode, reliability and comfort are one axis, not three separately weighted terms:
 
-Three layered components (scoring.md §2.3 table):
+    (a) MR_mode(mode)        categorical default from the GTFS route_type (the path the pipeline uses)
+    (b) MR_CV(headway_cv)    optional, used instead of (a) when the scheduled-headway CV is known: 1 / (1 + CV^2)
+    (c) C(occupancy_status)  optional comfort factor on top of (a) / (b) from GTFS-realtime OccupancyStatus (not used by default)
 
-    (a) MR_mode(mode)           -- categorical default, GTFS-static `route_type` only.
-                                   PRIMARY, load-bearing path for this project's
-                                   actual GTFS-static-only pipeline.
-    (b) MR_CV(headway_cv)       -- optional, preferred over (a) when scheduled-headway
-                                   CV data is available (still GTFS-static-only).
-    (c) C(occupancy_status)     -- optional comfort refinement on top of (a)/(b),
-                                   needs GTFS-realtime `OccupancyStatus`; NOT wired
-                                   into the default pipeline (real-time occupancy
-                                   is rarely available in practice).
+    MRC = MR_component * C_component
 
-Combination: `MRC = MR_component * C_component`, where `MR_component` is (b)
-if headway_cv is supplied, else (a); `C_component` defaults to 1.0
-(comfort-neutral) with no occupancy_status supplied -- the common case, so
-`MRC = MR_mode(mode)` exactly in practice, matching scoring.md §2.3's stated
-"common case" behavior. This internal product mirrors the document's
-non-compensatory multiplicative philosophy (§1.2) at the sub-function level.
-
-Cross-checked against `transitLOS/documentation/scoring/scripts/
-compare_methods.py`'s own `MR_MODE` table (the CV/comfort refinements are
-not implemented in that comparison script, which only ever has mode data).
+Defaults: `parameters.RegionParameters` (`mr_mode`, `comfort_scores`).
 """
 
 from __future__ import annotations
@@ -78,10 +54,8 @@ def mode_category(route_type: Optional[int]) -> str:
 def MR_mode(mode: str, region: str = "global") -> float:
     """Compute the mode-based categorical default `MR_mode(mode)`.
 
-    scoring.md §2.3(a): rail/subway/metro/commuter rail = 1.000 (anchor);
-    tram/light rail/dedicated-ROW BRT = 0.894 (geometric-mean interpolation
-    between rail and bus); local bus (mixed traffic) = 0.800 (Wardman,
-    Chintakayala & de Jong 2016, Table 7, "metro valued/bus valued" ratio).
+    Rail / subway / metro / commuter rail = 1.000; tram / light rail / BRT = 0.894 (geometric mean of rail and bus);
+    local bus = 0.800.
 
     Args:
         mode: One of `"rail"`, `"tram"`, `"bus"` (see `mode_category`).
@@ -105,6 +79,13 @@ def mode_score(route_type: Optional[int], region: str = "global") -> float:
     """Compute `MR_mode(mode_category(route_type))` directly from a GTFS route_type.
 
     Convenience wrapper combining `mode_category` + `MR_mode`.
+
+    Args:
+        route_type: GTFS route type.
+        region: Scoring region.
+
+    Returns:
+        The mode value.
     """
     return MR_mode(mode_category(route_type), region=region)
 
@@ -112,11 +93,7 @@ def mode_score(route_type: Optional[int], region: str = "global") -> float:
 def MR_CV(headway_cv: float) -> float:
     """Compute the optional CV-of-scheduled-headway reliability refinement.
 
-    scoring.md §2.3(b): `MR_CV(CV) = 1 / (1 + CV^2)`, the algebraic inverse
-    of the average-wait inflation factor `(1+CV^2)` from Bowman & Turnquist's
-    (1981) passenger-choice wait model -- NOT the prior version's
-    `exp(-CV/scale)` design-choice falloff, which had no direct literature
-    source. `MR_CV(0)=1.0`, `MR_CV(1)=0.5`, `MR_CV(2)~=0.2`. Mode-agnostic by
+    `MR_CV(CV) = 1 / (1 + CV^2)`, the inverse of the average-wait inflation factor `(1 + CV^2)`. `MR_CV(0)=1.0`, `MR_CV(1)=0.5`, `MR_CV(2)~=0.2`. Mode-agnostic by
     construction; preferred over `MR_mode` whenever scheduled-headway CV data
     exists, since it reflects the stop's own actual pattern.
 
@@ -138,7 +115,7 @@ def MR_CV(headway_cv: float) -> float:
 def comfort_score(occupancy_status: Optional[str], region: str = "global") -> float:
     """Compute the optional comfort/crowding refinement `C(occupancy_status)`.
 
-    scoring.md §2.3(c): a categorical lookup keyed to the standardized
+    A categorical lookup keyed to the standardized
     GTFS-realtime `VehiclePosition.OccupancyStatus` enum. Defaults to 1.0
     (comfort-neutral) when occupancy data is unavailable -- the common case,
     since this refinement needs GTFS-realtime data this project's pipeline
@@ -176,7 +153,7 @@ def mrc_score(
 ) -> float:
     """Compute the combined `MRC(mode/reliability/comfort)` sub-score.
 
-    scoring.md §2.3: `MRC = MR_component * C_component`, where
+    `MRC = MR_component * C_component`, where
     `MR_component` is `MR_CV(headway_cv)` if `headway_cv` is supplied
     (preferred, richer data), else `MR_mode(mode_category(route_type))`
     (the primary, load-bearing GTFS-static-only default); `C_component` is

@@ -21,9 +21,7 @@ network. It also renders the results as an interactive MapLibre map (`transitlos
 with hexagon/circle/census layers, a stats panel (distribution, regression, ANOVA,
 place-rank), and a what-if scenario editor.
 
-The literature review and methodology backing the score's parameters (kept locally
-under `documentation/`, not part of this repo) documents the reasoning behind every
-constant used in `src/transitlos/scoring/parameters.py`.
+The scoring formulas and their default constants are in `src/transitlos/scoring/` (`parameters.py`).
 
 ## Install
 
@@ -53,3 +51,32 @@ uv run pytest
 - `src/transitlos/` — scoring pipeline (`scoring/`) and map rendering (`map/`).
 - `examples/` — runnable notebooks.
 - `tests/` — unit tests.
+
+## Use as a library
+
+transitlos never writes into the current working directory. `prepare_street_network(aoi, cache_dir=...)` /
+`level_of_service(..., cache_dir=...)` persist the simplified street network only when `cache_dir` is given
+(`None` = no caching). `transitlos.cache.get_cache_dir(namespace, cache_dir=None)` resolves a cache folder:
+explicit argument, else `$TRANSITLOS_CACHE_DIR/<namespace>`, else `<tempdir>/transitlos-cache/<namespace>`.
+Census/GTFS caches are configured in pycensus (`PYCENSUS_CACHE_DIR`) and pyGTFSHandler (`PYGTFSHANDLER_CACHE_DIR`).
+
+```python
+from transitlos.network import prepare_street_network
+net = prepare_street_network(aoi, cache_dir="/data/my_project/cache/streets", pbf_path="region.osm.pbf")
+```
+
+OSM street extracts (`.osm.pbf`) use the `osm` namespace (`transitlos.cache.get_osm_dir()`); when `pbf_path` is omitted the extract is downloaded there.
+
+
+## Flexible scoring
+
+`transitlos.flex` recomputes the scores after processing, with other parameters, curve shapes or aggregation, on the server or in the browser: see [docs/FLEX_SCORING.md](docs/FLEX_SCORING.md).
+
+## Large files
+
+A pre-commit hook (`tools/check_large_files.py`, installed with `python3 tools/check_large_files.py --install`) refuses a commit with a file over 10 MB once: run the same commit again to keep it. Files over 50 MB are never committed.
+
+## Local files
+
+This repository is public. API keys (`api_keys.json`, `.env`), notes about a particular machine or its processes (hosting, uploads,
+local paths) and upload scripts are never committed: keep notes as `*.local.md` or under `local/`, which `.gitignore` excludes.

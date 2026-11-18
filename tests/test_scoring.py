@@ -1,4 +1,4 @@
-"""Tests for transitlos.scoring, per scoring.md's finalized methodology.
+"""Tests for transitlos.scoring.
 
 Covers monotonicity, bounds, the equal-weight geometric-mean identity, weight
 validation, a qualitative metro-vs-rural-bus ordering check, the MRC(·)
@@ -226,7 +226,7 @@ def test_mrc_score_applies_comfort_on_top():
 
 
 def test_stop_score_default_is_nested_sqrt_mrc_v_times_h():
-    # 2026-09-29 aggregation-STRUCTURE revision (scoring.md Section 1.2): the
+    # 2026-09-29 aggregation-STRUCTURE revision: the
     # default is now the nested form sqrt(MRC * V) * H, not a flat mean of
     # all three sub-scores.
     a, b, c = 0.4, 0.7, 0.9
@@ -245,7 +245,7 @@ def test_stop_score_nested_rejects_weights_and_p():
 def test_stop_score_nested_not_idempotent_at_all_equal():
     # Unlike a true mean, the nested form is NOT idempotent: MRC=V=H=x gives
     # x**2, not x -- an honest, documented consequence of gating H in by
-    # multiplication rather than averaging it (scoring.md Section 1.2).
+    # multiplication rather than averaging it.
     x = 0.90
     assert stop_score(x, x, x) == pytest.approx(x**2, rel=1e-9)
 
@@ -260,7 +260,7 @@ def test_stop_score_nested_catastrophic_v_stress_case():
 
 
 def test_stop_score_nested_catastrophic_headway_gates_harder_than_legacy_means():
-    # The original motivating production example (scoring.md Section 1.2):
+    # The original motivating production example:
     # mode=bus, MRC=0.800, V=0.8401, headway=285.73min -> H=0.1312. The
     # nested form should punish this at least as hard as the legacy p=-1
     # harmonic mean did.
@@ -349,7 +349,7 @@ def test_frequency_score_same_across_regions():
 
 def test_walk_decay_same_across_regions():
     # 2026-09-28: no region-specific override remains for any of the six
-    # functions (scoring.md Section 3.3) -- unlike the prior model, walking
+    # functions -- unlike the prior model, walking
     # speed itself no longer varies by region either.
     t = 10
     na = walk_decay(t, 0.5, "bus", region="north_america")
