@@ -936,7 +936,7 @@ def field_unit_suffix(col: str) -> str:
 
 # Every country's census source prefixes its columns with a real
 # `pycensus.<country>.<source>.schema.SCHEMA(prefix=...)` (see e.g.
-# `pycensus.countries.mexico.inegi.schema`) so `inegi_population`/`acs5_population`/
+# `pycensus.census.countries.mexico.inegi.schema`) so `inegi_population`/`acs5_population`/
 # `cbs_population` never collide inside `pycensus`'s own multi-source
 # registry. On the map, a single study only ever joins ONE country's data,
 # so that collision risk doesn't exist here -- and per the user's explicit
@@ -1077,13 +1077,13 @@ _SCHEMA_FEATURES_CACHE: Dict[Tuple[str, str], set] = {}
 def _infer_bare_prefix(col: str, country: Optional[str]) -> str:
     """Prefix of the first source schema of ``country`` that defines feature ``col`` ('' if none)."""
     try:
-        import pycensus
+        from pycensus.schema import schema_dir
     except ImportError:
         return ""
     for folder, source, prefix in _COUNTRY_SOURCES.get(country or "", []):
         key = (folder, source)
         if key not in _SCHEMA_FEATURES_CACHE:
-            path = os.path.join(os.path.dirname(pycensus.__file__), "countries", folder, "schema", f"{source}_schema.json")
+            path = os.path.join(str(schema_dir(folder)), f"{source}_schema.json")
             try:
                 with open(path, encoding="utf-8") as f:
                     _SCHEMA_FEATURES_CACHE[key] = {e["feature_name"] for e in json.load(f).get("features", [])}
@@ -1163,9 +1163,7 @@ def _global_schema_definitions() -> Dict[str, str]:
     global _GLOBAL_SCHEMA_DEFINITIONS_CACHE
     if _GLOBAL_SCHEMA_DEFINITIONS_CACHE is None:
         try:
-            import pycensus
-
-            schema_path = os.path.join(os.path.dirname(pycensus.__file__), "schemas", "global_schema.json")
+            from pycensus.canonical import GLOBAL_SCHEMA_PATH as schema_path
             with open(schema_path, encoding="utf-8") as f:
                 entries = json.load(f)
             _GLOBAL_SCHEMA_DEFINITIONS_CACHE = {e["feature_name"]: e.get("definition", "") for e in entries}
@@ -1188,8 +1186,9 @@ def _per_country_schema_originals() -> Dict[Tuple[str, str], str]:
         try:
             import pycensus
 
-            countries_dir = os.path.join(os.path.dirname(pycensus.__file__), "countries")
-            for schema_path in glob.glob(os.path.join(countries_dir, "*", "schema", "*_schema.json")):
+            from pycensus.schema import schema_dirs
+
+            for schema_path in sorted(str(q) for d in schema_dirs() for q in d.glob("*_schema.json")):
                 prefix = os.path.basename(schema_path)[: -len("_schema.json")] + "_"
                 try:
                     with open(schema_path, encoding="utf-8") as f:
@@ -1216,7 +1215,7 @@ def _per_country_schema_definitions() -> Dict[Tuple[str, str], str]:
     `global_schema.json` entry on purpose, since they aren't
     cross-country-comparable). Those columns already have real, carefully
     written `definition` fields in their OWN country's
-    `pycensus/countries/<country>/schema/<source>_schema.json` (see e.g.
+    `pycensus/census/countries/<country>/schema/<source>_schema.json` (see e.g.
     `andorra/schema/estadisticaad_schema.json`'s `buildingCount` entry) --
     `_column_metadata_rows` was just never looking there, so it silently
     fell back to the humanized column name instead of that real text.
@@ -1234,8 +1233,9 @@ def _per_country_schema_definitions() -> Dict[Tuple[str, str], str]:
         try:
             import pycensus
 
-            countries_dir = os.path.join(os.path.dirname(pycensus.__file__), "countries")
-            for schema_path in glob.glob(os.path.join(countries_dir, "*", "schema", "*_schema.json")):
+            from pycensus.schema import schema_dirs
+
+            for schema_path in sorted(str(q) for d in schema_dirs() for q in d.glob("*_schema.json")):
                 # Source prefix mirrors this file's own naming convention
                 # (`_SOURCE_PREFIXES`/`_METADATA_SOURCE_INFO`): the schema
                 # filename's stem up to `_schema.json`, plus the trailing
@@ -3916,6 +3916,36 @@ var __backgroundLayers = {{}};
 var __backgroundSpecs = {json.dumps(BACKGROUND_MAPS)};
 var __activeBackground = {json.dumps(DEFAULT_BACKGROUND)};
 var __defaultBasemapSwapped = false;
+// Without WebGL / web workers (e.g. Colab's output frame) MapLibre draws no tiles: after a few seconds
+// swap it for the same OpenFreeMap tiles drawn on canvas (Leaflet.VectorGrid).
+function __watchVectorTiles(key, spec) {{
+  var gl = __backgroundLayers[key], loaded = false;
+  try {{ gl.getMaplibreMap().on('sourcedata', function(e) {{ if (e.tile) loaded = true; }}); }} catch (e) {{}}
+  setTimeout(function() {{
+    if (loaded || __backgroundLayers[key] !== gl) return;
+    var show = __leafletMap.hasLayer(gl);
+    if (show) __leafletMap.removeLayer(gl);
+    function build() {{
+      fetch('https://tiles.openfreemap.org/planet').then(function(r) {{ return r.json(); }}).then(function(tj) {{
+        var st = {{water: {{fill: true, fillColor: '#c8d6e5', fillOpacity: 1, stroke: false, weight: 0}},
+          landcover: {{fill: true, fillColor: '#dfe6d8', fillOpacity: 0.7, stroke: false, weight: 0}},
+          park: {{fill: true, fillColor: '#d5e3cf', fillOpacity: 0.8, stroke: false, weight: 0}},
+          building: {{fill: true, fillColor: '#e2e2e2', fillOpacity: 0.8, stroke: false, weight: 0}},
+          waterway: {{color: '#c8d6e5', weight: 1}}, transportation: {{color: '#ffffff', weight: 1.5, opacity: 1}},
+          boundary: {{color: '#b8b8c8', weight: 1, dashArray: '4 3'}}}};
+        var vg = L.vectorGrid.protobuf(tj.tiles[0], {{
+          vectorTileLayerStyles: new Proxy(st, {{get: function(t, k) {{ return t[k] || []; }}}}),
+          maxNativeZoom: 14, attribution: spec.attribution, pane: 'basemapPane'}});
+        __backgroundLayers[key] = vg;
+        if (show && __activeBackground === key) vg.addTo(__leafletMap);
+      }});
+    }}
+    if (window.L && L.vectorGrid) {{ build(); return; }}
+    var sc = document.createElement('script');
+    sc.src = 'https://unpkg.com/leaflet.vectorgrid@1.3.0/dist/Leaflet.VectorGrid.bundled.min.js';
+    sc.onload = build; document.head.appendChild(sc);
+  }}, 8000);
+}}
 function __setBackground(key) {{
   if (!__leafletMap) return;
   if (!__backgroundLayers[key]) {{
@@ -3923,6 +3953,7 @@ function __setBackground(key) {{
     __backgroundLayers[key] = spec.style
       ? L.maplibreGL({{style: spec.style, attribution: spec.attribution, pane: 'basemapPane'}})
       : L.tileLayer(spec.url, {{attribution: spec.attribution, maxZoom: 20, pane: 'basemapPane'}});
+    if (spec.style) {{ __watchVectorTiles(key, spec); }}
   }}
   if (__defaultBasemapSwapped && __backgroundLayers[__activeBackground]) {{
     __leafletMap.removeLayer(__backgroundLayers[__activeBackground]);
@@ -4533,7 +4564,7 @@ def build_city_map(
         # possible of the AOI is covered with block or blockgroup data" --
         # Mexico's INEGI (like the US ACS) only publishes block/ageb
         # boundaries for urban localities (see
-        # `pycensus.countries.mexico.inegi.loader`'s module docstring), so a
+        # `pycensus.census.countries.mexico.inegi.loader`'s module docstring), so a
         # real coverage hole in the FINEST level is common and, at the
         # finest level's own zoom band, used to just show the basemap even
         # where the next-coarser level's REAL polygon does cover that spot.

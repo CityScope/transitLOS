@@ -45,7 +45,7 @@ def _worldpop_raster_to_gdf(raster_path: str, aoi: Optional[gpd.GeoDataFrame] = 
 
     Args:
         raster_path: Path to a GeoTIFF downloaded by
-            `pycensus.countries.worldwide.worldpop.loader.download_worldpop_population`.
+            `pycensus.census.worldwide.worldpop.loader.download_worldpop_population`.
         aoi: Optional Area of Interest GeoDataFrame/GeoSeries used to crop
             the raster (via a `rasterio` windowed read) before
             vectorization. Its CRS is reprojected to the raster's CRS as
@@ -111,19 +111,19 @@ def cross_with_population(
         access_gdf: Street-edges GeoDataFrame with an `level_of_service` column
             (e.g. from `transitlos.level_of_service.compute_level_of_service`).
         population_source: `"worldpop"` (global gridded population, any
-            country) or `"us_census"` (`pycensus.countries.usa.acs5`/`.dhc`, US only).
+            country) or `"us_census"` (`pycensus.census.countries.usa.acs5`/`.dhc`, US only).
         aoi: Area of interest, required for `"worldpop"` (used to download
             the raster) and used as a fallback to derive `us_census`'s
             `states` if `region_for_census` is not given.
         region_for_census: For `"us_census"`: state name(s)/abbreviation(s)/
-            FIPS code(s) forwarded to `pycensus.countries.usa.acs5.load`/`.dhc.load` as
+            FIPS code(s) forwarded to `pycensus.census.countries.usa.acs5.load`/`.dhc.load` as
             `states`. If `None`, derived from `aoi`.
         id_col: Name to give the population polygon's unique-id column in
             the returned GeoDataFrame (`GEOID` for `us_census` is renamed to
             this; a synthetic pixel index is used for `worldpop`).
         access_columns: Edge columns from `access_gdf` to aggregate onto the
             population polygons. Defaults to `["level_of_service"]`.
-        census_level: Geometry level forwarded to `pycensus.countries.usa.acs5.load`/
+        census_level: Geometry level forwarded to `pycensus.census.countries.usa.acs5.load`/
             `.dhc.load` (only used when `population_source="us_census"`).
         census_dataset: `"acs"` or `"dhc"` -- which `pycensus.usa` submodule
             to use for `"us_census"`.
@@ -148,7 +148,7 @@ def cross_with_population(
     access_columns = access_columns if access_columns is not None else ["level_of_service"]
 
     if population_source == "worldpop":
-        from pycensus.countries.worldwide.worldpop.loader import download_worldpop_population
+        from pycensus.census.worldwide.worldpop.loader import download_worldpop_population
 
         if aoi is None or worldpop_date is None:
             raise ValueError("aoi and worldpop_date are required for population_source='worldpop'.")
@@ -159,7 +159,7 @@ def cross_with_population(
         pop_gdf[id_col] = np.arange(len(pop_gdf))
 
     elif population_source == "us_census":
-        from pycensus.countries.usa import acs, dhc
+        from pycensus.census.countries.usa import acs, dhc
 
         loader = {"acs": acs, "dhc": dhc}.get(census_dataset)
         if loader is None:

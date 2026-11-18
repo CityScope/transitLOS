@@ -746,7 +746,7 @@ def download_and_prepare_stops_per_feed(
             logged but not fatal -- one bad/empty feed among several real
             ones shouldn't abort the whole city, matching this codebase's
             "one bad workbook/level shouldn't abort everything" convention
-            elsewhere -- see `pycensus.countries.germany.ba.loader`).
+            elsewhere -- see `pycensus.census.countries.germany.ba.loader`).
     """
     import warnings
 

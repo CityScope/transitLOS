@@ -173,9 +173,7 @@ def _global_definitions():
         import json
         from pathlib import Path
 
-        import pycensus
-
-        p = Path(pycensus.__file__).resolve().parent / "schemas" / "global_schema.json"
+        from pycensus.canonical import GLOBAL_SCHEMA_PATH as p
         _GLOBAL_DEFS = {f["feature_name"]: f.get("definition", "") for f in json.loads(p.read_text(encoding="utf-8"))}
     except Exception:  # noqa: BLE001
         pass

@@ -20,7 +20,7 @@ Rescaling
     Every rescale is logged ("[roadless] ..."), as a WARNING when more than `rescale_warn_share` of the source is affected.
 Census polygons without a cell
     (city studies) a census polygon containing no cell centre goes whole to the nearest cell within `census_fallback_max_m`.
-Built surface (GlobalBuildingAtlas, `pycensus.countries.worldwide.gba`)
+Built surface (GlobalBuildingAtlas, `pycensus.census.worldwide.gba`)
     built floor area = footprint x height / `floor_height_m`. The built-surface population keeps WorldPop where WorldPop >=
     `built_pop_min_ratio` x (people per built m2) x built m2, and uses the rate x built m2 elsewhere; outside the census the rate is the
     built-area-weighted rate of the `built_pop_k_nearest` nearest census polygons.
