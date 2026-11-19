@@ -1,5 +1,7 @@
 site_name: transitLOS
 site_description: Transit level-of-service scores and maps
+site_url: https://cityscope.github.io/transitLOS/
+repo_url: https://github.com/CityScope/transitLOS
 docs_dir: docs
 theme:
   name: material
