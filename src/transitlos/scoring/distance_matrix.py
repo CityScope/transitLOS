@@ -158,21 +158,19 @@ def build_intelligent_distance_matrix(
             further.
 
     Returns:
-        `(distance_matrix, bucket_map, distance_steps_m)`:
-
-        - `distance_matrix`: a `polars.DataFrame` with one row per bucket
-          representative `poi_score` and one column per
-          `str(distance_in_meters)`, values ceiling-discretized onto the
-          output grid -- directly usable as
-          `AccessibilityAnalyzer.run(distance_matrix, poi_score_col=...)`'s
-          first argument.
-        - `bucket_map`: `{original_stop_score: bucket_representative}` for
-          every distinct input stop_score -- callers must remap their own
-          stops' score column through this before calling `.run()`, so the
-          join against `distance_matrix["poi_score"]` lines up exactly (see
-          `level_of_service.py`).
-        - `distance_steps_m`: the chosen distance thresholds in meters
-          (ascending), for logging/inspection.
+        distance_matrix: a `polars.DataFrame` with one row per bucket
+            representative `poi_score` and one column per
+            `str(distance_in_meters)`, values ceiling-discretized onto the
+            output grid -- directly usable as
+            `AccessibilityAnalyzer.run(distance_matrix, poi_score_col=...)`'s
+            first argument.
+        bucket_map: `{original_stop_score: bucket_representative}` for
+            every distinct input stop_score -- callers must remap their own
+            stops' score column through this before calling `.run()`, so the
+            join against `distance_matrix["poi_score"]` lines up exactly (see
+            `level_of_service.py`).
+        distance_steps_m: the chosen distance thresholds in meters
+            (ascending), for logging/inspection.
     """
     warn_if_unvalidated_region(region)
     scores = np.unique(np.asarray(

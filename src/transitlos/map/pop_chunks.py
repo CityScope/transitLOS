@@ -102,7 +102,9 @@ def build_population_chunks(
             behind for the client to fetch.
         deg: Chunk size in degrees. Must match the client's
             `window.__popChunkCfg.deg`.
-        h3_column, population_column, access_column: Column names.
+        h3_column: H3 cell id column name.
+        population_column: Population column name.
+        access_column: Access (level of service) column name.
         min_population: Cells at/below this population are dropped. They
             carry zero weight in every consumer (population-weighted access,
             `impact = sum(gain * population)`), so keeping them would only
@@ -252,8 +254,9 @@ def build_geoid_chunks(
     """Write `{h3_cell: GEOID}` chunk files (same grid as `build_population_chunks`).
 
     Args:
-        h3_cells, lats, lngs: Parallel sequences, one per h3 cell (lat/lng
-            are that cell's own centroid, in degrees).
+        h3_cells: H3 cell ids.
+        lats: Latitude of each cell's own centroid, in degrees (parallel to `h3_cells`).
+        lngs: Longitude of each cell's own centroid, in degrees (parallel to `h3_cells`).
         geoids: Parallel sequence of GEOID strings (or `None` for a cell with
             no matched polygon -- dropped, see module docstring above).
         out_dir: Directory to write into (existing `*.json` removed first).
@@ -326,7 +329,8 @@ def build_geoid_chunks_from_h3_and_census(
         census_gdf: Census polygon GeoDataFrame (e.g. `census_by_level["blockgroup"]`).
         out_dir: Directory to write chunk files into.
         id_col: GEOID column name on `census_gdf`.
-        level, deg: See `build_geoid_chunks`.
+        level: See `build_geoid_chunks`.
+        deg: See `build_geoid_chunks`.
         h3_column: H3 cell id column name on `h3_table`.
     """
     import h3 as _h3

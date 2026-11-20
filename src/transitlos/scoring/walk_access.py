@@ -153,9 +153,11 @@ def walk_time_for_decay(
             inverted for (must match the `walk_decay` call being inverted).
         mode: One of `"bus"`, `"rail"`, `"tram"` (must match the `walk_decay`
             call being inverted).
-        region, t_plateau_minutes, p, t0_base_minutes, k: Same meaning as in
-            `walk_decay` -- must match the call whose curve is being
-            inverted.
+        region: Same meaning as in `walk_decay` -- must match the call whose curve is being inverted.
+        t_plateau_minutes: Same meaning as in `walk_decay` -- must match the call whose curve is being inverted.
+        p: Same meaning as in `walk_decay` -- must match the call whose curve is being inverted.
+        t0_base_minutes: Same meaning as in `walk_decay` -- must match the call whose curve is being inverted.
+        k: Same meaning as in `walk_decay` -- must match the call whose curve is being inverted.
 
     Returns:
         The walk time (minutes) at which

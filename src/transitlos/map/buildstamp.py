@@ -92,7 +92,7 @@ DARK_JS = r"""(function(){
    +'#statsPanel{overflow:hidden !important;height:min(calc(100vh - 150px),780px) !important;}'
    +'#statsPanel[style*="display: block"],#statsPanel[style*="display:block"]{display:flex !important;flex-direction:column;}'
    +'#statsPanel > *{flex:0 0 auto;}'
-   +'#statsPanel > div[id^=statsTab_][style*="block"]{display:flex !important;flex-direction:column;flex:1 1 auto !important;min-height:0;}'
+   +'#statsPanel > div[id^=statsTab_][style*="block"]{display:flex !important;flex-direction:column;flex:1 1 auto !important;min-height:0;overflow-y:auto !important;overflow-x:hidden !important;}'
    +'#statsPanel > div[id^=statsTab_] > *{flex:0 0 auto;}'
    +'#placeRankList,#distBars,#regR2Bars,#anovaBars{flex:1 1 auto !important;min-height:90px;overflow-y:auto !important;overflow-x:hidden !important;}#statsPanel{width:min(480px,94vw);}'
    +'#mapDarkBtn.pill{border:none;background:transparent;font-size:13px;line-height:1;height:auto;padding:0 0 0 8px;margin:0 0 0 8px;border-left:1px solid #ddd;border-radius:0;opacity:.75;}#mapDarkBtn.pill:hover{opacity:1;}'
@@ -175,7 +175,7 @@ DARK_JS = r"""(function(){
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',init); else init();
 })();"""
 
-STAMP_VER = 'data-stamp="23"'
+STAMP_VER = 'data-stamp="24"'
 
 
 def build_id(html: str) -> str:
